@@ -1,0 +1,20 @@
+services:
+  kui-local-multi-exit:
+    build: .
+    container_name: kui-local-multi-exit
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      KUI_MANAGEMENT_USER: ${KUI_MANAGEMENT_USER:-admin}
+      KUI_MANAGEMENT_PASSWORD: ${KUI_MANAGEMENT_PASSWORD:?set KUI_MANAGEMENT_PASSWORD}
+    ports:
+      - "${KUI_MANAGEMENT_PORT:-8080}:8080"
+      - "7920-7931:7920-7931"
+    volumes:
+      - kui-local-data:/opt/kui-local
+
+volumes:
+  kui-local-data:
