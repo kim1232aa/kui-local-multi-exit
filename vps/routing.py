@@ -7,16 +7,39 @@ from .models import ExitSlotSnapshot
 
 
 class RouteManager:
+    _MISSING_MESSAGES = ("No such file", "Cannot find device", "FIB table does not exist")
+
     def __init__(self, run: Callable[..., object] = subprocess.run):
         self._run = run
 
-    def _execute(self, command: list[str]) -> None:
-        self._run(command, capture_output=True, text=True, check=False)
+    def _execute(self, command: list[str], *, allow_missing: bool = False) -> None:
+        result = self._run(command, capture_output=True, text=True, check=False)
+        detail = (result.stderr or result.stdout or "command failed").strip()
+        if result.returncode == 0 or (allow_missing and any(message in detail for message in self._MISSING_MESSAGES)):
+            return
+        raise RuntimeError(f"{' '.join(command)}: {detail}")
 
     def cleanup(self, slot: ExitSlotSnapshot) -> None:
         preference = slot.route_table
-        self._execute(["ip", "rule", "del", "fwmark", str(slot.mark), "lookup", str(slot.route_table), "pref", str(preference)])
-        self._execute(["ip", "route", "flush", "table", str(slot.route_table)])
+        self._execute(
+            ["ip", "rule", "del", "fwmark", str(slot.mark), "lookup", str(slot.route_table), "pref", str(preference)],
+            allow_missing=True,
+        )
+        self._execute(["ip", "route", "flush", "table", str(slot.route_table)], allow_missing=True)
+
+    def is_installed(self, slot: ExitSlotSnapshot) -> bool:
+        result = self._run(
+            ["ip", "route", "show", "table", str(slot.route_table)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            return False
+        return any(
+            line.strip().startswith("default ") and f"dev {slot.tunnel_name}" in line
+            for line in result.stdout.splitlines()
+        )
 
     def install(
         self,
@@ -27,18 +50,22 @@ class RouteManager:
     ) -> None:
         self.cleanup(slot)
         table = str(slot.route_table)
-        self._execute(["ip", "route", "add", f"{endpoint_ip}/32", "via", gateway, "dev", external_interface, "table", table])
-        self._execute(["ip", "route", "add", "default", "dev", slot.tunnel_name, "table", table])
-        self._execute(
-            [
-                "ip",
-                "rule",
-                "add",
-                "fwmark",
-                str(slot.mark),
-                "lookup",
-                table,
-                "pref",
-                str(slot.route_table),
-            ]
-        )
+        try:
+            self._execute(["ip", "route", "add", f"{endpoint_ip}/32", "via", gateway, "dev", external_interface, "table", table])
+            self._execute(["ip", "route", "add", "default", "dev", slot.tunnel_name, "table", table])
+            self._execute(
+                [
+                    "ip",
+                    "rule",
+                    "add",
+                    "fwmark",
+                    str(slot.mark),
+                    "lookup",
+                    table,
+                    "pref",
+                    str(slot.route_table),
+                ]
+            )
+        except Exception:
+            self.cleanup(slot)
+            raise

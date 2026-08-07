@@ -8,7 +8,8 @@ import urllib.request
 from pathlib import Path
 from unittest.mock import patch
 
-from vps.local_api import LocalAPIServer
+from vps.local_api import LocalAPIHandler, LocalAPIServer
+from vps.realm_manager import RealmManager
 from vps.store import LocalStore
 
 
@@ -16,9 +17,25 @@ class FakeManager:
     def __init__(self, store):
         self.store = store
         self.actions = []
+        self.listener_states = {}
 
     def snapshot(self):
         return [slot.as_dict() for slot in self.store.list_slots()]
+
+    def listener_ready(self, slot_id):
+        return self.listener_states.get(
+            slot_id,
+            self.store.get_slot(slot_id).state == "ready",
+        )
+
+    def set_slot_ready(self, slot_id, *, listener_ready=True):
+        self.store.set_runtime(
+            slot_id,
+            state="ready",
+            entry_ip="198.51.100.1",
+            egress_ip="203.0.113.1",
+        )
+        self.listener_states[slot_id] = listener_ready
 
     def redial_slot(self, slot_id):
         self.actions.append(("redial", slot_id))
@@ -53,10 +70,39 @@ class LocalAPITest(unittest.TestCase):
         self.store = LocalStore(Path(self.tempdir.name) / "state.db")
         self.store.initialize()
         self.manager = FakeManager(self.store)
+        self.realm_processes = []
+
+        class RealmProcess:
+            def __init__(process_self):
+                process_self.returncode = None
+
+            def poll(process_self):
+                return process_self.returncode
+
+            def terminate(process_self):
+                process_self.returncode = 0
+
+            def wait(process_self, timeout=None):
+                return process_self.returncode
+
+            def kill(process_self):
+                process_self.returncode = -9
+
+        def start_realm(command, **kwargs):
+            process = RealmProcess()
+            self.realm_processes.append((command, process))
+            return process
+
+        self.realm_manager = RealmManager(
+            self.store,
+            binary="/usr/local/bin/realm",
+            popen=start_realm,
+        )
         self.server = LocalAPIServer(
             ("127.0.0.1", 0),
             store=self.store,
             manager=self.manager,
+            realm_manager=self.realm_manager,
             web_root=Path(self.tempdir.name),
             username="admin",
             password="secret",
@@ -90,7 +136,12 @@ class LocalAPITest(unittest.TestCase):
             finally:
                 error.close()
 
-    def test_login_returns_bearer_token_for_kui_frontend(self):
+    def test_management_api_accessible_without_login_in_local_mode(self):
+        status, body = self.request("/api/local/exits", authenticated=False)
+
+        self.assertEqual(200, status)
+
+    def test_management_login_endpoint_is_removed(self):
         status, body = self.request(
             "/api/login",
             method="POST",
@@ -98,33 +149,49 @@ class LocalAPITest(unittest.TestCase):
             authenticated=False,
         )
 
-        self.assertEqual(200, status)
-        self.assertEqual("admin", body["username"])
-        self.assertEqual("admin", body["role"])
-        self.assertTrue(body["token"])
+        self.assertEqual(404, status)
+        self.assertEqual("not_found", body["code"])
 
-    def test_bearer_token_authenticates_local_api(self):
-        status, login = self.request(
-            "/api/login",
+    def test_idle_slots_are_not_published(self):
+        status, body = self.request("/api/proxy/proxies", authenticated=False, expect_json=False)
+
+        self.assertEqual(200, status)
+        self.assertEqual("", body.strip())
+
+    def test_only_ready_listener_slots_are_published(self):
+        self.store.set_runtime(
+            "exit-01",
+            state="ready",
+            entry_ip="198.51.100.1",
+            egress_ip="203.0.113.1",
+        )
+        status, body = self.request("/api/proxy/proxies", authenticated=False, expect_json=False)
+
+        self.assertEqual(200, status)
+        self.assertIn(":7920#", body)
+        self.assertNotIn(":7921#", body)
+
+    def test_invalid_update_does_not_stop_ready_slot(self):
+        self.store.set_runtime("exit-01", state="ready")
+
+        status, body = self.request(
+            "/api/local/exits/exit-01",
+            method="PUT",
+            body={"proxy_port": 9001},
+        )
+
+        self.assertEqual(400, status)
+        self.assertNotIn(("stop", "exit-01"), self.manager.actions)
+
+    def test_proxy_switch_requires_explicit_slot(self):
+        status, body = self.request(
+            "/api/proxy/switch",
             method="POST",
-            body={"username": "admin", "password": "secret"},
-            authenticated=False,
+            body={"ip": "10.0.0.8"},
         )
-        self.assertEqual(200, status)
 
-        request = urllib.request.Request(
-            self.base + "/api/local/exits",
-            headers={"Authorization": f"Bearer {login['token']}"},
-        )
-        with urllib.request.urlopen(request, timeout=3) as response:
-            body = json.loads(response.read())
-
-        self.assertEqual(12, len(body["exits"]))
-
-    def test_management_api_accessible_without_login_in_local_mode(self):
-        status, body = self.request("/api/local/exits", authenticated=False)
-
-        self.assertEqual(200, status)
+        self.assertEqual(400, status)
+        self.assertEqual("slot_id is required", body["error"])
 
     def test_dashboard_asset_is_loadable_before_frontend_login(self):
         (Path(self.tempdir.name) / "index.html").write_text("<title>K-UI Local</title>", encoding="utf-8")
@@ -149,11 +216,24 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual([], body["servers"])
         self.assertEqual("local", body["mode"])
 
-    def test_kui_stats_endpoint_returns_empty_history_for_local_mode(self):
+    def test_kui_stats_endpoint_reflects_persisted_events_and_checks(self):
+        self.store.record_event("exit-01", "connected", "tunnel ready")
+        generation = self.store.get_slot("exit-01").generation
+        self.store.append_check_result(
+            "exit-01",
+            generation,
+            {"accepted": True, "egress_ip": "203.0.113.1"},
+        )
+
         status, body = self.request("/api/stats?ip=local")
 
         self.assertEqual(200, status)
-        self.assertEqual([], body)
+        self.assertEqual(1, len(body))
+        self.assertEqual(1, body[0]["event_count"])
+        self.assertEqual(1, body[0]["check_count"])
+        self.assertEqual(1, body[0]["accepted_checks"])
+        self.assertEqual(0, body[0]["total_bytes"])
+        self.assertRegex(body[0]["day"], r"^\d{4}-\d{2}-\d{2}$")
 
     def test_ui_ping_accepts_frontend_keepalive(self):
         status, body = self.request("/api/ui_ping", method="POST", body={})
@@ -161,22 +241,102 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertTrue(body["success"])
 
-    def test_probe_public_endpoint_returns_local_dashboard_shape(self):
+    def test_probe_public_endpoint_projects_all_local_slots(self):
+        self.store.set_runtime(
+            "exit-01",
+            state="ready",
+            egress_ip="203.0.113.1",
+            check_result={"targets": {"accepted": True}},
+        )
+        self.manager.listener_states["exit-01"] = True
+
         status, body = self.request("/api/probe/public?ajax=1")
 
         self.assertEqual(200, status)
-        self.assertEqual([], body["servers"])
+        self.assertEqual(12, len(body["servers"]))
+        first = body["servers"][0]
+        self.assertEqual("exit-01", first["id"])
+        self.assertEqual("ready", first["state"])
+        self.assertEqual("203.0.113.1", first["egress_ip"])
+        self.assertEqual({"targets": {"accepted": True}}, first["check_result"])
+        self.assertTrue(first["listener_ready"])
+        self.assertGreater(first["updated_at"], 0)
+        self.assertEqual(first["updated_at"] * 1000, first["last_updated"])
+        self.assertEqual("0", first["ping_ct"])
+        self.assertEqual("0", first["ping_cu"])
+        self.assertEqual("0", first["ping_cm"])
+        self.assertEqual("0", first["ping_bd"])
+        self.assertEqual("0", first["cpu"])
+        self.assertEqual("0", first["memory"])
+        self.assertEqual("0", first["net_in_speed"])
+        self.assertEqual("0", first["net_out_speed"])
         self.assertEqual("", body["realtime_url"])
         self.assertEqual("false", body["settings"]["is_public"])
         self.assertIn("cached_nodes_data", body["settings"])
 
-    def test_probe_admin_data_endpoint_returns_local_settings_shape(self):
+    def test_probe_admin_data_projects_all_local_slots(self):
         status, body = self.request("/api/probe/admin/data")
 
         self.assertEqual(200, status)
-        self.assertEqual([], body["servers"])
+        self.assertEqual(12, len(body["servers"]))
+        self.assertEqual("exit-01", body["servers"][0]["id"])
+        self.assertIn("listener_ready", body["servers"][0])
         self.assertEqual("false", body["settings"]["is_public"])
         self.assertIn("cached_nodes_data", body["settings"])
+
+    def test_realm_api_configures_starts_restarts_and_stops_real_manager(self):
+        initial_status, initial = self.request("/api/realm")
+        configure_status, configured = self.request(
+            "/api/realm",
+            method="PUT",
+            body={"listen": "0.0.0.0:5000", "remote": "1.1.1.1:443", "use_udp": True},
+        )
+        start_status, started = self.request(
+            "/api/realm",
+            method="POST",
+            body={"action": "start"},
+        )
+        restart_status, restarted = self.request(
+            "/api/realm",
+            method="POST",
+            body={"action": "restart"},
+        )
+        stop_status, stopped = self.request(
+            "/api/realm",
+            method="POST",
+            body={"action": "stop"},
+        )
+
+        self.assertEqual(200, initial_status)
+        self.assertTrue(initial["available"])
+        self.assertFalse(initial["running"])
+        self.assertEqual(200, configure_status)
+        self.assertEqual("0.0.0.0:5000", configured["listen"])
+        self.assertEqual("1.1.1.1:443", configured["remote"])
+        self.assertTrue(configured["use_udp"])
+        self.assertEqual(200, start_status)
+        self.assertTrue(started["running"])
+        self.assertEqual(
+            ["/usr/local/bin/realm", "-u", "-l", "0.0.0.0:5000", "-r", "1.1.1.1:443"],
+            self.realm_processes[0][0],
+        )
+        self.assertEqual(200, restart_status)
+        self.assertTrue(restarted["running"])
+        self.assertEqual(2, len(self.realm_processes))
+        self.assertEqual(200, stop_status)
+        self.assertFalse(stopped["running"])
+
+    def test_local_deploy_command_contains_only_local_compose_workflow(self):
+        status, body = self.request("/api/local/deploy-command")
+
+        self.assertEqual(200, status)
+        self.assertEqual("https://github.com/kim1232aa/kui-local-multi-exit.git", body["repository_url"])
+        self.assertEqual("docker compose up -d --build", body["compose_command"])
+        self.assertIn("KUI_MANAGEMENT_PASSWORD", body["environment"])
+        serialized = json.dumps(body)
+        self.assertNotIn("agent_token", serialized)
+        self.assertNotIn("agent_update", serialized)
+        self.assertNotIn("apk ", serialized)
 
     @patch("vps.local_api.fetch_countries", return_value=["CA", "JP", "US"])
     def test_proxy_status_endpoints_reflect_local_exit_slots(self, _mock_fetch_countries):
@@ -207,26 +367,27 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(7920, details[0]["port"])
 
     def test_proxy_extraction_returns_usable_local_socks5_lines(self):
+        self.manager.set_slot_ready("exit-01")
         request = urllib.request.Request(self.base + "/api/proxy/proxies", headers=self.auth)
         with urllib.request.urlopen(request, timeout=3) as response:
             body = response.read().decode("utf-8")
 
         lines = body.strip().splitlines()
-        self.assertEqual(12, len(lines))
+        self.assertEqual(1, len(lines))
         self.assertTrue(lines[0].startswith("socks5://admin:secret@127.0.0.1:7920#"))
         self.assertIn("exit-01", lines[0])
         self.assertIn("JP", lines[0])
 
-    def test_updates_country_and_port_then_restarts_only_slot(self):
+    def test_updates_country_then_restarts_only_slot(self):
         status, body = self.request(
             "/api/local/exits/exit-01",
             method="PUT",
-            body={"country": "CA", "proxy_port": 9001},
+            body={"country": "CA"},
         )
 
         self.assertEqual(200, status)
         self.assertEqual("CA", body["exit"]["country"])
-        self.assertEqual(9001, body["exit"]["proxy_port"])
+        self.assertEqual(7920, body["exit"]["proxy_port"])
         self.assertIn(("stop", "exit-01"), self.manager.actions)
         self.assertIn(("start", "exit-01"), self.manager.actions)
 
@@ -311,6 +472,134 @@ class LocalAPITest(unittest.TestCase):
 
         status, _ = self.request(f"/api/nodes?id={created['id']}", method="DELETE")
         self.assertEqual(200, status)
+
+    def test_vps_crud_preserves_complete_management_contract(self):
+        created_payload = {
+            "ip": "10.0.0.11",
+            "name": "edge-jp",
+            "os": "ubuntu",
+            "egress_mode": "socks5",
+            "proxy_mode": "include",
+            "proxy_categories": "video,ai",
+            "egress_revision": 7,
+            "egress_status": "pending",
+            "egress_applied_mode": "direct",
+            "egress_applied_revision": 6,
+            "egress_error": "waiting for apply",
+            "egress_ip": "203.0.113.11",
+            "socks5_addr": "proxy.example.com",
+            "socks5_port": 1080,
+            "socks5_user": "proxy-user",
+            "socks5_pass": "proxy-pass",
+        }
+
+        status, created = self.request("/api/vps", method="POST", body=created_payload)
+        self.assertEqual(200, status)
+        for key, value in created_payload.items():
+            self.assertEqual(value, created[key], key)
+
+        status, listed = self.request("/api/vps")
+        self.assertEqual(200, status)
+        stored = next(vps for vps in listed if vps["ip"] == created_payload["ip"])
+        for key, value in created_payload.items():
+            self.assertEqual(value, stored[key], key)
+
+        updated_payload = {
+            **created_payload,
+            "name": "edge-jp-updated",
+            "proxy_mode": "exclude",
+            "proxy_categories": "social",
+            "egress_revision": 8,
+            "egress_status": "applied",
+            "egress_applied_mode": "socks5",
+            "egress_applied_revision": 8,
+            "egress_error": "",
+            "egress_ip": "203.0.113.12",
+        }
+        status, updated = self.request("/api/vps", method="PUT", body=updated_payload)
+        self.assertEqual(200, status)
+        for key, value in updated_payload.items():
+            self.assertEqual(value, updated[key], key)
+
+        status, listed = self.request("/api/vps")
+        stored = next(vps for vps in listed if vps["ip"] == created_payload["ip"])
+        for key, value in updated_payload.items():
+            self.assertEqual(value, stored[key], key)
+
+    def test_node_crud_preserves_complete_management_contract(self):
+        created_payload = {
+            "id": 77,
+            "vps_ip": "10.0.0.12",
+            "name": "reality-jp",
+            "protocol": "Reality",
+            "address": "vpn.example.com",
+            "port": 443,
+            "username": "node-user",
+            "uuid": "11111111-1111-1111-1111-111111111111",
+            "password": "node-pass",
+            "sni": "www.example.com",
+            "private_key": "private-key",
+            "public_key": "public-key",
+            "short_id": "abcd",
+            "flow": "xtls-rprx-vision",
+            "network": "tcp",
+            "host": "cdn.example.com",
+            "path": "/reality",
+            "extra": "{\"fingerprint\":\"chrome\"}",
+            "relay_type": "node",
+            "target_ip": "198.51.100.12",
+            "target_port": 8443,
+            "target_id": 9,
+            "traffic_limit": 1073741824,
+            "expire_time": 2000000000,
+        }
+
+        status, created = self.request("/api/nodes", method="POST", body=created_payload)
+        self.assertEqual(200, status)
+        self.assertEqual(77, created["id"])
+        self.assertEqual(created_payload["vps_ip"], created["ip"])
+        for key, value in created_payload.items():
+            self.assertEqual(value, created[key], key)
+
+        status, listed = self.request("/api/nodes")
+        self.assertEqual(200, status)
+        stored = next(node for node in listed if node["id"] == 77)
+        for key, value in created_payload.items():
+            self.assertEqual(value, stored[key], key)
+
+        updated_payload = {
+            **created_payload,
+            "name": "reality-jp-updated",
+            "address": "vpn2.example.com",
+            "port": 8443,
+            "network": "ws",
+            "host": "edge.example.com",
+            "path": "/ws",
+            "target_port": 9443,
+        }
+        status, updated = self.request("/api/nodes", method="PUT", body=updated_payload)
+        self.assertEqual(200, status)
+        for key, value in updated_payload.items():
+            self.assertEqual(value, updated[key], key)
+
+        status, listed = self.request("/api/nodes")
+        stored = next(node for node in listed if node["id"] == 77)
+        for key, value in updated_payload.items():
+            self.assertEqual(value, stored[key], key)
+
+    def test_vps_and_node_crud_reject_unknown_fields(self):
+        requests = (
+            ("/api/vps", "POST", {"ip": "10.0.0.21", "unknown": True}),
+            ("/api/vps", "PUT", {"ip": "10.0.0.1", "unknown": True}),
+            ("/api/nodes", "POST", {"vps_ip": "10.0.0.22", "unknown": True}),
+            ("/api/nodes", "PUT", {"id": 1, "unknown": True}),
+        )
+
+        for path, method, payload in requests:
+            with self.subTest(path=path, method=method):
+                status, body = self.request(path, method=method, body=payload)
+                self.assertEqual(400, status)
+                self.assertEqual("unsupported_field", body["code"])
 
     def test_user_crud_lifecycle(self):
         status, created = self.request("/api/users", method="POST", body={"username": "user1", "password": "password123", "traffic_limit": 1073741824})
@@ -412,7 +701,8 @@ class LocalAPITest(unittest.TestCase):
         links = base64.b64decode(encoded).decode()
         self.assertNotIn("vpn.example.com", links)
 
-    def test_subscription_endpoint_includes_enabled_local_exit_socks5_nodes(self):
+    def test_subscription_endpoint_includes_only_ready_listener_local_exits(self):
+        self.manager.set_slot_ready("exit-01")
         status, data = self.request("/api/data")
         self.assertEqual(200, status)
         token = data["mySubToken"]
@@ -421,10 +711,21 @@ class LocalAPITest(unittest.TestCase):
 
         self.assertEqual(200, status)
         links = base64.b64decode(encoded).decode().splitlines()
-        self.assertEqual(12, len(links))
+        self.assertEqual(1, len(links))
         self.assertTrue(links[0].startswith("socks5://admin:secret@127.0.0.1:7920#JP_exit-01_"))
 
-    def test_subscription_clash_format_includes_enabled_local_exit_socks5_nodes(self):
+    def test_subscription_excludes_store_ready_slot_without_listener(self):
+        self.manager.set_slot_ready("exit-01", listener_ready=False)
+        status, data = self.request("/api/data")
+        token = data["mySubToken"]
+
+        status, encoded = self.request(f"/api/sub?user=admin&token={token}", expect_json=False)
+
+        self.assertEqual(200, status)
+        self.assertEqual("", base64.b64decode(encoded).decode())
+
+    def test_subscription_clash_format_includes_only_ready_listener_local_exits(self):
+        self.manager.set_slot_ready("exit-01")
         status, data = self.request("/api/data")
         self.assertEqual(200, status)
         token = data["mySubToken"]
@@ -449,11 +750,17 @@ class LocalAPITest(unittest.TestCase):
         links = base64.b64decode(encoded).decode()
         self.assertNotIn(":7920#JP_exit-01_", links)
 
-    def test_proxy_switch_delegates_to_slot_redial(self):
-        status, result = self.request("/api/proxy/switch", method="POST", body={"country": "JP", "port": 7920})
+    def test_proxy_switch_delegates_to_explicit_slot_redial(self):
+        status, result = self.request("/api/proxy/switch", method="POST", body={"slot_id": "exit-01"})
         self.assertEqual(202, status)
         self.assertTrue(result["accepted"])
         self.assertIn(("redial", "exit-01"), self.manager.actions)
+
+    def test_proxy_switch_accepts_unambiguous_legacy_port_mapping(self):
+        status, result = self.request("/api/proxy/switch", method="POST", body={"port": 7921})
+        self.assertEqual(202, status)
+        self.assertTrue(result["accepted"])
+        self.assertIn(("redial", "exit-02"), self.manager.actions)
 
     def test_local_nodes_endpoint_returns_candidate_list(self):
         status, nodes = self.request("/api/local/nodes?country=JP")
@@ -477,8 +784,90 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(report, body)
         fetch_report.assert_called_once_with("203.0.113.9")
 
+    def test_probe_detail_returns_current_slot_and_check_history(self):
+        self.store.set_runtime(
+            "exit-01",
+            state="ready",
+            egress_ip="203.0.113.9",
+            check_result={"targets": {"accepted": True}},
+        )
+        generation = self.store.get_slot("exit-01").generation
+        self.store.append_check_result(
+            "exit-01",
+            generation,
+            {"egress_ip": "203.0.113.9", "accepted": True},
+        )
+
+        status, body = self.request("/api/probe/detail?id=exit-01")
+
+        self.assertEqual(200, status)
+        self.assertEqual("exit-01", body["id"])
+        self.assertEqual("203.0.113.9", body["egress_ip"])
+        self.assertEqual({"targets": {"accepted": True}}, body["check_result"])
+        self.assertEqual(1, len(body["check_history"]))
+        self.assertEqual("203.0.113.9", body["check_history"][0]["result"]["egress_ip"])
+
     def test_probe_detail_returns_not_found_for_unknown_local_probe(self):
         status, body = self.request("/api/probe/detail?id=missing")
+
+        self.assertEqual(404, status)
+        self.assertEqual("not_found", body["code"])
+
+    def test_probe_display_metadata_round_trips_without_replacing_slot_state(self):
+        update_status, updated = self.request(
+            "/api/probe/admin/server",
+            method="PUT",
+            body={
+                "id": "exit-01",
+                "name": "Tokyo residential",
+                "server_group": "Japan",
+                "is_hidden": "true",
+                "price": "10USD/year",
+                "expire_date": "2027-01-01",
+                "bandwidth": "1Gbps",
+                "traffic_limit": "1TB/month",
+                "reset_day": "15",
+            },
+        )
+        admin_status, admin = self.request("/api/probe/admin/data")
+        detail_status, detail = self.request("/api/probe/detail?id=exit-01")
+
+        self.assertEqual(200, update_status)
+        self.assertEqual("Tokyo residential", updated["name"])
+        self.assertEqual(200, admin_status)
+        self.assertEqual(12, len(admin["servers"]))
+        self.assertEqual("Tokyo residential", admin["servers"][0]["name"])
+        self.assertEqual("Japan", admin["servers"][0]["server_group"])
+        self.assertEqual("idle", admin["servers"][0]["state"])
+        self.assertEqual(200, detail_status)
+        self.assertEqual("Tokyo residential", detail["name"])
+        self.assertEqual("exit-01", detail["id"])
+
+    def test_reset_probe_display_metadata_keeps_slot_and_restores_defaults(self):
+        self.request(
+            "/api/probe/admin/server",
+            method="PUT",
+            body={"id": "exit-01", "name": "Custom", "server_group": "Custom group"},
+        )
+
+        reset_status, reset = self.request("/api/probe/admin/server?id=exit-01", method="DELETE")
+        admin_status, admin = self.request("/api/probe/admin/data")
+        detail_status, detail = self.request("/api/probe/detail?id=exit-01")
+
+        self.assertEqual(200, reset_status)
+        self.assertTrue(reset["success"])
+        self.assertEqual(200, admin_status)
+        self.assertEqual(12, len(admin["servers"]))
+        self.assertEqual("exit-01", admin["servers"][0]["name"])
+        self.assertEqual(200, detail_status)
+        self.assertEqual("exit-01", detail["name"])
+
+    def test_probe_display_metadata_rejects_unknown_slot(self):
+        status, body = self.request(
+            "/api/probe/admin/server",
+            method="PUT",
+            body={"id": "exit-99", "name": "Unknown"},
+        )
 
         self.assertEqual(404, status)
         self.assertEqual("not_found", body["code"])
@@ -512,20 +901,15 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual("Probe Title", probe["settings"]["site_title"])
 
     @patch("vps.local_api.set_credentials")
-    def test_user_password_change_succeeds_and_updates_login(self, set_credentials):
+    def test_user_password_change_updates_shared_proxy_credentials(self, set_credentials):
         status, body = self.request("/api/user/password", method="PUT", body={"password": "newpass123"})
         self.assertEqual(200, status)
         self.assertTrue(body["success"])
         set_credentials.assert_called_once_with("admin", "newpass123")
-
-        login_status, login_body = self.request(
-            "/api/login",
-            method="POST",
-            body={"username": "admin", "password": "newpass123"},
-            authenticated=False,
-        )
-        self.assertEqual(200, login_status)
-        self.assertTrue(login_body["token"])
+        stored = self.store.get_user("admin")
+        self.assertIsNotNone(stored)
+        expected_hash = LocalAPIHandler._hash_password("newpass123")
+        self.assertEqual(expected_hash, stored["password"])
 
     def test_sub_token_reset_returns_new_token(self):
         status, body = self.request("/api/user/sub_token", method="PUT", body={})

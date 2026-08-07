@@ -15,7 +15,7 @@ from .models import ExitSlotSnapshot
 from .proxy_server import ProxyListener
 from .routing import RouteManager
 from .store import LocalStore
-from .vpngate import NodePool, check_residential, check_streaming, detect_egress, fetch_nodes
+from .vpngate import STREAM_URLS, NodePool, check_residential, detect_egress, fetch_nodes, probe_targets
 
 
 @dataclass
@@ -67,6 +67,15 @@ class ExitManager:
             return self._runtimes[slot_id]
         except KeyError as error:
             raise KeyError(slot_id) from error
+
+    def listener_ready(self, slot_id: str) -> bool:
+        listener = self.runtime(slot_id).listener
+        if listener is None:
+            return False
+        checker = getattr(listener, "is_ready", None)
+        if callable(checker):
+            return bool(checker())
+        return bool(getattr(listener, "started", False) and not getattr(listener, "stopped", False))
 
     def initialize(self) -> None:
         self.workspace.mkdir(parents=True, exist_ok=True)
@@ -278,6 +287,13 @@ class ExitManager:
             self._schedule_retry(slot_id, failed.generation, delay)
         return failed
 
+    def record_failed_check(self, slot_id: str, generation: int, check_result: dict[str, Any]) -> bool:
+        current = self.store.get_slot(slot_id)
+        if not current.enabled or current.generation != generation:
+            return False
+        self.store.append_check_result(slot_id, generation, check_result)
+        return True
+
     def commit_ready(
         self,
         slot_id: str,
@@ -293,19 +309,19 @@ class ExitManager:
             return False
         runtime = self.runtime(slot_id)
         assert runtime.lock is not None
-        with runtime.lock:
-            if runtime.listener:
-                runtime.listener.stop()
-            runtime.listener = self.listener_factory(
-                current.id,
-                "0.0.0.0",
-                current.proxy_port,
-                current.tunnel_name,
-                current.mark,
-            )
-            runtime.listener.start()
-            self.store.set_runtime(
+        listener = self.listener_factory(
+            current.id,
+            "0.0.0.0",
+            current.proxy_port,
+            current.tunnel_name,
+            current.mark,
+        )
+        try:
+            listener.start(timeout=3)
+            self.store.append_check_result(slot_id, generation, check_result)
+            updated = self.store.set_runtime_if_generation(
                 slot_id,
+                generation,
                 state="ready",
                 entry_ip=entry_ip,
                 egress_ip=egress_ip,
@@ -314,6 +330,19 @@ class ExitManager:
                 last_error="",
                 failure_streak=0,
             )
+            if updated is None:
+                listener.stop()
+                return False
+            with runtime.lock:
+                if runtime.listener:
+                    runtime.listener.stop()
+                runtime.listener = listener
+        except Exception:
+            listener.stop()
+            with runtime.lock:
+                if runtime.listener is listener:
+                    runtime.listener = None
+            raise
         self.store.record_event(slot_id, "connected", f"{entry_ip} -> {egress_ip}")
         return True
 
@@ -345,14 +374,18 @@ class ExitManager:
             args.append(str(auth_file))
         return args
 
+    def _node_eligible(self, node: dict[str, Any]) -> bool:
+        return not self._openvpn_proxy_args() or bool(
+            re.search(r"(?m)^proto\s+tcp(?:-client)?\b", node["config"])
+        )
+
     def _select_node(self, country: str, excluded: set[str]) -> dict[str, Any] | None:
         skipped = set(excluded)
-        proxy_enabled = bool(self._openvpn_proxy_args())
         while True:
             node = self.node_pool.select(country, skipped)
             if not node:
                 return None
-            if not proxy_enabled or re.search(r"(?m)^proto\s+tcp(?:-client)?\b", node["config"]):
+            if self._node_eligible(node):
                 return node
             skipped.add(node["ip"])
 
@@ -361,7 +394,7 @@ class ExitManager:
             self._reserved_nodes.pop(slot_id, None)
             excluded = self.active_entry_ips(excluding=slot_id)
             node = self.node_pool.get(preferred_ip, country) if preferred_ip else None
-            if node is not None and node["ip"] in excluded:
+            if node is not None and (node["ip"] in excluded or not self._node_eligible(node)):
                 node = None
             if node is None:
                 node = self._select_node(country, excluded)
@@ -372,6 +405,18 @@ class ExitManager:
     def _release_node(self, slot_id: str) -> None:
         with self._selection_lock:
             self._reserved_nodes.pop(slot_id, None)
+
+    @staticmethod
+    def _write_runtime_file(path: Path, content: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        path.chmod(0o600)
+
+    @staticmethod
+    def _prepare_runtime_log(path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch(mode=0o600, exist_ok=True)
+        path.chmod(0o600)
 
     def _openvpn_command(self, slot: ExitSlotSnapshot, config_path: Path) -> list[str]:
         version = self._run(["openvpn", "--version"], capture_output=True, text=True, check=False).stdout
@@ -425,7 +470,8 @@ class ExitManager:
             endpoint_ip = str(node["ip"])
             config_path = self.config_dir / f"{slot_id}.ovpn"
             log_path = self.workspace / f"{slot_id}.log"
-            config_path.write_text(node["config"], encoding="utf-8")
+            self._write_runtime_file(config_path, node["config"])
+            self._prepare_runtime_log(log_path)
             gateway, external_interface = self._default_route(self._run)
             with log_path.open("w") as log_file:
                 runtime.process = self._popen(
@@ -448,16 +494,19 @@ class ExitManager:
             if self.store.get_slot(slot_id).generation != generation:
                 return
             self.routing.install(slot, endpoint_ip, gateway, external_interface)
-            egress_ip = detect_egress(slot.tunnel_name, self._run) or endpoint_ip
+            egress_ip = detect_egress(slot.tunnel_name, self._run)
+            if not egress_ip:
+                raise RuntimeError("real egress IP unavailable")
             residential, residential_result = check_residential(egress_ip)
             if not residential:
                 self.node_pool.penalize(endpoint_ip, 50000)
                 raise RuntimeError("exit classified as datacenter")
-            streaming, streaming_result = check_streaming(slot.tunnel_name, self._run)
-            if not streaming:
+            probe_result = probe_targets(slot.tunnel_name, STREAM_URLS, self._run)
+            check_result = {"residential": residential_result, "targets": probe_result}
+            if not probe_result["accepted"]:
+                self.record_failed_check(slot_id, generation, check_result)
                 self.node_pool.penalize(endpoint_ip, 3000)
-                raise RuntimeError("all streaming probes failed")
-            check_result = {"residential": residential_result, "streaming": streaming_result}
+                raise RuntimeError("target probes failed")
             if not self.commit_ready(
                 slot_id,
                 generation,
@@ -491,6 +540,9 @@ class ExitManager:
                 return
             if runtime.process.poll() is not None:
                 self._handle_connection_failure(slot_id, generation, "OpenVPN process exited", current.entry_ip)
+                return
+            if not self.routing.is_installed(current):
+                self._handle_connection_failure(slot_id, generation, "policy route disappeared", current.entry_ip)
                 return
             egress = detect_egress(slot.tunnel_name, self._run)
             if egress and egress == current.egress_ip:

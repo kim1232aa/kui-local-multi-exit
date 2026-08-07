@@ -6,4 +6,9 @@ __pycache__/
 *.db
 *.db-shm
 *.db-wal
+*.ovpn
+*.log
+auth.txt
+socks_auth.txt
+runtime/
 temp/

@@ -10,6 +10,10 @@ services:
     environment:
       KUI_MANAGEMENT_USER: ${KUI_MANAGEMENT_USER:-admin}
       KUI_MANAGEMENT_PASSWORD: ${KUI_MANAGEMENT_PASSWORD:?set KUI_MANAGEMENT_PASSWORD}
+      KUI_FETCH_PROXY: ${KUI_FETCH_PROXY:-}
+      KUI_OPENVPN_SOCKS_PROXY: ${KUI_OPENVPN_SOCKS_PROXY:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "${KUI_MANAGEMENT_PORT:-8080}:8080"
       - "7920-7931:7920-7931"

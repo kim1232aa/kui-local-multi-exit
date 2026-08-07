@@ -54,9 +54,56 @@ class DashboardContractTest(unittest.TestCase):
             "@click=\"logout\"",
             "const logout =",
             "const login =",
+            "isLoggedIn",
+            "authKey",
+            "authGeneration",
+            "currentUser",
+            "Authorization",
+            "Bearer",
+            "agent_token",
+            "/api/agent_update",
+            "请先刷新页面以签发独立 Agent Token",
+            "apk update",
+            "Agent 下次心跳",
+            "实时下发",
+            "功能规划占位",
         ):
             self.assertNotIn(removed, self.html)
-        self.assertIn("const isLoggedIn = ref(true)", self.html)
+
+    def test_realm_and_local_deployment_views_call_real_local_apis(self):
+        for marker in (
+            "/api/realm",
+            "loadRealmStatus",
+            "saveRealmConfig",
+            "startRealm",
+            "stopRealm",
+            "restartRealm",
+            "/api/local/deploy-command",
+            "loadDeployCommand",
+            "docker compose up -d --build",
+        ):
+            self.assertIn(marker, self.html)
+        self.assertNotIn("本地多出口模式不启动独立 Realm 进程", self.html)
+
+    def test_multi_exit_cards_explain_real_publishability_and_probe_attempts(self):
+        for marker in (
+            "listener_ready",
+            "targets.attempts",
+            "attempt.url",
+            "attempt.code",
+            "attempt.classification",
+            "attempt.error",
+            "目标明确应答 403",
+            "未发布到订阅",
+        ):
+            self.assertIn(marker, self.html)
+        self.assertNotIn("403（可正常使用）", self.html)
+
+    def test_management_requests_do_not_send_cloud_session_headers(self):
+        self.assertNotIn("kuiAdminAuthHeader", self.html)
+        self.assertNotIn("getPcAuthHeader", self.html)
+        self.assertNotIn("realtimeUrl", self.html)
+        self.assertNotIn("switchProxyIP", self.html)
 
     def test_local_dashboard_preserves_all_original_admin_sections(self):
         for marker in (

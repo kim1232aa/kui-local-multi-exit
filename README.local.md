@@ -22,6 +22,18 @@ export KUI_MANAGEMENT_PASSWORD='change-this-password'
 docker compose up -d --build
 ```
 
+`KUI_MANAGEMENT_PASSWORD` 是 12 个 SOCKS5 出口共用的代理密码，不是面板登录密码；面板免登录，不存在第二组管理密码。
+
+如当前网络必须先经过临时 Clash SOCKS5 才能拉 VPNGate 源或建立 OpenVPN，可显式设置：
+
+```bash
+export KUI_FETCH_PROXY='socks5://host.docker.internal:7896'
+export KUI_OPENVPN_SOCKS_PROXY='socks5://host.docker.internal:7896'
+docker compose up -d --build
+```
+
+Compose 已映射 `host.docker.internal`。这两个变量默认均为空；直连可用时不要设置。`KUI_OPENVPN_SOCKS_PROXY` 下只能选择 TCP OpenVPN 节点，因为 OpenVPN 的 SOCKS 传输不支持 UDP 节点。
+
 面板：`http://<VPS-IP>:8080/`
 
 代理：
@@ -42,7 +54,10 @@ SOCKS5 exit-12: socks5://admin:<same-password>@<VPS-IP>:7931
 - 修改两位国家代码或 `ANY`，修改端口后点击“保存”。
 - 点击“换 IP”只重拨当前槽位；接受请求不代表隧道已经就绪，需观察状态变为 `ready`。
 - 连续三次失败后槽位显示 `disabled`，点击“启用”才会重新拨号。
-- `出口 IP`、`VPNGate 节点`、`原检查结果`和错误信息分开显示。
+- 只有 `enabled=true`、状态为 `ready` 且 SOCKS5 监听器真实就绪的槽位才发布到订阅；卡片会明确显示未发布原因。
+- `出口 IP`、`VPNGate 节点`、TestISP 的 ISP/住宅原始分类、每个目标 URL 的 HTTP 状态/分类/错误和槽位错误信息分开显示。
+- Realm 页直接管理真实本地 `realm` 进程；镜像没有该二进制时明确显示“二进制不可用”，不会假报启动成功。
+- “恢复默认展示”只清除固定槽位的探针展示元数据，不删除槽位和运行状态。
 
 ## 真实验证
 

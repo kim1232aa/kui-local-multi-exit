@@ -172,8 +172,6 @@ def _parse_line(raw: str) -> dict[str, Any] | None:
         return _parse_tuic_or_naive(raw, "Naive")
     if lowered.startswith("ss://"):
         return _parse_ss(raw)
-    if lowered.startswith("ssr://"):
-        return _parse_ssr(raw)
     if lowered.startswith("anytls://"):
         return _parse_password_url(raw, "AnyTLS")
     return None

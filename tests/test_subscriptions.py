@@ -2,6 +2,7 @@ import base64
 import json
 import unittest
 
+from vps.local_api import LocalAPIHandler
 from vps.subscriptions import parse_subscription
 
 
@@ -81,7 +82,7 @@ class SubscriptionParserTest(unittest.TestCase):
         result = parse_subscription(content)
 
         self.assertEqual(
-            ["Trojan", "Hysteria2", "TUIC", "Naive", "SS", "SSR", "AnyTLS"],
+            ["Trojan", "Hysteria2", "TUIC", "Naive", "SS", "AnyTLS"],
             [node["protocol"] for node in result.nodes],
         )
         self.assertEqual("trojan-pass", result.nodes[0]["password"])
@@ -91,8 +92,35 @@ class SubscriptionParserTest(unittest.TestCase):
         self.assertEqual("naive-user", result.nodes[3]["uuid"])
         self.assertEqual("aes-256-gcm", result.nodes[4]["uuid"])
         self.assertEqual("ss-pass", result.nodes[4]["password"])
-        self.assertEqual("ssr-pass", result.nodes[5]["password"])
-        self.assertEqual("any-pass", result.nodes[6]["password"])
+        self.assertEqual("any-pass", result.nodes[5]["password"])
+        self.assertEqual(1, result.debug["rejected"])
+
+    def test_every_accepted_protocol_has_a_plain_subscription_export(self):
+        vmess = base64.b64encode(json.dumps({
+            "ps": "VMess",
+            "add": "vmess.example.com",
+            "port": "443",
+            "id": "22222222-2222-2222-2222-222222222222",
+        }).encode()).decode().rstrip("=")
+        ss_credentials = base64.urlsafe_b64encode(b"aes-256-gcm:ss-pass").decode().rstrip("=")
+        content = "\n".join((
+            f"vmess://{vmess}",
+            "vless://11111111-1111-1111-1111-111111111111@vless.example.com:443#VLESS",
+            "vless://11111111-1111-1111-1111-111111111111@reality.example.com:443?security=reality&pbk=key#Reality",
+            "trojan://trojan-pass@trojan.example.com:443#Trojan",
+            "hy2://hy-pass@hy.example.com:8443#HY2",
+            "tuic://tuic-uuid:tuic-pass@tuic.example.com:443#TUIC",
+            "naive+https://naive-user:naive-pass@naive.example.com:443#Naive",
+            f"ss://{ss_credentials}@ss.example.com:8388#SS",
+            "anytls://any-pass@any.example.com:443#AnyTLS",
+        ))
+
+        result = parse_subscription(content)
+
+        self.assertEqual(9, len(result.nodes))
+        for node in result.nodes:
+            with self.subTest(protocol=node["protocol"]):
+                self.assertTrue(LocalAPIHandler._subscription_link(node))
 
 
 if __name__ == "__main__":

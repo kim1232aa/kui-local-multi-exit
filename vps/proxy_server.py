@@ -208,16 +208,31 @@ class ProxyListener:
         self.interface = interface
         self.mark = mark
         self.ready = threading.Event()
+        self._started = threading.Event()
         self._stop = threading.Event()
         self._servers: list[socket.socket] = []
+        self._clients: set[socket.socket] = set()
+        self._clients_lock = threading.RLock()
         self._thread: threading.Thread | None = None
+        self._startup_error: OSError | None = None
+        self._connection_slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
 
-    def start(self) -> None:
+    def is_ready(self) -> bool:
+        return self.ready.is_set() and self._thread is not None and self._thread.is_alive()
+
+    def start(self, timeout: float = 3) -> None:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
+        self.ready.clear()
+        self._started.clear()
+        self._startup_error = None
         self._thread = threading.Thread(target=self.serve_forever, name=f"proxy-{self.slot_id}", daemon=True)
         self._thread.start()
+        if not self._started.wait(timeout):
+            raise TimeoutError(f"proxy listener {self.slot_id} did not become ready")
+        if self._startup_error is not None:
+            raise self._startup_error
 
     def stop(self) -> None:
         self._stop.set()
@@ -228,6 +243,18 @@ class ProxyListener:
             except OSError:
                 pass
         self._servers.clear()
+        with self._clients_lock:
+            clients = list(self._clients)
+            self._clients.clear()
+        for client in clients:
+            try:
+                client.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                client.close()
+            except OSError:
+                pass
         if self._thread and self._thread is not threading.current_thread():
             self._thread.join(timeout=3)
 
@@ -347,13 +374,16 @@ class ProxyListener:
         except (OSError, ConnectionError):
             pass
         finally:
+            with self._clients_lock:
+                self._clients.discard(client)
             try:
                 client.close()
             finally:
-                CONNECTION_SLOTS.release()
+                self._connection_slots.release()
 
     def serve_forever(self) -> None:
         servers: list[socket.socket] = []
+        server4 = None
         try:
             server4 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server4.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -377,6 +407,7 @@ class ProxyListener:
                         pass
             self._servers = servers
             self.ready.set()
+            self._started.set()
             while not self._stop.is_set():
                 try:
                     readable, _, _ = select.select(servers, [], [], 0.5)
@@ -387,16 +418,28 @@ class ProxyListener:
                         client, _ = server.accept()
                     except OSError:
                         continue
-                    if not CONNECTION_SLOTS.acquire(blocking=False):
+                    if not self._connection_slots.acquire(blocking=False):
                         client.close()
                         continue
+                    with self._clients_lock:
+                        self._clients.add(client)
                     try:
                         threading.Thread(target=self._proxy_client, args=(client,), daemon=True).start()
                     except Exception:
-                        CONNECTION_SLOTS.release()
+                        with self._clients_lock:
+                            self._clients.discard(client)
+                        self._connection_slots.release()
                         client.close()
+        except OSError as error:
+            self._startup_error = error
+            self._started.set()
         finally:
             self.ready.clear()
+            if server4 is not None and server4 not in servers:
+                try:
+                    server4.close()
+                except OSError:
+                    pass
             for server in servers:
                 try:
                     server.close()

@@ -21,6 +21,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .exit_manager import ExitManager
 from .proxy_server import set_credentials
+from .realm_manager import RealmManager, RealmUnavailable
 from .store import LocalStore
 from .subscriptions import parse_subscription
 from .vpngate import direct_url_opener, fetch_countries
@@ -30,6 +31,10 @@ TESTISP_API_URL = "https://testisp.info/api/check"
 GITHUB_PROBE_DATA_URL = "https://raw.githubusercontent.com/a63414262/CF-Server-Monitor-Pro/refs/heads/main/nodes.json"
 MAX_GITHUB_PROBE_DATA_BYTES = 4 * 1024 * 1024
 MAX_SUBSCRIPTION_BYTES = 4 * 1024 * 1024
+
+
+class UnsupportedField(ValueError):
+    """The client sent a field this endpoint does not implement."""
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -130,6 +135,19 @@ COUNTRY_PRESETS = (
     "CZ", "GR", "HU", "RO", "BG", "HR", "SK", "SI", "LT", "LV", "EE", "UA",
     "RS", "BA", "CY", "MT", "IS", "LU",
 )
+VPS_FIELDS = {
+    "ip", "name", "os", "egress_mode", "proxy_mode", "proxy_categories",
+    "egress_revision", "egress_status", "egress_applied_mode",
+    "egress_applied_revision", "egress_error", "egress_ip", "socks5_addr",
+    "socks5_port", "socks5_user", "socks5_pass",
+}
+NODE_FIELDS = {
+    "id", "ip", "vps_ip", "name", "protocol", "address", "port", "username",
+    "uuid", "password", "sni", "private_key", "public_key", "short_id", "flow",
+    "network", "host", "path", "extra", "relay_type", "target_ip", "target_port",
+    "target_id", "enable", "traffic_used", "traffic_limit", "expire_time",
+    "reset_traffic",
+}
 
 
 class LocalAPIServer(ThreadingHTTPServer):
@@ -141,6 +159,7 @@ class LocalAPIServer(ThreadingHTTPServer):
         *,
         store: LocalStore,
         manager: ExitManager,
+        realm_manager: RealmManager | None = None,
         web_root: Path | str,
         username: str,
         password: str,
@@ -149,20 +168,12 @@ class LocalAPIServer(ThreadingHTTPServer):
             raise ValueError("management username and password are required")
         self.store = store
         self.manager = manager
+        self.realm_manager = realm_manager or RealmManager(store)
         self.web_root = Path(web_root).resolve()
         self.username = username
         self.password = password
-        self._tokens: set[str] = set()
         self._countries_cache: tuple[float, list[str]] | None = None
         super().__init__(address, LocalAPIHandler)
-
-    def issue_token(self) -> str:
-        token = secrets.token_urlsafe(32)
-        self._tokens.add(token)
-        return token
-
-    def is_token_valid(self, token: str) -> bool:
-        return any(secrets.compare_digest(token, issued) for issued in self._tokens)
 
 
 class LocalAPIHandler(BaseHTTPRequestHandler):
@@ -191,22 +202,6 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(payload)
-
-    def _authenticated(self) -> bool:
-        authorization = self.headers.get("Authorization", "")
-        if authorization.startswith("Bearer "):
-            return self.server.is_token_valid(authorization[7:].strip())
-        if not authorization.startswith("Basic "):
-            return False
-        try:
-            decoded = base64.b64decode(authorization[6:], validate=True).decode("utf-8")
-            username, password = decoded.split(":", 1)
-        except (ValueError, UnicodeError):
-            return False
-        return hmac.compare_digest(username, self.server.username) and hmac.compare_digest(password, self.server.password)
-
-    def _require_auth(self) -> bool:
-        return True
 
     def _read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
@@ -244,6 +239,85 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 merged[key] = value
         return merged
 
+    def _slot_projection(self) -> list[dict[str, Any]]:
+        projected = []
+        for slot in self.server.manager.snapshot():
+            listener_ready = bool(self.server.manager.listener_ready(slot["id"]))
+            updated_at = int(slot.get("updated_at") or 0)
+            metadata: dict[str, Any] = {}
+            raw_metadata = self.server.store.get_setting(f"probe_server_{slot['id']}")
+            if raw_metadata:
+                try:
+                    parsed = json.loads(raw_metadata)
+                    if isinstance(parsed, dict):
+                        metadata = parsed
+                except json.JSONDecodeError:
+                    metadata = {}
+            metadata.pop("id", None)
+            projected.append(
+                {
+                    **slot,
+                    "listener_ready": listener_ready,
+                    "last_updated": updated_at * 1000,
+                    "name": slot["id"],
+                    "region": slot["country"],
+                    "country_code": slot["country"],
+                    "ping_ct": "0",
+                    "ping_cu": "0",
+                    "ping_cm": "0",
+                    "ping_bd": "0",
+                    "cpu": "0",
+                    "memory": "0",
+                    "net_in_speed": "0",
+                    "net_out_speed": "0",
+                    "net_rx": "0",
+                    "net_tx": "0",
+                    "monthly_rx": "0",
+                    "monthly_tx": "0",
+                    "realtime_state": "online"
+                    if slot["enabled"] and slot["state"] == "ready" and listener_ready
+                    else "offline",
+                    **metadata,
+                    "id": slot["id"],
+                }
+            )
+        return projected
+
+    def _statistics(self) -> list[dict[str, Any]]:
+        daily: dict[str, dict[str, Any]] = {}
+
+        def bucket(timestamp: int) -> dict[str, Any]:
+            day = time.strftime("%Y-%m-%d", time.localtime(timestamp))
+            return daily.setdefault(
+                day,
+                {
+                    "day": day,
+                    "event_count": 0,
+                    "check_count": 0,
+                    "accepted_checks": 0,
+                    "total_bytes": 0,
+                },
+            )
+
+        for event in self.server.store.list_events(limit=500):
+            bucket(int(event["created_at"]))["event_count"] += 1
+        for check in self.server.store.list_check_results(limit=500):
+            row = bucket(int(check["created_at"]))
+            row["check_count"] += 1
+            result = check["result"]
+            accepted = bool(result.get("accepted"))
+            if not accepted and isinstance(result.get("targets"), dict):
+                accepted = bool(result["targets"].get("accepted"))
+            row["accepted_checks"] += int(accepted)
+        return [daily[day] for day in sorted(daily)]
+
+    def _publishable_slots(self) -> list[dict[str, Any]]:
+        return [
+            slot
+            for slot in self._slot_projection()
+            if slot["enabled"] and slot["state"] == "ready" and slot["listener_ready"]
+        ]
+
     def _proxy_details(self) -> list[dict[str, Any]]:
         return [
             {
@@ -251,7 +325,8 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 "country": slot["country"],
                 "node_ip": slot["egress_ip"] or slot["entry_ip"],
                 "port": slot["proxy_port"],
-                "active": slot["state"] == "ready",
+                "active": slot["state"] == "ready" and self.server.manager.listener_ready(slot["id"]),
+                "listener_ready": self.server.manager.listener_ready(slot["id"]),
             }
             for slot in self.server.manager.snapshot()
         ]
@@ -404,9 +479,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         username = quote(self.server.username, safe="")
         password = quote(self.server.password, safe="")
         links = []
-        for slot in self.server.manager.snapshot():
-            if not slot["enabled"]:
-                continue
+        for slot in self._publishable_slots():
             name = quote(f"{slot['country']}_{slot['id']}_{slot['state']}", safe="")
             links.append(f"socks5://{username}:{password}@{host}:{slot['proxy_port']}#{name}")
         return links
@@ -414,9 +487,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
     def _local_clash_proxies(self) -> list[tuple[str, str]]:
         host = self._request_proxy_host()
         proxies = []
-        for slot in self.server.manager.snapshot():
-            if not slot["enabled"]:
-                continue
+        for slot in self._publishable_slots():
             name = f"{slot['country']}_{slot['id']}_{slot['state']}"
             proxy = "\n".join((
                 f"  - name: {json.dumps(name, ensure_ascii=False)}",
@@ -441,26 +512,31 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         return token
 
     def do_GET(self) -> None:
-        if not self._require_auth():
-            return
         if self.path.split("?", 1)[0] == "/healthz":
             self._send_json(HTTPStatus.OK, {"ok": True})
             return
         if self.path.split("?", 1)[0] == "/api/local/status":
-            slots = self.server.manager.snapshot()
+            slots = [
+                {**slot, "listener_ready": bool(self.server.manager.listener_ready(slot["id"]))}
+                for slot in self.server.manager.snapshot()
+            ]
             self._send_json(
                 HTTPStatus.OK,
                 {
                     "ok": True,
                     "total": len(slots),
-                    "ready": sum(slot["state"] == "ready" for slot in slots),
+                    "ready": len(self._publishable_slots()),
                     "enabled": sum(bool(slot["enabled"]) for slot in slots),
                     "exits": slots,
                 },
             )
             return
         if self.path.split("?", 1)[0] == "/api/local/exits":
-            self._send_json(HTTPStatus.OK, {"exits": self.server.manager.snapshot()})
+            slots = [
+                {**slot, "listener_ready": bool(self.server.manager.listener_ready(slot["id"]))}
+                for slot in self.server.manager.snapshot()
+            ]
+            self._send_json(HTTPStatus.OK, {"exits": slots})
             return
         path = self.path.split("?", 1)[0]
         if path.startswith("/api/local/events"):
@@ -485,16 +561,36 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             })
             return
         if path == "/api/stats":
-            self._send_json(HTTPStatus.OK, [])
+            self._send_json(HTTPStatus.OK, self._statistics())
             return
         if path == "/api/probe/public":
             self._send_json(
                 HTTPStatus.OK,
-                {"settings": self._probe_settings(), "servers": [], "realtime_url": ""},
+                {"settings": self._probe_settings(), "servers": self._slot_projection(), "realtime_url": ""},
             )
             return
         if path == "/api/probe/admin/data":
-            self._send_json(HTTPStatus.OK, {"settings": self._probe_settings(), "servers": []})
+            self._send_json(
+                HTTPStatus.OK,
+                {"settings": self._probe_settings(), "servers": self._slot_projection()},
+            )
+            return
+        if path == "/api/realm":
+            self._send_json(HTTPStatus.OK, self.server.realm_manager.status())
+            return
+        if path == "/api/local/deploy-command":
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "repository_url": "https://github.com/kim1232aa/kui-local-multi-exit.git",
+                    "environment": {
+                        "KUI_MANAGEMENT_PASSWORD": "<shared-proxy-password>",
+                        "KUI_FETCH_PROXY": "",
+                        "KUI_OPENVPN_SOCKS_PROXY": "",
+                    },
+                    "compose_command": "docker compose up -d --build",
+                },
+            )
             return
         if path == "/api/proxy/countries":
             cached = self.server._countries_cache
@@ -544,9 +640,9 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             host = self._request_proxy_host()
             lines = [
                 f"socks5://{username}:{password}@{host}:{slot['proxy_port']}#{slot['country']}_{slot['id']}_{slot['state']}"
-                for slot in self.server.manager.snapshot()
+                for slot in self._publishable_slots()
             ]
-            self._send_text(HTTPStatus.OK, "\n".join(lines) + "\n")
+            self._send_text(HTTPStatus.OK, "\n".join(lines) + ("\n" if lines else ""))
             return
         if path == "/api/sub":
             if self.server.store.get_setting("probe_subscription_protection") == "true":
@@ -601,15 +697,14 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/probe/detail":
             detail_id = self._query_param("id") or ""
-            setting = self.server.store.get_setting(f"probe_server_{detail_id}")
-            if not setting or self.server.store.get_setting(f"probe_server_{detail_id}_deleted") == "1":
+            detail = next((slot for slot in self._slot_projection() if slot["id"] == detail_id), None)
+            if detail is None:
                 self._send_json(HTTPStatus.NOT_FOUND, {"code": "not_found", "error": "probe server not found"})
                 return
-            try:
-                detail = json.loads(setting)
-            except json.JSONDecodeError:
-                self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"code": "invalid_state", "error": "probe server data is invalid"})
-                return
+            detail["check_history"] = self.server.store.list_check_results(
+                slot_id=detail_id,
+                limit=100,
+            )
             self._send_json(HTTPStatus.OK, detail)
             return
         if path == "/api/proxy/testisp-lookup":
@@ -630,8 +725,6 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         self._serve_asset()
 
     def do_PUT(self) -> None:
-        if not self._require_auth():
-            return
         path = self.path.split("?", 1)[0]
         match = self._slot_match()
         if match:
@@ -641,9 +734,20 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 allowed = {"country", "proxy_port", "enabled"}
                 if set(payload) - allowed:
                     raise ValueError("unsupported slot field")
-                current = self.server.store.get_slot(slot_id)
-                was_enabled = current.enabled
-                if was_enabled:
+                current = self.server.store.validate_slot_update(
+                    slot_id,
+                    country=payload.get("country"),
+                    proxy_port=payload.get("proxy_port"),
+                    enabled=payload.get("enabled"),
+                )
+                changed = any(
+                    getattr(current, key) != (str(value).upper() if key == "country" else value)
+                    for key, value in payload.items()
+                )
+                if not changed:
+                    self._send_json(HTTPStatus.OK, {"exit": current.as_dict()})
+                    return
+                if current.enabled:
                     self.server.manager.stop_slot(slot_id)
                 updated = self.server.store.update_slot(slot_id, **payload)
                 if updated.enabled:
@@ -658,22 +762,43 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         try:
             payload = self._read_json()
             if path == "/api/vps":
+                unknown = set(payload) - VPS_FIELDS
+                if unknown:
+                    raise UnsupportedField(f"unsupported vps fields: {', '.join(sorted(unknown))}")
                 ip = str(payload.get("ip", ""))
                 if not ip:
                     raise ValueError("ip is required")
-                fields = {k: payload[k] for k in ("name", "os", "egress_mode", "socks5_addr", "socks5_port", "socks5_user", "socks5_pass") if k in payload}
+                fields = {key: value for key, value in payload.items() if key != "ip"}
+                for key in ("socks5_port", "egress_revision", "egress_applied_revision"):
+                    if key in fields:
+                        fields[key] = int(fields[key])
                 updated = self.server.store.update_vps(ip, **fields)
                 self._send_json(HTTPStatus.OK, updated)
                 return
             if path == "/api/nodes":
+                unknown = set(payload) - NODE_FIELDS
+                if unknown:
+                    raise UnsupportedField(f"unsupported node fields: {', '.join(sorted(unknown))}")
                 node_id = int(payload.get("id", 0))
-                if "enable" in payload:
-                    updated = self.server.store.update_node(node_id, enable=int(bool(payload["enable"])))
-                elif payload.get("reset_traffic"):
-                    updated = self.server.store.update_node(node_id, traffic_used=0)
-                else:
-                    fields = {k: payload[k] for k in ("ip", "name", "protocol", "traffic_limit", "expire_time") if k in payload}
-                    updated = self.server.store.update_node(node_id, **fields)
+                if not node_id:
+                    raise ValueError("id is required")
+                if payload.get("ip") and payload.get("vps_ip") and payload["ip"] != payload["vps_ip"]:
+                    raise ValueError("ip and vps_ip must match")
+                fields = {
+                    key: value
+                    for key, value in payload.items()
+                    if key not in {"id", "vps_ip", "reset_traffic"}
+                }
+                if "vps_ip" in payload:
+                    fields["ip"] = payload["vps_ip"]
+                if payload.get("reset_traffic"):
+                    fields["traffic_used"] = 0
+                if "enable" in fields:
+                    fields["enable"] = int(bool(fields["enable"]))
+                for key in ("port", "target_port", "target_id", "traffic_used", "traffic_limit", "expire_time"):
+                    if key in fields:
+                        fields[key] = int(fields[key])
+                updated = self.server.store.update_node(node_id, **fields)
                 self._send_json(HTTPStatus.OK, updated)
                 return
             if path == "/api/users":
@@ -725,9 +850,30 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.OK, {"sub_token": new_token})
                 return
             if path == "/api/probe/admin/server":
-                server_id = str(payload.get("id", ""))
-                self.server.store.set_setting(f"probe_server_{server_id}", json.dumps(payload))
-                self._send_json(HTTPStatus.OK, payload)
+                server_id = str(payload.get("id", "")).strip()
+                try:
+                    self.server.store.get_slot(server_id)
+                except KeyError:
+                    self._send_json(HTTPStatus.NOT_FOUND, {"code": "not_found", "error": "probe server not found"})
+                    return
+                allowed = {
+                    "id", "name", "server_group", "is_hidden", "price", "expire_date",
+                    "bandwidth", "traffic_limit", "reset_day",
+                }
+                unknown = set(payload) - allowed
+                if unknown:
+                    raise UnsupportedField(f"unsupported probe fields: {', '.join(sorted(unknown))}")
+                metadata = {key: payload[key] for key in allowed if key in payload}
+                metadata["id"] = server_id
+                self.server.store.set_setting(
+                    f"probe_server_{server_id}",
+                    json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
+                )
+                self._send_json(HTTPStatus.OK, metadata)
+                return
+            if path == "/api/realm":
+                self.server.realm_manager.configure(payload)
+                self._send_json(HTTPStatus.OK, self.server.realm_manager.status())
                 return
             if path == "/api/thirdparty":
                 tp_id = int(payload.get("id", 0))
@@ -738,26 +884,14 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.OK, updated)
                 return
             self._send_json(HTTPStatus.NOT_FOUND, {"code": "not_found", "error": "endpoint not found"})
+        except UnsupportedField as error:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"code": "unsupported_field", "error": str(error)})
         except (ValueError, json.JSONDecodeError) as error:
             self._send_json(HTTPStatus.BAD_REQUEST, {"code": "invalid_request", "error": str(error)})
         except KeyError:
             self._send_json(HTTPStatus.NOT_FOUND, {"code": "not_found", "error": "resource not found"})
 
     def do_POST(self) -> None:
-        if self.path.split("?", 1)[0] == "/api/login":
-            try:
-                payload = self._read_json()
-                username = str(payload.get("username", ""))
-                password = str(payload.get("password", ""))
-                if not hmac.compare_digest(username, self.server.username) or not hmac.compare_digest(password, self.server.password):
-                    self._send_json(HTTPStatus.UNAUTHORIZED, {"code": "invalid_credentials", "error": "invalid username or password"})
-                    return
-                self._send_json(HTTPStatus.OK, {"token": self.server.issue_token(), "username": self.server.username, "role": "admin"})
-            except (ValueError, json.JSONDecodeError) as error:
-                self._send_json(HTTPStatus.BAD_REQUEST, {"code": "invalid_request", "error": str(error)})
-            return
-        if not self._require_auth():
-            return
         path = self.path.split("?", 1)[0]
         if path == "/api/ui_ping":
             try:
@@ -801,25 +935,74 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             return
         try:
             payload = self._read_json()
+            if path == "/api/realm":
+                action = str(payload.get("action", "")).strip().lower()
+                if action == "start":
+                    result = self.server.realm_manager.start()
+                elif action == "stop":
+                    result = self.server.realm_manager.stop()
+                elif action == "restart":
+                    result = self.server.realm_manager.restart()
+                else:
+                    raise ValueError("action must be start, stop, or restart")
+                self._send_json(HTTPStatus.OK, result)
+                return
             if path == "/api/vps":
+                unknown = set(payload) - VPS_FIELDS
+                if unknown:
+                    raise UnsupportedField(f"unsupported vps fields: {', '.join(sorted(unknown))}")
                 ip = str(payload.get("ip", ""))
                 name = str(payload.get("name", ""))
                 if not ip:
                     raise ValueError("ip is required")
                 os_type = str(payload.get("os", "debian"))
-                created = self.server.store.add_vps(ip, name, os_type)
+                fields = {
+                    key: value
+                    for key, value in payload.items()
+                    if key not in {"ip", "name", "os"}
+                }
+                for key in ("socks5_port", "egress_revision", "egress_applied_revision"):
+                    if key in fields:
+                        fields[key] = int(fields[key])
+                created = self.server.store.add_vps(ip, name, os_type, **fields)
                 self.server.store.record_event(None, "vps", f"vps added: {ip} ({name})")
                 self._send_json(HTTPStatus.OK, created)
                 return
             if path == "/api/nodes":
-                ip = str(payload.get("ip") or payload.get("vps_ip") or "")
+                unknown = set(payload) - NODE_FIELDS
+                if unknown:
+                    raise UnsupportedField(f"unsupported node fields: {', '.join(sorted(unknown))}")
+                if payload.get("ip") and payload.get("vps_ip") and payload["ip"] != payload["vps_ip"]:
+                    raise ValueError("ip and vps_ip must match")
+                ip = str(payload.get("vps_ip") or payload.get("ip") or "")
                 name = str(payload.get("name") or payload.get("username") or "")
                 protocol = str(payload.get("protocol", ""))
                 traffic_limit = int(payload.get("traffic_limit", 0))
                 expire_time = int(payload.get("expire_time", 0))
                 if not ip:
                     raise ValueError("ip is required")
-                created = self.server.store.add_node(ip, name, protocol, traffic_limit, expire_time)
+                fields = {
+                    key: value
+                    for key, value in payload.items()
+                    if key not in {
+                        "id", "ip", "vps_ip", "name", "protocol", "traffic_limit",
+                        "expire_time", "reset_traffic",
+                    }
+                }
+                if "enable" in fields:
+                    fields["enable"] = int(bool(fields["enable"]))
+                for key in ("port", "target_port", "target_id", "traffic_used"):
+                    if key in fields:
+                        fields[key] = int(fields[key])
+                created = self.server.store.add_node(
+                    ip,
+                    name,
+                    protocol,
+                    traffic_limit,
+                    expire_time,
+                    node_id=int(payload["id"]) if payload.get("id") is not None else None,
+                    **fields,
+                )
                 self._send_json(HTTPStatus.OK, created)
                 return
             if path == "/api/users":
@@ -858,31 +1041,18 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 })
                 return
             if path == "/api/proxy/switch":
-                country = str(payload.get("country", ""))
-                port = payload.get("port", 0)
-                ip = str(payload.get("ip", ""))
                 slots = self.server.manager.snapshot()
-                target = None
-                if port:
-                    for slot in slots:
-                        if slot["proxy_port"] == int(port):
-                            target = slot["id"]
-                            break
-                if not target and country:
-                    for slot in slots:
-                        if slot["country"] == country and slot["enabled"]:
-                            target = slot["id"]
-                            break
-                if not target:
-                    for slot in slots:
-                        if slot["enabled"]:
-                            target = slot["id"]
-                            break
-                if not target and slots:
-                    target = slots[0]["id"]
-                if not target:
-                    raise ValueError("no slot available for proxy switch")
-                slot = self.server.manager.redial_slot(target)
+                slot_id = str(payload.get("slot_id", "")).strip()
+                if not slot_id and payload.get("port"):
+                    port = int(payload["port"])
+                    matches = [slot["id"] for slot in slots if slot["proxy_port"] == port]
+                    if len(matches) == 1:
+                        slot_id = matches[0]
+                if not slot_id:
+                    raise ValueError("slot_id is required")
+                if not any(slot["id"] == slot_id for slot in slots):
+                    raise KeyError(slot_id)
+                slot = self.server.manager.redial_slot(slot_id)
                 self._send_json(HTTPStatus.ACCEPTED, {"accepted": True, "exit": slot.as_dict()})
                 return
             if path == "/api/proxy/config":
@@ -908,8 +1078,13 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     else:
                         self.server.manager.disable_slot(slot_id)
                 if country and country != target_slot["country"]:
-                    was_enabled = self.server.store.get_slot(slot_id).enabled
-                    if was_enabled:
+                    current = self.server.store.validate_slot_update(
+                        slot_id,
+                        country=country,
+                        proxy_port=None,
+                        enabled=None,
+                    )
+                    if current.enabled:
                         self.server.manager.stop_slot(slot_id)
                     self.server.store.update_slot(slot_id, country=country)
                     if self.server.store.get_slot(slot_id).enabled:
@@ -957,14 +1132,18 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.OK, {"success": True})
                 return
             self._send_json(HTTPStatus.NOT_FOUND, {"code": "not_found", "error": "endpoint not found"})
+        except UnsupportedField as error:
+            self._send_json(HTTPStatus.BAD_REQUEST, {"code": "unsupported_field", "error": str(error)})
+        except RealmUnavailable as error:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"code": "unavailable", "error": str(error)})
         except (ValueError, json.JSONDecodeError) as error:
             self._send_json(HTTPStatus.BAD_REQUEST, {"code": "invalid_request", "error": str(error)})
+        except RuntimeError as error:
+            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"code": "operation_failed", "error": str(error)})
         except KeyError:
             self._send_json(HTTPStatus.NOT_FOUND, {"code": "not_found", "error": "resource not found"})
 
     def do_DELETE(self) -> None:
-        if not self._require_auth():
-            return
         path = self.path.split("?", 1)[0]
         try:
             if path == "/api/vps":
@@ -998,7 +1177,8 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/probe/admin/server":
                 server_id = self._query_param("id") or ""
-                self.server.store.set_setting(f"probe_server_{server_id}_deleted", "1")
+                self.server.store.get_slot(server_id)
+                self.server.store.delete_setting(f"probe_server_{server_id}")
                 self._send_json(HTTPStatus.OK, {"success": True})
                 return
             self._send_json(HTTPStatus.NOT_FOUND, {"code": "not_found", "error": "endpoint not found"})

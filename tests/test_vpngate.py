@@ -71,9 +71,9 @@ class VPNGateFetchTest(unittest.TestCase):
             attempted.append((request.full_url, request.headers.get("Host")))
             return FakeResponse()
 
-        with patch.object(vpngate, "resolve_ipv4_endpoints", return_value=list(endpoints)), patch.object(
-            vpngate, "open_direct_url", side_effect=open_url
-        ):
+        with patch.dict(os.environ, {"KUI_FETCH_PROXY": ""}, clear=False), patch.object(
+            vpngate, "resolve_ipv4_endpoints", return_value=list(endpoints)
+        ), patch.object(vpngate, "open_direct_url", side_effect=open_url):
             nodes = vpngate.fetch_nodes()
 
         self.assertEqual([], nodes)
@@ -102,9 +102,9 @@ class VPNGateFetchTest(unittest.TestCase):
             def read(self):
                 return csv_body.encode()
 
-        with patch.object(vpngate, "resolve_ipv4_endpoints", return_value=["199.59.150.12"]), patch.object(
-            vpngate, "open_direct_url", return_value=TextResponse()
-        ):
+        with patch.dict(os.environ, {"KUI_FETCH_PROXY": ""}, clear=False), patch.object(
+            vpngate, "resolve_ipv4_endpoints", return_value=["199.59.150.12"]
+        ), patch.object(vpngate, "open_direct_url", return_value=TextResponse()):
             nodes = vpngate.fetch_nodes()
 
         self.assertEqual(1, len(nodes))
@@ -149,9 +149,9 @@ class VPNGateFetchTest(unittest.TestCase):
             def read(self):
                 return csv_body.encode()
 
-        with patch.object(vpngate, "resolve_ipv4_endpoints", return_value=["199.59.150.12"]), patch.object(
-            vpngate, "open_direct_url", return_value=TextResponse()
-        ):
+        with patch.dict(os.environ, {"KUI_FETCH_PROXY": ""}, clear=False), patch.object(
+            vpngate, "resolve_ipv4_endpoints", return_value=["199.59.150.12"]
+        ), patch.object(vpngate, "open_direct_url", return_value=TextResponse()):
             countries = vpngate.fetch_countries()
 
         self.assertEqual(["JP", "US"], countries)
@@ -208,17 +208,137 @@ class VPNGateFetchTest(unittest.TestCase):
             )
             self.assertFalse(ok, code)
 
-    def test_default_generate_204_probe_requires_exact_204(self):
+    def test_probe_targets_records_every_target_without_early_success_return(self):
+        target_codes = {
+            vpngate.DEFAULT_STREAM_URL: "204",
+            "https://www.google.com/": "301",
+            "https://chatgpt.com": "403",
+            "https://cn.tradingview.com": "500",
+            "https://claude.ai": "000",
+        }
+
         class Result:
             returncode = 0
-            stdout = "200"
+            stderr = ""
 
-        ok, detail = vpngate.check_streaming("tun0", run=lambda *_args, **_kwargs: Result(), urls=(
-            "https://www.gstatic.com/generate_204",
-        ))
+        def run(command, **_kwargs):
+            result = Result()
+            result.stdout = target_codes[command[-1]]
+            if result.stdout == "000":
+                result.returncode = 28
+            return result
 
-        self.assertFalse(ok)
-        self.assertEqual("200", detail["attempts"][0]["code"])
+        report = vpngate.probe_targets(
+            "tun0",
+            tuple(target_codes)[1:],
+            run=run,
+        )
+
+        self.assertFalse(report["accepted"])
+        self.assertTrue(report["base_ok"])
+        self.assertFalse(report["custom_ok"])
+        self.assertEqual(list(target_codes), [attempt["url"] for attempt in report["attempts"]])
+        self.assertEqual(
+            ["204", "301", "403", "500", "000"],
+            [attempt["code"] for attempt in report["attempts"]],
+        )
+        self.assertEqual("explicit_response", report["attempts"][2]["classification"])
+        self.assertEqual("redirect", report["attempts"][1]["classification"])
+        self.assertEqual("timeout", report["attempts"][4]["classification"])
+
+    def test_probe_targets_uses_marked_doh_instead_of_system_dns(self):
+        commands = []
+
+        class Result:
+            returncode = 0
+            stdout = "204"
+            stderr = ""
+
+        def run(command, **_kwargs):
+            commands.append(command)
+            return Result()
+
+        report = vpngate.probe_targets(
+            "tun0",
+            ("https://www.google.com/",),
+            run=run,
+        )
+
+        self.assertTrue(report["accepted"])
+        for command in commands:
+            self.assertEqual("https://cloudflare-dns.com/dns-query", command[command.index("--doh-url") + 1])
+            self.assertIn("cloudflare-dns.com:443:1.1.1.1", command)
+            self.assertEqual("tun0", command[command.index("--interface") + 1])
+
+    def test_probe_targets_requires_every_custom_target_success(self):
+        codes = {
+            vpngate.DEFAULT_STREAM_URL: "204",
+            "https://www.google.com/": "200",
+            "https://chatgpt.com": "403",
+            "https://cn.tradingview.com": "000",
+            "https://claude.ai": "403",
+        }
+
+        class Result:
+            stderr = ""
+
+        def run(command, **_kwargs):
+            result = Result()
+            result.stdout = codes[command[-1]]
+            result.returncode = 0 if result.stdout != "000" else 28
+            return result
+
+        report = vpngate.probe_targets(
+            "tun0",
+            tuple(codes)[1:],
+            run=run,
+        )
+
+        self.assertFalse(report["accepted"])
+        self.assertFalse(report["custom_ok"])
+
+    def test_probe_targets_accepts_safe_redirect_when_followed_target_responds(self):
+        commands = []
+
+        def run(command, **_kwargs):
+            class Result:
+                returncode = 0
+                stdout = "204" if command[-1] == vpngate.DEFAULT_STREAM_URL else "200"
+                stderr = ""
+
+            commands.append(command)
+            return Result()
+
+        report = vpngate.probe_targets(
+            "tun0",
+            ("https://www.google.com/",),
+            run=run,
+        )
+
+        self.assertTrue(report["accepted"])
+        self.assertIn("--location", commands[0])
+        self.assertEqual("20", commands[0][commands[0].index("--max-redirs") + 1])
+
+    def test_probe_targets_requires_base_and_one_custom_success(self):
+        scenarios = [
+            ({vpngate.DEFAULT_STREAM_URL: "200", "https://chatgpt.com": "403"}, False),
+            ({vpngate.DEFAULT_STREAM_URL: "204", "https://chatgpt.com": "500"}, False),
+            ({vpngate.DEFAULT_STREAM_URL: "204", "https://chatgpt.com": "407"}, False),
+        ]
+
+        for codes, expected in scenarios:
+            with self.subTest(codes=codes):
+                class Result:
+                    returncode = 0
+                    stderr = ""
+
+                def run(command, **_kwargs):
+                    result = Result()
+                    result.stdout = codes[command[-1]]
+                    return result
+
+                report = vpngate.probe_targets("tun0", ("https://chatgpt.com",), run=run)
+                self.assertEqual(expected, report["accepted"])
 
     def test_custom_probe_accepts_2xx_and_explicit_4xx_but_not_redirect_or_407(self):
         expected = {

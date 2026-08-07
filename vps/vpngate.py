@@ -21,10 +21,10 @@ from typing import Any
 
 API_URL = "https://www.vpngate.net/api/iphone/"
 STREAM_URLS = (
-    "https://www.youtube.com",
-    "https://www.gstatic.com/generate_204",
-    "https://cp.cloudflare.com/generate_204",
-    "https://www.google.com/robots.txt",
+    "https://www.google.com/",
+    "https://chatgpt.com",
+    "https://cn.tradingview.com",
+    "https://claude.ai",
 )
 
 
@@ -321,6 +321,63 @@ def _probe_accepts(url: str, code: str) -> bool:
     return 200 <= status < 300 or 400 <= status < 500 and status != 407
 
 
+def _probe_classification(url: str, code: str, returncode: int) -> str:
+    if returncode != 0 or code == "000":
+        return "timeout" if returncode == 28 or code == "000" else "transport_error"
+    if not re.fullmatch(r"[0-9]{3}", code):
+        return "invalid_response"
+    status = int(code)
+    if 300 <= status < 400:
+        return "redirect"
+    if status == 407:
+        return "proxy_auth_required"
+    if status >= 500:
+        return "server_error"
+    if _probe_accepts(url, code):
+        return "explicit_response"
+    return "unexpected_status"
+
+
+def probe_targets(
+    interface: str,
+    urls: tuple[str, ...] | list[str],
+    run: Callable[..., Any] = subprocess.run,
+) -> dict[str, Any]:
+    custom_targets = tuple(dict.fromkeys(str(url).strip() for url in urls if str(url).strip()))
+    targets = (DEFAULT_STREAM_URL, *[url for url in custom_targets if url != DEFAULT_STREAM_URL])
+    attempts = []
+    for url in targets:
+        started = time.monotonic()
+        command = [
+            "curl", "-o", "/dev/null", "-s", "-w", "%{http_code}",
+            "-A", "Mozilla/5.0", "-m", "10", "--location", "--max-redirs", "20",
+            "--interface", interface,
+            "--doh-url", "https://cloudflare-dns.com/dns-query",
+            "--resolve", "cloudflare-dns.com:443:1.1.1.1",
+        ]
+        result = run([*command, url], capture_output=True, text=True, check=False)
+        code = result.stdout.strip()
+        accepted = result.returncode == 0 and _probe_accepts(url, code)
+        attempts.append(
+            {
+                "url": url,
+                "code": code,
+                "accepted": accepted,
+                "classification": _probe_classification(url, code, result.returncode),
+                "elapsed_ms": max(0, int((time.monotonic() - started) * 1000)),
+                "error": (getattr(result, "stderr", "") or "").strip()[:500],
+            }
+        )
+    base_ok = bool(attempts and attempts[0]["accepted"])
+    custom_ok = bool(attempts[1:]) and all(attempt["accepted"] for attempt in attempts[1:])
+    return {
+        "base_ok": base_ok,
+        "custom_ok": custom_ok,
+        "accepted": base_ok and custom_ok,
+        "attempts": attempts,
+    }
+
+
 def check_streaming(
     interface: str,
     run: Callable[..., Any] = subprocess.run,
@@ -336,7 +393,13 @@ def check_streaming(
             check=False,
         )
         code = result.stdout.strip()
-        attempts.append({"url": url, "code": code})
-        if result.returncode == 0 and _probe_accepts(url, code):
+        attempt = {
+            "url": url,
+            "code": code,
+            "accepted": result.returncode == 0 and _probe_accepts(url, code),
+            "classification": _probe_classification(url, code, result.returncode),
+        }
+        attempts.append(attempt)
+        if attempt["accepted"]:
             return True, {"attempts": attempts}
     return False, {"attempts": attempts}

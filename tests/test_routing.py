@@ -21,6 +21,20 @@ class CommandRecorder:
         return Result()
 
 
+class SelectiveFailureRecorder(CommandRecorder):
+    def __init__(self, failing_fragment, stderr="simulated route failure"):
+        super().__init__()
+        self.failing_fragment = failing_fragment
+        self.stderr = stderr
+
+    def __call__(self, command, **kwargs):
+        result = super().__call__(command, **kwargs)
+        if self.failing_fragment in " ".join(command):
+            result.returncode = 2
+            result.stderr = self.stderr
+        return result
+
+
 class RouteManagerTest(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
@@ -51,6 +65,49 @@ class RouteManagerTest(unittest.TestCase):
         commands = [" ".join(command) for command in self.recorder.commands]
         self.assertEqual(2, sum("route flush table 200" in command for command in commands))
         self.assertFalse(any("table 201" in command for command in commands))
+
+    def test_install_raises_when_required_route_command_fails(self):
+        routing = RouteManager(run=SelectiveFailureRecorder("default dev tun0"))
+
+        with self.assertRaisesRegex(RuntimeError, "simulated route failure"):
+            routing.install(self.first, "198.51.100.1", "172.18.0.1", "eth0")
+
+    def test_cleanup_ignores_known_missing_rules_but_not_unexpected_failures(self):
+        missing = RouteManager(run=SelectiveFailureRecorder("rule del", "RTNETLINK answers: No such file or directory"))
+        missing.cleanup(self.first)
+
+        missing_table = RouteManager(run=SelectiveFailureRecorder("route flush", "Error: ipv4: FIB table does not exist"))
+        missing_table.cleanup(self.first)
+
+        unexpected_rule = RouteManager(run=SelectiveFailureRecorder("rule del", "RTNETLINK answers: Operation not permitted"))
+        with self.assertRaisesRegex(RuntimeError, "Operation not permitted"):
+            unexpected_rule.cleanup(self.first)
+
+        unexpected_route = RouteManager(run=SelectiveFailureRecorder("route flush"))
+        with self.assertRaisesRegex(RuntimeError, "simulated route failure"):
+            unexpected_route.cleanup(self.first)
+
+    def test_install_cleans_partial_routes_after_failure(self):
+        recorder = SelectiveFailureRecorder("default dev tun0")
+        routing = RouteManager(run=recorder)
+
+        with self.assertRaises(RuntimeError):
+            routing.install(self.first, "198.51.100.1", "172.18.0.1", "eth0")
+
+        commands = [" ".join(command) for command in recorder.commands]
+        self.assertEqual(2, sum("route flush table 200" in command for command in commands))
+
+    def test_is_installed_requires_default_route_on_slot_tunnel(self):
+        class RouteStateRecorder(CommandRecorder):
+            def __call__(self, command, **kwargs):
+                result = super().__call__(command, **kwargs)
+                if command == ["ip", "route", "show", "table", "200"]:
+                    result.stdout = "198.51.100.1 via 172.18.0.1 dev eth0\n"
+                return result
+
+        routing = RouteManager(run=RouteStateRecorder())
+
+        self.assertFalse(routing.is_installed(self.first))
 
 
 if __name__ == "__main__":

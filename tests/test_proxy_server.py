@@ -1,4 +1,5 @@
 import socket
+import time
 import unittest
 from unittest.mock import patch
 
@@ -95,6 +96,63 @@ class ProxyServerTest(unittest.TestCase):
         self.assertEqual(b"alice", proxy_server.PROXY_USER)
         self.assertEqual(b"secret", proxy_server.PROXY_PASS)
         self.assertEqual("exit-01", first.slot_id)
+
+    def test_start_raises_when_listener_port_cannot_bind(self):
+        occupied = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        occupied.bind(("127.0.0.1", 0))
+        occupied.listen(1)
+        listener = proxy_server.ProxyListener(
+            "exit-01",
+            "127.0.0.1",
+            occupied.getsockname()[1],
+            "tun0",
+            200,
+        )
+        try:
+            with self.assertRaises(OSError):
+                listener.start()
+        finally:
+            listener.stop()
+            occupied.close()
+
+    def test_listener_connection_limits_are_independent(self):
+        first = proxy_server.ProxyListener("exit-01", "0.0.0.0", 7920, "tun0", 200)
+        second = proxy_server.ProxyListener("exit-02", "0.0.0.0", 7921, "tun1", 201)
+
+        self.assertTrue(hasattr(first, "_connection_slots"))
+        self.assertTrue(hasattr(second, "_connection_slots"))
+        self.assertIsNot(first._connection_slots, second._connection_slots)
+        self.assertTrue(hasattr(first, "_clients"))
+        self.assertTrue(hasattr(second, "_clients"))
+        self.assertIsNot(first._clients, second._clients)
+
+    def test_stop_closes_tracked_accepted_clients(self):
+        listener = proxy_server.ProxyListener("exit-01", "127.0.0.1", 0, "tun0", 200)
+        listener.start()
+        port = listener._servers[0].getsockname()[1]
+        client = socket.create_connection(("127.0.0.1", port), timeout=1)
+        try:
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline and not listener._clients:
+                time.sleep(0.01)
+            self.assertTrue(listener._clients)
+
+            listener.stop()
+
+            self.assertEqual(b"", client.recv(1))
+            self.assertEqual(set(), listener._clients)
+        finally:
+            client.close()
+            listener.stop()
+
+    def test_listener_reports_ready_only_while_bound(self):
+        listener = proxy_server.ProxyListener("exit-01", "127.0.0.1", 0, "tun0", 200)
+
+        self.assertFalse(listener.is_ready())
+        listener.start()
+        self.assertTrue(listener.is_ready())
+        listener.stop()
+        self.assertFalse(listener.is_ready())
 
 
 if __name__ == "__main__":
