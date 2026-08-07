@@ -12,3 +12,4 @@ auth.txt
 socks_auth.txt
 runtime/
 temp/
+.worktrees/
