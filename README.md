@@ -1,695 +1,403 @@
-## 🌟 项目赞助商 (Sponsor)
+# K-UI Local Multi-Exit
 
-<p align="center">
-  <a href="https://derouter.ai?ref=0oZZ1HVc" target="_blank">
-    <b>DeRouter</b> — 基于区块链的纯正透明大模型 API 网关
-  </a>
-</p>
+`kui-local-multi-exit` 是一个面向单台 Linux VPS 的本地多出口代理控制器。它在一个 Docker 容器中运行管理面板、本地 SQLite、VPNGate/OpenVPN 调度器和 12 个独立 SOCKS5 出口，不依赖 Cloudflare 或外部控制中心。
 
-**DeRouter** 通过区块链技术保证 Claude、GPT 官方 API 的**纯正与透明**，杜绝掺水降智问题。目前 Claude、GPT 在能力上仍领先国内大模型。
+## 功能与边界
 
-- 🔗 官网：https://derouter.ai?ref=0oZZ1HVc
-- 🐦 Twitter：https://x.com/derouter_net
-- 💰 **有多余的 Claude 账号**：可托管到平台赚取收益
-- ⚡ **有 API 需求**：可使用其平台，价格为官方 API 的 **1-2 折**
+- 固定 12 个出口槽位：`exit-01` 至 `exit-12`。
+- 默认代理端口：TCP `7920-7931`，每个槽位一个独立 TUN、策略路由和 SOCKS5 listener。
+- 每个槽位可修改国家、选择候选节点、换 IP、停用、启用。
+- 管理页/API 免登录；12 个 SOCKS5 出口共用一组用户名和密码。
+- 本地 SQLite 和运行状态保存在 Docker volume `kui-local-data`。
+- 只有隧道、策略路由、真实 listener、住宅属性和全部目标探针均通过的槽位才会发布到订阅。
+- VPNGate 是动态公网节点池，**不保证 12 个槽位始终同时可用**。
 
-<br>
+## 部署前提
 
-<p align="center">
-  <a href="https://bytevirt.com/aff.php?aff=209" target="_blank">
-    <b>ByteVirt</b> — 始于方寸字节，成就无限云端
-  </a>
-</p>
+建议使用 Debian 12 或 Ubuntu 22.04/24.04 VPS，并满足：
 
-**ByteVirt** 是一家专注于高性价比云服务器的 VPS 厂商，提供稳定可靠的虚拟化云端主机，适合部署 KUI 节点、探针 bash 及各类自建服务。
+- Linux 内核提供 `/dev/net/tun`。
+- Docker Engine 与 Docker Compose v2 可用。
+- root 用户，或当前用户有 Docker 权限。
+- VPS 可以访问外部 HTTPS 和 VPNGate/OpenVPN 节点。
+- 至少开放 TCP `8080` 和 `7920-7931`，或在云安全组/防火墙中只允许可信来源访问。
 
-- 🔗 官网：https://bytevirt.com/aff.php?aff=209
-- 🖥️ **多地域机房**：可按需选择节点位置，满足代理与监控部署需求
-- ⚡ **稳定高速**：优质网络与虚拟化性能，保障服务长期在线
-
----
-
-# KUI x Server Monitor Pro
-
-KUI 是一套基于 Cloudflare 的代理管理、服务器探针和住宅双隧道面板。
-
-- Pages：网页、API、登录和配置。
-- D1：保存用户、VPS、节点和流量。
-- Realtime Worker + Durable Objects：提供实时状态和配置推送。
-- VPS Agent：监控服务器、管理 sing-box 和住宅代理。
-
-## 功能
-
-- XTLS-Reality、Hysteria2、TUIC、Trojan、H2/gRPC-Reality、AnyTLS、Naive、VLESS-Argo。
-- CPU、内存、磁盘、负载、网速、TCP/UDP 和线路延迟探针。
-- 多用户、流量、配额、到期和订阅管理。
-- OpenVPN 主备住宅隧道和 SOCKS5/HTTP 代理。
-- WebSocket 实时推送，断线后自动使用 HTTP fallback。
-- 每台 VPS 可选择原生、WARP、住宅代理或 SOCKS5 出口。
-- 住宅 SOCKS5 运行时节点可追加到管理员普通订阅和 Clash/Mihomo 订阅。
-- 管理员订阅保护开关：临时停止订阅更新并返回站点首页内容。
-- Realm 中转入口已预留，当前为功能规划占位页。
-
-## 实时状态与额度
-
-Realtime Worker 会根据正在查看面板的人群自动调整 VPS Agent 的常规状态频率：
-
-| 查看状态 | Core/Proxy 状态频率 | 说明 |
-|---|---:|---|
-| 管理员后台 Dashboard WebSocket 在线 | 5 秒 | 配置、出口切换和实时运维使用最高频率 |
-| 仅公开探针 WebSocket 在线 | 10 秒 | 公开探针保持接近实时，同时减少 Worker/DO 消耗 |
-| 没有 Dashboard 或公开探针观众 | 30 秒 | 空闲降频，仍保持 Agent 在线与状态更新 |
-
-以下事件不等待状态周期，会立即推送：
-
-- VPS 或住宅代理上线、掉线。
-- 节点和 Agent 配置下发结果。
-- WARP、住宅代理、手动 SOCKS5 出口切换结果。
-
-两台 VPS 各运行 Core 与 Proxy Agent 时，公开探针持续有人查看的常规状态消息约为 `34,560/天`；无人查看时约为 `11,520/天`。管理员后台持续打开时约为 `69,120/天`。实际 Workers & Pages 用量还会受订阅拉取、公开页面访问、WebSocket 重连和 D1 操作影响。
-
-## 节点出口与住宅代理
-
-每台 VPS 可在“服务器与节点 → 节点出口”选择：
-
-- 原生出口。
-- WARP IPv4、WARP IPv6 或 WARP 双栈。
-- 住宅 IP 代理。
-- 手动 SOCKS5 出口。
-
-住宅 IP 代理支持两种模式：
-
-- **全局代理**：所有受管节点流量通过住宅 SOCKS5 出口。
-- **局部代理**：仅已选择的分类域名通过住宅出口，例如 YouTube、Googlevideo 和 YTimg。
-
-局部代理会使用 sing-box 域名嗅探规则来匹配 TLS/HTTP 目标域名。住宅出口只验证 IPv4；在局部模式下，受管节点的 IPv6 流量会被明确拒绝，避免从 WARP 双栈切换后发生 IPv6 绕过或原生 IPv6 泄漏。
-
-修改局部代理分类时，先勾选分类，再点击“应用已选分类”。单个分类勾选不会立即递增出口 revision 或重建 sing-box 配置。
-
-## 订阅保护
-
-管理员可在：
-
-```text
-系统设置 → 管理员订阅防泄漏重置 → 订阅保护
-```
-
-直接切换订阅保护开关，变更会立即保存，不需要点击“立即生效配置”。
-
-- **关闭**：订阅链接可被客户端正常在线更新。
-- **开启**：`/api/sub` 不验证 Token、不读取节点数据，直接返回普通站点首页 HTML；订阅客户端不会获得真实节点，从而停止在线更新。
-
-订阅保护适合在链接疑似泄露、需要临时停止拉取时使用。它不等于完整访问控制：已暴露的订阅路径仍可能被访问记录识别。长期保护建议同时轮换订阅 Token，并使用独立订阅域名、Cloudflare Access 或可信 IP 访问限制。
-
-# 新用户部署
-
-推荐使用下面的顺序，不要跳步：
-
-```text
-1. Fork GitHub 仓库
-2. 创建一个 Cloudflare D1 数据库
-3. 创建 Cloudflare Pages，并绑定这个 D1
-4. 配置 Pages 生产环境变量
-5. 首次登录 Pages，确认数据库初始化
-6. 部署 Realtime Worker，并绑定同一个 D1
-7. 检查 Worker /health
-8. 将 Worker 地址写回 Pages，重新部署
-9. 在 KUI 面板添加 VPS
-10. 在 VPS 执行面板生成的 Full Deploy Command
-11. 添加节点并验证订阅
-```
-
-## 0. 部署前准备
-
-需要准备：
-
-- GitHub 账号。
-- Cloudflare 账号，并已添加一个可用的 Pages 账户。
-- 一台 Debian/Ubuntu 或 Alpine VPS。
-- VPS 公网 IPv4 或 IPv6。
-- VPS 可以访问外部 HTTPS。
-- VPS SSH root 权限。
-
-建议先不要部署住宅代理。先完成 Pages、Worker、Agent 和普通节点验证，再启用住宅出口。
-
-## 1. Fork 仓库
-
-打开仓库：
-
-```text
-https://github.com/a6216abcd/K-UI
-```
-
-点击右上角 **Fork**，将仓库复制到自己的 GitHub 账号。
-
-后续 Cloudflare Pages 必须连接你 Fork 后的仓库，不要连接上游仓库。
-
-## 2. 创建 D1 数据库
-
-进入 Cloudflare 控制台：
-
-```text
-Workers & Pages → D1 → Create database
-```
-
-数据库名称建议填写：
-
-```text
-kui-db
-```
-
-创建完成后记录数据库名称。Pages 和 Realtime Worker 必须绑定同一个 D1 数据库，不能各自使用自动创建的空数据库。
-
-## 3. 创建 Pages 项目
-
-进入：
-
-```text
-Workers & Pages → Create application → Pages → Connect to Git
-```
-
-选择你 Fork 的 KUI 仓库，使用以下设置：
-
-| 设置项 | 填写内容 |
-|---|---|
-| Production branch | `dev`，或你准备发布的分支 |
-| Framework preset | `None` |
-| Build command | `exit 0` |
-| Build output directory | `.` |
-
-点击部署，等待 Pages 首次构建成功。
-
-部署成功后打开 Pages 地址：
-
-```text
-https://你的项目.pages.dev
-```
-
-## 4. 绑定 Pages 的生产 D1
-
-进入 Pages 项目：
-
-```text
-Settings → Functions → D1 database bindings
-```
-
-在 **Production** 环境添加：
-
-| Binding name | Database |
-|---|---|
-| `DB` | 第 2 步创建的 `kui-db` |
-
-必须满足：
-
-- Binding name 必须是 `DB`，大小写不能变。
-- 必须绑定在 Production，不要只绑定 Preview。
-- 修改 binding 后必须重新部署 Pages。
-
-## 5. 配置 Pages 生产环境变量
-
-进入：
-
-```text
-Settings → Environment variables → Production
-```
-
-添加以下变量：
-
-| 名称 | 类型 | 说明 |
-|---|---|---|
-| `ADMIN_USERNAME` | Variable | 管理员用户名，建议使用 `admin` |
-| `ADMIN_PASSWORD` | Secret | 管理员强密码，至少 16 位 |
-| `PROXY_USER` | Secret | 住宅代理用户名 |
-| `PROXY_PASS` | Secret | 住宅代理密码 |
-
-第一次部署可以暂时不添加：
-
-```text
-REALTIME_URL
-```
-
-保存变量并重新部署 Pages。
-
-## 6. 首次登录并初始化数据库
-
-打开：
-
-```text
-https://你的项目.pages.dev
-```
-
-使用刚配置的 `ADMIN_USERNAME` 和 `ADMIN_PASSWORD` 登录。
-
-登录后进入“服务器与节点”，确认页面可以正常加载。此时 Pages + D1 基础部署完成。
-
-如果页面提示缺少 DB、登录后 500 或数据无法加载，不要继续部署 Worker，先回到第 4 步检查 D1 binding。
-
-## 7. 部署 Realtime Worker
-
-Realtime Worker 用于实时状态、Dashboard WebSocket 和配置通知。它不是 Pages 本身，必须单独部署。
-
-### 推荐方法：本地 Wrangler 部署
-
-使用本地 Wrangler 可以明确指定 Pages 地址和已有 D1，最不容易绑定到错误的空数据库：
+先检查：
 
 ```bash
-git clone https://github.com/a6216abcd/K-UI.git
-cd K-UI/realtime
-npm install
-npx wrangler login
+test -c /dev/net/tun && echo "TUN OK"
+docker version
+docker compose version
 ```
 
-确认 `wrangler.jsonc` 的 `d1_databases` 使用 Pages 第 2 步创建的同一个数据库：
+如尚未安装 Docker，请按 Docker 官方对应发行版文档安装 Docker Engine 和 Compose plugin。不要使用过时的独立 `docker-compose` v1。
 
-```jsonc
-"d1_databases": [
-  {
-    "binding": "DB",
-    "database_name": "kui-db",
-    "database_id": "你的 D1 database_id"
-  }
-]
-```
+## 安全提醒
 
-然后部署：
+管理面板默认免登录。不要把 `8080` 无限制暴露到不可信网络；请至少使用 VPS 防火墙限制来源 IP，或放在带访问控制的反向代理后面。
+
+`KUI_MANAGEMENT_PASSWORD` 是所有 SOCKS5 出口的共用密码。请使用随机强密码，并且不要把真实密码提交到 Git。仓库已经忽略 `.env`，可在 VPS 项目目录创建本地 `.env` 保存配置。
+
+## 首次部署
+
+### 1. 克隆仓库
 
 ```bash
-npx wrangler deploy
+git clone https://github.com/kim1232aa/kui-local-multi-exit.git
+cd kui-local-multi-exit
 ```
 
-### 使用自定义域名时必须设置 PAGES_ORIGIN
+### 2. 创建本地配置
 
-默认 Pages 地址形如：
+推荐使用 `.env`：
 
-```text
-https://你的项目.pages.dev
+```bash
+cat > .env <<'EOF'
+KUI_MANAGEMENT_USER=admin
+KUI_MANAGEMENT_PASSWORD=请替换为随机强密码
+KUI_MANAGEMENT_PORT=8080
+KUI_FETCH_PROXY=
+KUI_OPENVPN_SOCKS_PROXY=
+EOF
+chmod 600 .env
 ```
 
-不需要设置 `PAGES_ORIGIN`，Realtime Worker 会自动接受该 Pages 域名的 WebSocket 连接。
+变量说明：
 
-如果你为 Pages 绑定了自定义域名，例如：
+| 变量 | 必填 | 默认值 | 说明 |
+|---|---|---|---|
+| `KUI_MANAGEMENT_USER` | 否 | `admin` | 12 个 SOCKS5 出口共用用户名 |
+| `KUI_MANAGEMENT_PASSWORD` | 是 | 无 | 12 个 SOCKS5 出口共用密码；不是面板登录密码 |
+| `KUI_MANAGEMENT_PORT` | 否 | `8080` | 面板映射到宿主机的 TCP 端口 |
+| `KUI_FETCH_PROXY` | 否 | 空 | 拉取 VPNGate 数据时使用的显式 HTTP/HTTPS/SOCKS5 代理 |
+| `KUI_OPENVPN_SOCKS_PROXY` | 否 | 空 | OpenVPN 握手使用的 SOCKS5 上游代理 |
 
-```text
-https://panel.example.com
+也可以只为当前 shell 导出必填变量：
+
+```bash
+export KUI_MANAGEMENT_PASSWORD='请替换为随机强密码'
 ```
 
-必须进入 Worker：
+### 3. 启动
 
-```text
-Workers & Pages → kui-realtime → Settings → Variables and Secrets
+```bash
+docker compose up -d --build
 ```
 
-新增或修改 Worker **Variable**：
+检查容器：
 
-| 名称 | 值 |
-|---|---|
-| `PAGES_ORIGIN` | `https://panel.example.com` |
-
-要求：
-
-- 必须包含 `https://`。
-- 末尾不要添加 `/`。
-- 必须填写 Pages 实际对外访问的自定义域名，不是 Worker 地址。
-- 保存变量后重新部署 Worker。
-
-否则 Worker 会拒绝来自自定义域名的 Dashboard / 公开探针 WebSocket，页面会退回旧数据或 HTTP fallback。
-
-### 备用方法：Cloudflare 一键部署
-
-如果无法使用本地 Node.js，可以使用按钮：
-
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/a6216abcd/K-UI/tree/dev/realtime)
-
-部署时确认 Worker 名称为：
-
-```text
-kui-realtime
+```bash
+docker compose ps
+docker inspect --format '{{.State.Health.Status}}' kui-local-multi-exit
+docker compose logs --tail=100 kui-local-multi-exit
 ```
 
-一键部署完成后，仍必须按照下面的“Worker 必须绑定同一个 D1”检查 DB binding。不要直接使用它自动创建的空 D1。
+容器状态最终应为 `healthy`。首次启动会拉取 VPNGate 节点并拨号，槽位状态可能需要一段时间才能稳定。
 
-### Worker 必须绑定同一个 D1
+## 防火墙
 
-进入：
+默认端口：
 
-```text
-Workers & Pages → kui-realtime → Settings → Bindings
+- TCP `8080`：管理面板和 API。
+- TCP `7920-7931`：12 个 SOCKS5 出口。
+
+使用 UFW 且只允许一个管理来源时，可按实际来源 IP 调整：
+
+```bash
+ufw allow from <你的可信公网IP> to any port 8080 proto tcp
+ufw allow from <你的可信公网IP> to any port 7920:7931 proto tcp
+ufw status
 ```
 
-确认：
+云厂商安全组也必须配置相同规则。不要因为 SOCKS5 有密码就默认向整个互联网开放端口。
 
-```text
-DB              → 与 Pages 完全相同的 kui-db
-VPS_PRESENCE    → VpsPresence
-DASHBOARD_HUB   → DashboardHub
+## 网络受限时使用上游代理
+
+普通 VPS 直连可用时，保持以下变量为空。只有 VPS 宿主确实运行了可用的 SOCKS5 服务时才配置，例如宿主 `7896`：
+
+```bash
+cat >> .env <<'EOF'
+KUI_FETCH_PROXY=socks5://host.docker.internal:7896
+KUI_OPENVPN_SOCKS_PROXY=socks5://host.docker.internal:7896
+EOF
+docker compose up -d --build
 ```
-
-最容易出错的是 Worker 自动创建了另一个 D1。发现 Worker 的 DB 不是 Pages 正在使用的 D1 时，删除错误 binding，重新绑定正确的数据库。
-
-不要修改或删除两个 Durable Object binding：
-
-```text
-VPS_PRESENCE
-DASHBOARD_HUB
-```
-
-## 8. 验证 Worker
-
-打开：
-
-```text
-https://你的Worker地址/health
-```
-
-应该返回：
-
-```json
-{"ok":true,"service":"kui-realtime","version":1}
-```
-
-如果不是这个结果，先不要继续配置 Pages 的 `REALTIME_URL`。
-
-## 9. 回填 Pages 的 REALTIME_URL
-
-确认 Worker `/health` 正常后，回到 Pages：
-
-```text
-Settings → Environment variables → Production
-```
-
-添加：
-
-| 名称 | 类型 | 值 |
-|---|---|---|
-| `REALTIME_URL` | Variable | `https://你的Worker地址` |
 
 注意：
 
-- 必须使用 `https://`。
-- 末尾不要添加 `/`。
-- 必须填写 Worker 地址，不是 Pages 地址。
+- `host.docker.internal:7896` 不是项目自带服务；VPS 上没有对应 listener 时不要照抄。
+- Compose 已把 `host.docker.internal` 映射到宿主网关。
+- OpenVPN 通过 SOCKS5 上游时只支持 TCP OpenVPN 节点，UDP 节点会被跳过。
+- 不要给容器设置全局 `HTTP_PROXY`、`HTTPS_PROXY` 或 `ALL_PROXY`；出口路由由每个槽位的 mark 和策略路由控制。
 
-保存后重新部署 Pages。重新登录后台，确认 Dashboard 实时状态可以连接。
+## 访问和代理地址
 
-## 10. 添加 VPS
-
-登录 KUI 后台，进入：
+面板：
 
 ```text
-服务器与节点 → 接入机器
+http://<VPS-IP>:8080/
 ```
 
-填写：
+如果设置了其他 `KUI_MANAGEMENT_PORT`，使用对应宿主端口。
 
-- VPS 名称。
-- VPS 公网 IP。
-- 系统类型：Debian/Ubuntu 或 Alpine。
+SOCKS5：
 
-点击接入机器。
+```text
+socks5://admin:<你的密码>@<VPS-IP>:7920  # exit-01
+socks5://admin:<你的密码>@<VPS-IP>:7921  # exit-02
+...
+socks5://admin:<你的密码>@<VPS-IP>:7931  # exit-12
+```
 
-添加后，服务器卡片会生成专属的 **Full Deploy Command**。
+用户名以 `KUI_MANAGEMENT_USER` 为准。
 
-## 11. 安装 VPS Agent
+在“住宅 IP 代理”页可以：
 
-只复制面板当前生成的完整命令，在对应 VPS 的 root Shell 执行。
+- 查看 12 个槽位的出口、listener、住宅分类和逐目标探针结果。
+- 修改两位国家代码或 `ANY`，然后保存。
+- 从候选下拉框选择指定节点并连接。
+- 单独换 IP、启用或停用一个槽位。
+- 查看本地出口事件日志。
 
-不要：
+连续三次失败后槽位会停用，需要手动点击“启用”或选择候选重新连接。接受重拨请求只代表任务开始，不代表隧道已经 ready。
 
-- 手动替换 Agent Token。
-- 把其他 VPS 的命令复制到本机。
-- 把管理员密码写入安装命令。
-- 在本地 Windows 终端执行 Linux 安装命令。
+## 可发布条件
 
-Full Deploy 会安装并管理：
+槽位只有同时满足以下条件才会发布到 `/api/proxy/proxies` 和订阅：
 
-- `kui-agent`
-- `sing-box`
-- `proxy-lite`
-- Core/Proxy realtime client
-- 住宅代理所需组件
+1. `enabled=true`。
+2. OpenVPN 进程和 TUN 正常。
+3. 槽位策略路由表包含指向对应 TUN 的默认路由。
+4. SOCKS5 listener 已真实绑定。
+5. 实际出口 IP 可读取且被 TestISP 判定为住宅。
+6. 默认探针 `https://www.gstatic.com/generate_204` 精确返回 `204`。
+7. Google、ChatGPT、TradingView、Claude 四个自定义目标全部得到可接受响应。
 
-Debian/Ubuntu 检查：
+自定义目标接受最终 `2xx`，以及目标站明确返回且非 `407` 的 `4xx`；拒绝最终 `3xx`、`5xx`、`407` 和网络超时。
+
+## 部署后验证
+
+### 面板和 API
 
 ```bash
-systemctl is-active kui-agent sing-box
-systemctl status kui-agent --no-pager
-journalctl -u kui-agent -n 80 --no-pager
+curl -fsS http://127.0.0.1:8080/healthz
+curl -fsS http://127.0.0.1:8080/api/local/exits
+curl -fsS http://127.0.0.1:8080/api/proxy/proxies
 ```
 
-Alpine 检查：
+如果修改了 `KUI_MANAGEMENT_PORT`，把以上 `8080` 替换为实际端口。
+
+### 逐端口验证真实出口
+
+使用 `.env` 时先将密码加载到 shell，避免在命令历史中重复写明文：
 
 ```bash
-rc-service kui-agent status
-rc-service sing-box status
-tail -n 80 /var/log/kui-agent.log
+set -a
+. ./.env
+set +a
+
+curl --fail --silent --show-error \
+  --socks5-hostname "$KUI_MANAGEMENT_USER:$KUI_MANAGEMENT_PASSWORD@127.0.0.1:7920" \
+  https://api.ipify.org
 ```
 
-等待 30-90 秒后刷新面板。服务器卡片显示在线，且 CPU、内存、磁盘和网速开始更新，说明 Agent 部署成功。
-
-## 12. 创建第一个节点
-
-先使用单节点创建测试，确认单节点可用后再使用“极速全量节点下发（8合1）”。
-
-推荐测试顺序：
-
-1. XTLS-Reality。
-2. Hysteria2。
-3. H2-Reality。
-4. gRPC-Reality。
-5. 其它协议。
-
-使用 Clash Meta/Mihomo 时：
-
-- H2-Reality 的旧版 Mihomo 可能在延迟测试中显示超时，但节点实际可用。
-- 建议使用较新的 Mihomo 内核，并直接访问网页验证节点。
-- 不要只依据延迟测试结果判断 H2-Reality 是否可用。
-
-## 13. 启用 8 合 1
-
-确认单节点测试成功后，在服务器卡片中填写起始端口，例如：
-
-```text
-8881
-```
-
-面板会连续创建：
-
-```text
-XTLS-Reality
-Hysteria2
-TUIC
-Trojan
-H2-Reality
-gRPC-Reality
-AnyTLS
-Naive
-```
-
-起始端口必须满足：
-
-```text
-起始端口 >= 10
-起始端口 + 7 <= 65535
-```
-
-确认 VPS 安全组和系统防火墙允许对应 TCP/UDP 端口：
-
-- XTLS-Reality、Trojan、H2-Reality、gRPC-Reality、AnyTLS、Naive：TCP。
-- Hysteria2、TUIC：UDP。
-
-## 部署成功标准
-
-满足以下条件，才算部署完成：
-
-- Pages 可以登录。
-- Pages Production 有 `DB` binding。
-- Worker `/health` 返回成功。
-- Pages 和 Worker 使用同一个 D1。
-- Pages 已设置正确的 `REALTIME_URL`。
-- VPS `kui-agent` 和 `sing-box` 为 active。
-- 面板能显示 VPS 在线状态。
-- 修改节点后 VPS 能自动更新配置。
-- 订阅能正常生成。
-- 至少一个 XTLS-Reality 或 Hysteria2 节点实际可用。
-- H2-Reality 要使用较新的 Mihomo 进行测试，旧内核可能只误报延迟超时。
-
-# 常见问题
-
-## Pages 提示缺少 DB
-
-检查：
-
-```text
-Pages → Settings → Functions → D1 database bindings
-```
-
-确认 Production 环境存在：
-
-```text
-DB → 正确的 D1 数据库
-```
-
-修改后重新部署 Pages。
-
-## Worker `/health` 正常但面板没有实时状态
-
-依次检查：
-
-1. Worker 的 `DB` 是否与 Pages 使用同一个 D1。
-2. Pages Production 是否设置 `REALTIME_URL`。
-3. `REALTIME_URL` 是否使用 HTTPS，末尾是否多了 `/`。
-4. 浏览器是否重新登录并刷新页面。
-
-## Agent 返回 401 或 403
-
-- VPS 公网 IP 必须先添加到 KUI 面板。
-- 必须使用该 VPS 对应的 Full Deploy Command。
-- Token 过期或丢失时，重新从面板复制命令并执行。
-- 历史 Agent 如果使用旧鉴权方式，必须重新执行当前版本 Full Deploy Command。
-
-## VPS 在线但节点不可用
-
-Debian/Ubuntu：
+验证全部已发布端口：
 
 ```bash
-systemctl is-active sing-box
-sing-box check -c /etc/sing-box/config.json
-journalctl -u sing-box -n 100 --no-pager
-ss -ltnup
+for port in $(seq 7920 7931); do
+  printf '%s -> ' "$port"
+  curl --fail --silent --show-error --max-time 20 \
+    --socks5-hostname "$KUI_MANAGEMENT_USER:$KUI_MANAGEMENT_PASSWORD@127.0.0.1:$port" \
+    https://api.ipify.org || echo 'not ready'
+  echo
+done
 ```
 
-Alpine：
+API 显示的 `egress_ip` 必须与对应 SOCKS5 端口实测值一致。不可用槽位不应出现在代理订阅中。
+
+## 日常运维
+
+### 查看状态和日志
 
 ```bash
-rc-service sing-box status
-sing-box check -c /etc/sing-box/config.json
-tail -n 100 /var/log/sing-box.log
-ss -ltnup
+docker compose ps
+docker compose logs -f --tail=200 kui-local-multi-exit
+docker stats kui-local-multi-exit
 ```
 
-重点检查：
+### 重启
 
-- 端口是否被其他服务占用。
-- 云安全组是否放行正确的 TCP/UDP 协议。
-- Reality 的公钥、short ID、UUID 是否来自同一个节点。
-- SNI 是否为空或拼写错误。
-- H2/gRPC 节点是否使用了过旧的客户端内核。
+```bash
+docker compose restart kui-local-multi-exit
+```
 
-## H2-Reality 显示延迟超时
+### 更新
 
-部分旧 Mihomo/Clash Verge 内核会把 H2-Reality 的延迟检测判定为超时，但实际连接仍然可用。
+更新不会删除 `kui-local-data`：
 
-处理方式：
+```bash
+git pull --ff-only
+docker compose up -d --build
+docker compose ps
+```
 
-- 更新 Mihomo/Clash Verge 内核。
-- 手动选择节点访问网页测试。
-- 查看客户端连接日志，而不是只看延迟数字。
+更新后重新检查 health、面板和实际 SOCKS5 出口。
 
-## WARP 出口失败
+## 备份与恢复
 
-WARP 是可选功能，不影响原生节点部署。先切回：
+数据保存在命名 volume `kui-local-data` 的 `/opt/kui-local`。先确认实际 volume 名称：
+
+```bash
+docker volume ls | grep kui-local-data
+```
+
+Compose 常会给 volume 加项目名前缀，例如 `kui-local-multi-exit_kui-local-data`。下面先自动读取 Compose 使用的实际名称。
+
+### 备份
+
+```bash
+mkdir -p backups
+VOLUME_NAME=$(docker inspect kui-local-multi-exit --format '{{range .Mounts}}{{if eq .Destination "/opt/kui-local"}}{{.Name}}{{end}}{{end}}')
+test -n "$VOLUME_NAME"
+docker run --rm \
+  -v "$VOLUME_NAME:/data:ro" \
+  -v "$PWD/backups:/backup" \
+  alpine sh -c 'tar czf /backup/kui-local-data.tar.gz -C /data .'
+```
+
+### 恢复
+
+恢复会覆盖当前持久化数据。先停止容器并确认备份文件正确：
+
+```bash
+docker compose down
+VOLUME_NAME=$(docker volume ls --format '{{.Name}}' | grep 'kui-local-data$' | head -n 1)
+test -n "$VOLUME_NAME"
+test -f backups/kui-local-data.tar.gz
+docker run --rm \
+  -v "$VOLUME_NAME:/data" \
+  -v "$PWD/backups:/backup:ro" \
+  alpine sh -c 'rm -rf /data/* /data/.[!.]* /data/..?* 2>/dev/null || true; tar xzf /backup/kui-local-data.tar.gz -C /data'
+docker compose up -d --build
+```
+
+恢复后检查容器 health 和槽位状态。
+
+## 停止与卸载
+
+停止并保留数据：
+
+```bash
+docker compose down
+```
+
+再次启动：
+
+```bash
+docker compose up -d --build
+```
+
+永久删除容器和 `kui-local-data`：
+
+```bash
+docker compose down -v
+```
+
+`down -v` 会不可恢复地删除 SQLite、槽位配置和历史记录。只有确认已有备份且确实不再需要数据时才执行。
+
+## 常见问题
+
+### `/dev/net/tun` 不存在
+
+```bash
+ls -l /dev/net/tun
+modprobe tun
+```
+
+部分 VPS 虚拟化方案需要在服务商面板启用 TUN/TAP。容器还必须保留 Compose 中的 `/dev/net/tun` device 和 `NET_ADMIN` capability。
+
+### 容器不健康
+
+```bash
+docker compose ps
+docker compose logs --tail=200 kui-local-multi-exit
+curl -v http://127.0.0.1:8080/healthz
+```
+
+检查面板端口是否被占用、密码变量是否已设置，以及容器是否能写入 volume。
+
+### 没有可用节点或槽位被停用
+
+VPNGate 节点随时可能离线、认证失败或无法通过目标探针。可以：
+
+- 刷新候选列表后手动选择其他节点。
+- 将目标国家改为当前候选较多的国家或 `ANY`。
+- 点击“启用”重新检测。
+- 查看卡片错误和 `docker compose logs`。
+
+不要为了凑够 12 个而把失败槽位标记为 ready。
+
+### 出口被判定为机房或未知
+
+项目采用 fail-closed：TestISP 未明确判定住宅时不会发布。更换 VPNGate 节点，不要绕过住宅门禁。
+
+### SOCKS5 返回 VPS 原生出口
+
+通过 API 与 `api.ipify.org` 对照。当前版本会检测策略路由消失并撤下槽位；如果仍出现不一致，先更新到最新版，再查看该槽位事件日志和路由：
+
+```bash
+docker exec kui-local-multi-exit ip rule show
+docker exec kui-local-multi-exit ip route show table 200
+```
+
+`exit-01` 使用表 `200`，后续槽位依次到 `211`。
+
+### 临时上游代理不可达
+
+如果 VPS 没有宿主 SOCKS5 服务，清空：
+
+```bash
+sed -i 's|^KUI_FETCH_PROXY=.*|KUI_FETCH_PROXY=|' .env
+sed -i 's|^KUI_OPENVPN_SOCKS_PROXY=.*|KUI_OPENVPN_SOCKS_PROXY=|' .env
+docker compose up -d --build
+```
+
+### Docker 或宿主系统代理干扰
+
+不要为该容器设置全局 `HTTP_PROXY`、`HTTPS_PROXY` 或 `ALL_PROXY`。如 Docker daemon 配置了全局代理，请核对它是否会影响容器出站；项目只会显式读取 `KUI_FETCH_PROXY` 和 `KUI_OPENVPN_SOCKS_PROXY`。
+
+## 开发验证
+
+```bash
+PYTHONWARNINGS='error::ResourceWarning' python3 -m unittest discover -s tests -v
+KUI_MANAGEMENT_PASSWORD=test-only-password docker compose config --quiet
+docker build --check .
+python3 -m compileall -q vps tests
+git diff --check
+```
+
+针对一台已经启动的实例运行真实 SOCKS5 集成测试：
+
+```bash
+KUI_INTEGRATION=1 \
+KUI_BASE_URL=http://127.0.0.1:8080 \
+KUI_PROXY_HOST=127.0.0.1 \
+KUI_PROXY_USER=admin \
+KUI_PROXY_PASSWORD='<实际代理密码>' \
+KUI_EXPECT_READY_SLOTS='<当前预期可用数量>' \
+python3 -m unittest discover -s tests/integration -v
+```
+
+## 项目结构
 
 ```text
-节点出口 → 原生出口
-```
-
-然后检查：
-
-```bash
-systemctl status kui-agent --no-pager
-journalctl -u kui-agent -n 100 --no-pager
-```
-
-常见原因：
-
-- VPS 没有可用 IPv6，却选择了 WARP IPv6 或双栈。
-- WARP 数据面校验失败。
-- VPS 网络阻断 WireGuard/UDP。
-- 系统时间不正确。
-
-## 住宅代理显示 0/2 或 1/2
-
-检查：
-
-- `/dev/net/tun` 是否存在。
-- `proxy-lite` 是否运行。
-- OpenVPN 是否可以访问外网。
-- Pages 是否配置 `PROXY_USER` 和 `PROXY_PASS`。
-- 所选国家是否有可用公开 VPN 节点。
-
-住宅代理依赖公开节点和网络质量，不保证始终为 2/2。建议先完成原生出口部署，再单独测试住宅出口。
-
-## 一键 Worker 部署失败
-
-使用本地 Wrangler：
-
-```bash
-git clone https://github.com/a6216abcd/K-UI.git
-cd K-UI/realtime
-npm install
-npx wrangler login
-```
-
-编辑 `wrangler.jsonc`：
-
-- 填写 Pages 正在使用的 `database_name`。
-- 填写同一个 D1 的 `database_id`。
-- 使用默认 `*.pages.dev` 域名时不需要配置 `PAGES_ORIGIN`。**绑定自定义域名后必须**在 Worker 环境变量中设置 `PAGES_ORIGIN=https://你的自定义域名`，保存后重新部署 Worker。
-
-然后执行：
-
-```bash
-npx wrangler deploy
-```
-
-部署后仍然要回到第 7-9 步检查 Worker binding、`/health` 和 Pages 的 `REALTIME_URL`。
-
-# 更新与安全
-
-VPS 组件每小时通过 Pages 鉴权端点检查更新，验证组件名、长度、SHA-256 和基于 Agent Token 的 HMAC 更新清单，通过 Python 语法检查后原子替换。更新后的 Agent 需要完成配置拉取、核心服务健康检查和首次状态上报后才确认新版本。
-
-自动更新文件包括：
-
-```text
-/opt/kui/agent.py
-/opt/kui/realtime_client.py
-/opt/proxy_lite/lite_manager.py
-/opt/proxy_lite/proxy_server.py
-/opt/proxy_lite/realtime_client.py
-```
-
-安全要求：
-
-- `ADMIN_PASSWORD`、`PROXY_USER`、`PROXY_PASS` 使用 Secret。
-- 不要公开 Agent Token、Cloudflare API Token 或 VPS root 密码。
-- 第三方订阅导入仅允许 HTTPS 公网地址；本机、私网和保留地址会被拒绝。
-- 开启订阅保护时，所有正常订阅客户端也不能更新；恢复前请确认不需要在线更新。
-- 住宅代理端口只允许可信来源访问。
-- 后台自定义 Script 可以执行任意 JavaScript，只允许可信管理员使用。
-- 如果 root 密码曾经出现在聊天、Issue 或日志中，立即修改密码。
-
-# 项目结构
-
-```text
-KUI/
+.
+├── Dockerfile
+├── compose.yaml
 ├── index.html
-├── functions/api/[[path]].js
-├── realtime/
-│   ├── src/index.js
-│   ├── wrangler.jsonc
-│   └── package.json
-└── vps/
-    ├── agent.py
-    ├── realtime_client.py
-    ├── kui.sh
-    ├── lite_manager.py
-    ├── proxy_server.py
-    └── residential-proxy.sh
+├── vps/                         # 本地 API、调度、路由、SOCKS5、VPNGate
+├── tests/                       # 单元与真实集成测试
+└── docs/superpowers/            # 设计与实施计划
 ```
 
-# 支持与贡献
-
-- Issues：https://github.com/a6216abcd/K-UI/issues
-- Pull Requests：https://github.com/a6216abcd/K-UI/pulls
-
-提交 Issue 时不要附带密码、Token 或完整 VPS 配置。
+更详细的本地模式说明见 [`README.local.md`](README.local.md)。

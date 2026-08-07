@@ -13,3 +13,6 @@ socks_auth.txt
 runtime/
 temp/
 .worktrees/
+.env
+.env.*
+!.env.example

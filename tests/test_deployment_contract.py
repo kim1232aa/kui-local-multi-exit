@@ -22,7 +22,12 @@ class DeploymentContractTest(unittest.TestCase):
 
     def test_gitignore_excludes_runtime_credentials_configs_and_logs(self):
         ignored = (self.root / ".gitignore").read_text(encoding="utf-8")
-        for marker in ("*.ovpn", "*.log", "auth.txt", "socks_auth.txt", "runtime/"):
+        for marker in ("*.ovpn", "*.log", "auth.txt", "socks_auth.txt", "runtime/", ".env"):
+            self.assertIn(marker, ignored)
+
+    def test_dockerignore_excludes_repository_and_local_runtime_data(self):
+        ignored = (self.root / ".dockerignore").read_text(encoding="utf-8")
+        for marker in (".git", ".worktrees", ".env", "temp", "runtime", "*.db", "*.log"):
             self.assertIn(marker, ignored)
 
     def test_runtime_openvpn_config_and_log_are_owner_only(self):
