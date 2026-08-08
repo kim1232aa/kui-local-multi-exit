@@ -67,7 +67,7 @@ class VPNGateFetchTest(unittest.TestCase):
         endpoints = iter(["199.59.150.12", "168.143.171.93"])
         attempted = []
 
-        def open_url(request, timeout):
+        def open_url(request, timeout, server_hostname=None):
             attempted.append((request.full_url, request.headers.get("Host")))
             return FakeResponse()
 

@@ -105,7 +105,19 @@ class ExitManager:
 
     def _refresh_loop(self) -> None:
         while not self._shutdown.wait(600):
-            self.refresh_nodes()
+            count = self.refresh_nodes()
+            # 节点刷新成功后，重启因自动失败限制而停用的槽位
+            if count > 0:
+                self._try_recover_auto_disabled_slots()
+
+    def _try_recover_auto_disabled_slots(self) -> None:
+        """尝试恢复因连续失败自动停用的槽位"""
+        for slot in self.store.list_slots():
+            if not slot.enabled and slot.disabled_reason == "automatic_failure_limit":
+                # 重置失败计数并启用
+                updated = self.store.enable_slot(slot.id)
+                self.store.record_event(slot.id, "auto_recovery", "recovered after node pool refresh")
+                self.start_slot(updated.id)
 
     def active_entry_ips(self, excluding: str | None = None) -> set[str]:
         with self._selection_lock:

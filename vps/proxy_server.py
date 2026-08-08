@@ -282,28 +282,121 @@ class ProxyListener:
             version, command, _, address_type = recv_exact(client, 4)
             if version != 5:
                 return
-            if command != 1:
+            if command == 1:  # CONNECT
+                if address_type == 1:
+                    host = socket.inet_ntoa(recv_exact(client, 4))
+                elif address_type == 3:
+                    host = recv_exact(client, recv_exact(client, 1)[0]).decode("ascii")
+                elif address_type == 4:
+                    host = socket.inet_ntop(socket.AF_INET6, recv_exact(client, 16))
+                else:
+                    return
+                port = int.from_bytes(recv_exact(client, 2), "big")
+                upstream = create_connection((host, port), self.mark, timeout=20)
+                upstream.settimeout(RELAY_IDLE_TIMEOUT)
+                client.settimeout(RELAY_IDLE_TIMEOUT)
+                client.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+                relay(client, upstream)
+            elif command == 3:  # UDP ASSOCIATE
+                # 消费客户端提供的地址（但我们不使用它）
+                if address_type == 1:
+                    recv_exact(client, 4)
+                elif address_type == 3:
+                    recv_exact(client, recv_exact(client, 1)[0])
+                elif address_type == 4:
+                    recv_exact(client, 16)
+                else:
+                    return
+                recv_exact(client, 2)  # port
+                # 创建 UDP relay socket
+                udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                udp_sock.setsockopt(socket.SOL_SOCKET, SO_MARK, self.mark)
+                udp_sock.bind((self.host, 0))
+                udp_port = udp_sock.getsockname()[1]
+                # 返回 UDP relay 地址
+                bind_addr = socket.inet_aton(self.host)
+                client.sendall(b"\x05\x00\x00\x01" + bind_addr + udp_port.to_bytes(2, "big"))
+                # UDP relay 循环
+                self._udp_relay(client, udp_sock)
+            else:
                 client.sendall(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
                 return
-            if address_type == 1:
-                host = socket.inet_ntoa(recv_exact(client, 4))
-            elif address_type == 3:
-                host = recv_exact(client, recv_exact(client, 1)[0]).decode("ascii")
-            elif address_type == 4:
-                host = socket.inet_ntop(socket.AF_INET6, recv_exact(client, 16))
-            else:
-                return
-            port = int.from_bytes(recv_exact(client, 2), "big")
-            upstream = create_connection((host, port), self.mark, timeout=20)
-            upstream.settimeout(RELAY_IDLE_TIMEOUT)
-            client.settimeout(RELAY_IDLE_TIMEOUT)
-            client.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
-            relay(client, upstream)
         except (OSError, ValueError, ConnectionError, UnicodeError):
             pass
         finally:
             if upstream:
                 upstream.close()
+
+    def _udp_relay(self, tcp_client: socket.socket, udp_sock: socket.socket) -> None:
+        """UDP ASSOCIATE relay: 转发 UDP 数据包直到 TCP 连接关闭"""
+        try:
+            udp_sock.settimeout(1.0)
+            tcp_client.settimeout(1.0)
+            client_udp_addr = None
+            while not self._stop.is_set():
+                try:
+                    # 检查 TCP 连接是否关闭
+                    ready, _, _ = select.select([tcp_client], [], [], 0.1)
+                    if ready:
+                        data = tcp_client.recv(1, socket.MSG_PEEK)
+                        if not data:
+                            break
+                except (OSError, socket.timeout):
+                    pass
+                # 接收客户端 UDP 数据包
+                try:
+                    data, addr = udp_sock.recvfrom(65536)
+                    if len(data) < 10:
+                        continue
+                    # SOCKS5 UDP 请求格式: RSV(2) | FRAG(1) | ATYP(1) | DST.ADDR | DST.PORT | DATA
+                    if data[2] != 0:  # FRAG != 0 不支持分片
+                        continue
+                    atyp = data[3]
+                    if atyp == 1:  # IPv4
+                        dst_addr = socket.inet_ntoa(data[4:8])
+                        dst_port = int.from_bytes(data[8:10], "big")
+                        payload = data[10:]
+                        header_len = 10
+                    elif atyp == 3:  # 域名
+                        addr_len = data[4]
+                        dst_addr = data[5:5+addr_len].decode("ascii")
+                        dst_port = int.from_bytes(data[5+addr_len:7+addr_len], "big")
+                        payload = data[7+addr_len:]
+                        header_len = 7 + addr_len
+                    elif atyp == 4:  # IPv6
+                        dst_addr = socket.inet_ntop(socket.AF_INET6, data[4:20])
+                        dst_port = int.from_bytes(data[20:22], "big")
+                        payload = data[22:]
+                        header_len = 22
+                    else:
+                        continue
+                    # 记录客户端地址
+                    if client_udp_addr is None:
+                        client_udp_addr = addr
+                    elif client_udp_addr != addr:
+                        continue  # 忽略来自其他地址的包
+                    # 解析目标并转发
+                    targets = resolve_with_doh(dst_addr, self.mark, timeout=5.0)
+                    if not targets:
+                        continue
+                    out_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    out_sock.setsockopt(socket.SOL_SOCKET, SO_MARK, self.mark)
+                    out_sock.settimeout(2.0)
+                    try:
+                        out_sock.sendto(payload, (targets[0], dst_port))
+                        # 等待响应
+                        reply_data, _ = out_sock.recvfrom(65536)
+                        # 封装响应: RSV(2) | FRAG(1) | ATYP(1) | BND.ADDR | BND.PORT | DATA
+                        reply_header = b"\x00\x00\x00" + data[3:header_len]
+                        udp_sock.sendto(reply_header + reply_data, client_udp_addr)
+                    finally:
+                        out_sock.close()
+                except socket.timeout:
+                    continue
+                except (OSError, ValueError, UnicodeError):
+                    continue
+        finally:
+            udp_sock.close()
 
     def _http_client(self, client: socket.socket, first_byte: bytes) -> None:
         if not PROXY_USER or not PROXY_PASS:

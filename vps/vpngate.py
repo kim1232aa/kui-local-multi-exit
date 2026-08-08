@@ -41,7 +41,13 @@ def resolve_ipv4_endpoints(hostname: str) -> list[str]:
     return endpoints
 
 
-def open_direct_url(request: urllib.request.Request, timeout: int):
+def open_direct_url(request: urllib.request.Request, timeout: int, server_hostname: str | None = None):
+    if server_hostname:
+        context = ssl.create_default_context()
+        https_handler = urllib.request.HTTPSHandler(context=context, check_hostname=True)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), https_handler)
+        # 通过 IP 连接但保留 SNI for TLS
+        return opener.open(request, timeout=timeout)
     return direct_url_opener().open(request, timeout=timeout)
 
 
@@ -163,7 +169,8 @@ def fetch_api_text(url: str = API_URL, timeout: int = 20) -> str:
         for endpoint in endpoints:
             try:
                 request = build_endpoint_request(endpoint, url)
-                with open_direct_url(request, timeout=timeout) as response:
+                # Python 3.12+ 需要显式传递 SNI 以匹配证书
+                with open_direct_url(request, timeout=timeout, server_hostname=parsed.hostname) as response:
                     text = response.read().decode("utf-8", errors="replace")
                 break
             except (OSError, urllib.error.URLError):
