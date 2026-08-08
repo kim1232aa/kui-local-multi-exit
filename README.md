@@ -43,7 +43,7 @@ docker compose version
 ### 1. 克隆仓库
 
 ```bash
-git clone https://github.com/kim1232aa/kui-local-multi-exit.git
+git clone https://github.com/YOUR_USERNAME/kui-local-multi-exit.git
 cd kui-local-multi-exit
 ```
 
@@ -104,8 +104,8 @@ docker compose logs --tail=100 kui-local-multi-exit
 使用 UFW 且只允许一个管理来源时，可按实际来源 IP 调整：
 
 ```bash
-ufw allow from <你的可信公网IP> to any port 8080 proto tcp
-ufw allow from <你的可信公网IP> to any port 7920:7931 proto tcp
+ufw allow from YOUR_TRUSTED_IP to any port 8080 proto tcp
+ufw allow from YOUR_TRUSTED_IP to any port 7920:7931 proto tcp
 ufw status
 ```
 
@@ -113,20 +113,20 @@ ufw status
 
 ## 网络受限时使用上游代理
 
-普通 VPS 直连可用时，保持以下变量为空。只有 VPS 宿主确实运行了可用的 SOCKS5 服务时才配置，例如宿主 `7896`：
+普通 VPS 直连可用时，保持以下变量为空。只有 VPS 宿主确实运行了可用的 SOCKS5 服务时才配置：
 
 ```bash
 cat >> .env <<'EOF'
-KUI_FETCH_PROXY=socks5://host.docker.internal:7896
-KUI_OPENVPN_SOCKS_PROXY=socks5://host.docker.internal:7896
+KUI_FETCH_PROXY=socks5://YOUR_UPSTREAM_HOST:PORT
+KUI_OPENVPN_SOCKS_PROXY=socks5://YOUR_UPSTREAM_HOST:PORT
 EOF
 docker compose up -d --build
 ```
 
 注意：
 
-- `host.docker.internal:7896` 不是项目自带服务；VPS 上没有对应 listener 时不要照抄。
-- Compose 已把 `host.docker.internal` 映射到宿主网关。
+- 替换 `YOUR_UPSTREAM_HOST:PORT` 为实际可用的 SOCKS5 代理地址。
+- Compose 已把 `host.docker.internal` 映射到宿主网关；如宿主本身有代理服务，可使用 `host.docker.internal:端口`。
 - OpenVPN 通过 SOCKS5 上游时只支持 TCP OpenVPN 节点，UDP 节点会被跳过。
 - 不要给容器设置全局 `HTTP_PROXY`、`HTTPS_PROXY` 或 `ALL_PROXY`；出口路由由每个槽位的 mark 和策略路由控制。
 
@@ -135,7 +135,7 @@ docker compose up -d --build
 面板：
 
 ```text
-http://<VPS-IP>:8080/
+http://YOUR_VPS_IP:8080/
 ```
 
 如果设置了其他 `KUI_MANAGEMENT_PORT`，使用对应宿主端口。
@@ -143,10 +143,10 @@ http://<VPS-IP>:8080/
 SOCKS5：
 
 ```text
-socks5://admin:<你的密码>@<VPS-IP>:7920  # exit-01
-socks5://admin:<你的密码>@<VPS-IP>:7921  # exit-02
+socks5://admin:YOUR_PASSWORD@YOUR_VPS_IP:7920  # exit-01
+socks5://admin:YOUR_PASSWORD@YOUR_VPS_IP:7921  # exit-02
 ...
-socks5://admin:<你的密码>@<VPS-IP>:7931  # exit-12
+socks5://admin:YOUR_PASSWORD@YOUR_VPS_IP:7931  # exit-12
 ```
 
 用户名以 `KUI_MANAGEMENT_USER` 为准。
@@ -370,7 +370,7 @@ docker compose up -d --build
 
 ```bash
 PYTHONWARNINGS='error::ResourceWarning' python3 -m unittest discover -s tests -v
-KUI_MANAGEMENT_PASSWORD=test-only-password docker compose config --quiet
+KUI_MANAGEMENT_PASSWORD=your-test-password docker compose config --quiet
 docker build --check .
 python3 -m compileall -q vps tests
 git diff --check
@@ -383,8 +383,8 @@ KUI_INTEGRATION=1 \
 KUI_BASE_URL=http://127.0.0.1:8080 \
 KUI_PROXY_HOST=127.0.0.1 \
 KUI_PROXY_USER=admin \
-KUI_PROXY_PASSWORD='<实际代理密码>' \
-KUI_EXPECT_READY_SLOTS='<当前预期可用数量>' \
+KUI_PROXY_PASSWORD='your-actual-password' \
+KUI_EXPECT_READY_SLOTS='expected-ready-count' \
 python3 -m unittest discover -s tests/integration -v
 ```
 
