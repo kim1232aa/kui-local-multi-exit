@@ -207,7 +207,7 @@ class LocalAPITest(unittest.TestCase):
         status, body = self.request("/api/local/exits")
 
         self.assertEqual(200, status)
-        self.assertEqual(12, len(body["exits"]))
+        self.assertEqual(24, len(body["exits"]))
 
     def test_kui_data_endpoint_returns_local_dashboard_shape(self):
         status, body = self.request("/api/data")
@@ -253,7 +253,7 @@ class LocalAPITest(unittest.TestCase):
         status, body = self.request("/api/probe/public?ajax=1")
 
         self.assertEqual(200, status)
-        self.assertEqual(12, len(body["servers"]))
+        self.assertEqual(24, len(body["servers"]))
         first = body["servers"][0]
         self.assertEqual("exit-01", first["id"])
         self.assertEqual("ready", first["state"])
@@ -278,7 +278,7 @@ class LocalAPITest(unittest.TestCase):
         status, body = self.request("/api/probe/admin/data")
 
         self.assertEqual(200, status)
-        self.assertEqual(12, len(body["servers"]))
+        self.assertEqual(24, len(body["servers"]))
         self.assertEqual("exit-01", body["servers"][0]["id"])
         self.assertIn("listener_ready", body["servers"][0])
         self.assertEqual("false", body["settings"]["is_public"])
@@ -361,7 +361,7 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual("local", pool[0]["ip"])
         self.assertEqual("local", nodes[0]["ip"])
         details = json.loads(nodes[0]["details"])
-        self.assertEqual(12, len(details))
+        self.assertEqual(24, len(details))
         self.assertEqual("exit-01", details[0]["tunnel"])
         self.assertEqual("JP", details[0]["country"])
         self.assertEqual(7920, details[0]["port"])
@@ -738,6 +738,128 @@ class LocalAPITest(unittest.TestCase):
         self.assertIn("port: 7920", body)
         self.assertIn("exit-01", body)
 
+    def test_reality_clash_subscription_uses_actual_country_isp_and_egress_ip(self):
+        self.manager.set_slot_ready("exit-03")
+        self.store.set_runtime(
+            "exit-03",
+            state="ready",
+            entry_ip="203.0.113.30",
+            egress_ip="203.0.113.30",
+            current_node={"ip": "203.0.113.30", "country": "JP", "source": "vpngate"},
+            check_result={
+                "residential": {
+                    "raw": {
+                        "geo": {"country": "Unknown", "country_code": "Unknown", "city": "Unknown"},
+                        "isp": {"org": "KDDI CORPORATION", "flag": "residential"},
+                    }
+                }
+            },
+        )
+        manifest = Path(self.tempdir.name) / "public-nodes.json"
+        manifest.write_text(
+            json.dumps({
+                "version": 1,
+                "nodes": [{
+                    "slot_id": "exit-03",
+                    "address": "153.121.38.245",
+                    "port": 8445,
+                    "uuid": "11111111-1111-1111-1111-111111111111",
+                    "sni": "addons.mozilla.org",
+                    "public_key": "abcdefghijklmnopqrstuvwxyzABCDEFGH1234567_",
+                    "short_id": "aabbccddeeff0011",
+                }],
+            }),
+            encoding="utf-8",
+        )
+        self.server.reality_nodes_file = manifest
+        status, data = self.request("/api/data")
+        token = data["mySubToken"]
+
+        status, body = self.request(f"/api/sub?user=admin&token={token}&format=clash", expect_json=False)
+
+        self.assertEqual(200, status)
+        self.assertIn('name: "JP-日本 | KDDI | 203.0.113.30 | exit-03"', body)
+        self.assertIn("type: vless", body)
+        self.assertIn('server: "153.121.38.245"', body)
+        self.assertIn("port: 8445", body)
+        self.assertIn("flow: \"xtls-rprx-vision\"", body)
+        self.assertIn("reality-opts:", body)
+        self.assertNotIn("type: socks5", body)
+        self.assertNotIn("ANY_exit-03_ready", body)
+
+        status, encoded = self.request(f"/api/sub?user=admin&token={token}", expect_json=False)
+        links = base64.b64decode(encoded).decode()
+        self.assertIn("vless://11111111-1111-1111-1111-111111111111@153.121.38.245:8445", links)
+        self.assertIn("JP-%E6%97%A5%E6%9C%AC%20%7C%20KDDI%20%7C%20203.0.113.30%20%7C%20exit-03", links)
+        self.assertNotIn("socks5://", links)
+
+    def test_reality_clash_subscription_separates_direct_and_chained_exits(self):
+        self.manager.set_slot_ready("exit-01")
+        manifest = Path(self.tempdir.name) / "public-nodes.json"
+        manifest.write_text(
+            json.dumps({
+                "version": 1,
+                "nodes": [
+                    {
+                        "slot_id": "exit-01",
+                        "address": "153.121.38.245",
+                        "port": 8443,
+                        "uuid": "11111111-1111-1111-1111-111111111111",
+                        "sni": "addons.mozilla.org",
+                        "public_key": "abcdefghijklmnopqrstuvwxyzABCDEFGH1234567_",
+                        "short_id": "aabbccddeeff0011",
+                    },
+                    {
+                        "slot_id": "tr-01",
+                        "address": "153.121.38.245",
+                        "port": 8501,
+                        "uuid": "22222222-2222-2222-2222-222222222222",
+                        "sni": "addons.mozilla.org",
+                        "public_key": "abcdefghijklmnopqrstuvwxyzABCDEFGH1234567_",
+                        "short_id": "1122334455667788",
+                    },
+                ],
+            }),
+            encoding="utf-8",
+        )
+        self.server.reality_nodes_file = manifest
+        status, data = self.request("/api/data")
+        token = data["mySubToken"]
+        bridge = {
+            "name": "bridge-01",
+            "protocol": "Hysteria2",
+            "address": "bridge.example.com",
+            "port": 443,
+            "password": "secret",
+            "sni": "bridge.example.com",
+        }
+
+        with patch("vps.local_api.load_bridge_nodes", return_value=[bridge]):
+            status, body = self.request(
+                f"/api/sub?user=admin&token={token}&format=clash",
+                expect_json=False,
+            )
+
+        self.assertEqual(200, status)
+        direct_name = "JP-日本 | 203.0.113.1 | exit-01"
+        chain_name = "TR-土耳其 | ProxyScrape | tr-01 | 链式"
+        direct_start = body.index(f'  - name: "{direct_name}"')
+        chain_start = body.index(f'  - name: "{chain_name}"')
+        direct_block = body[direct_start:chain_start]
+        chain_block = body[chain_start:body.index("\nproxy-groups:", chain_start)]
+        self.assertNotIn("dialer-proxy:", direct_block)
+        self.assertIn('dialer-proxy: "🔗链式前置"', chain_block)
+        self.assertEqual(1, body.count("dialer-proxy:"))
+        self.assertIn(
+            '  - name: PROXY\n    type: select\n    proxies:\n'
+            '      - "直连节点"\n      - "链式节点"',
+            body,
+        )
+        self.assertIn(
+            f'  - name: 链式节点\n    type: select\n    proxies:\n      - "{chain_name}"',
+            body,
+        )
+
     def test_subscription_excludes_disabled_local_exit_socks5_nodes(self):
         self.request("/api/local/exits/exit-01/disable", method="POST", body={})
         status, data = self.request("/api/data")
@@ -835,7 +957,7 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(200, update_status)
         self.assertEqual("Tokyo residential", updated["name"])
         self.assertEqual(200, admin_status)
-        self.assertEqual(12, len(admin["servers"]))
+        self.assertEqual(24, len(admin["servers"]))
         self.assertEqual("Tokyo residential", admin["servers"][0]["name"])
         self.assertEqual("Japan", admin["servers"][0]["server_group"])
         self.assertEqual("idle", admin["servers"][0]["state"])
@@ -857,7 +979,7 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(200, reset_status)
         self.assertTrue(reset["success"])
         self.assertEqual(200, admin_status)
-        self.assertEqual(12, len(admin["servers"]))
+        self.assertEqual(24, len(admin["servers"]))
         self.assertEqual("exit-01", admin["servers"][0]["name"])
         self.assertEqual(200, detail_status)
         self.assertEqual("exit-01", detail["name"])

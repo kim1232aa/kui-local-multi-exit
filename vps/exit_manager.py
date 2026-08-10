@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import socket
@@ -12,10 +13,11 @@ from pathlib import Path
 from typing import Any
 
 from .models import ExitSlotSnapshot
+from .openvpn_sources import fetch_all_openvpn_nodes
 from .proxy_server import ProxyListener
 from .routing import RouteManager
 from .store import LocalStore
-from .vpngate import STREAM_URLS, NodePool, check_residential, detect_egress, fetch_nodes, probe_targets
+from .vpngate import STREAM_URLS, NodePool, check_residential, detect_egress, probe_targets
 
 
 @dataclass
@@ -85,6 +87,7 @@ class ExitManager:
             if slot.state not in {"idle", "disabled"}:
                 self.store.set_runtime(slot.id, state="idle", entry_ip="", egress_ip="", current_node={}, check_result={})
         self.refresh_nodes()
+        self._try_recover_auto_disabled_slots()
         if self.start_workers:
             self._refresh_thread = threading.Thread(target=self._refresh_loop, name="vpngate-refresh", daemon=True)
             self._refresh_thread.start()
@@ -93,31 +96,72 @@ class ExitManager:
                 self.start_slot(slot.id)
 
     def refresh_nodes(self) -> int:
+        report: dict[str, Any] = {}
         try:
-            nodes = fetch_nodes(timeout=60)
+            fresh_nodes, report = fetch_all_openvpn_nodes(timeout=60)
         except Exception as error:
-            self.store.record_event(None, "vpngate_refresh_failed", str(error))
-            return 0
+            fresh_nodes = []
+            self.store.record_event(None, "openvpn_refresh_failed", str(error))
+        if fresh_nodes:
+            try:
+                self.store.replace_vpn_nodes(
+                    fresh_nodes,
+                    retention_days=int(os.environ.get("KUI_VPN_HISTORY_DAYS", "30")),
+                )
+            except Exception as error:
+                self.store.record_event(None, "openvpn_cache_write_failed", str(error))
+        cached_nodes = self.store.load_vpn_nodes()
+        nodes = cached_nodes or fresh_nodes
         if nodes:
             self.node_pool.replace(nodes)
-            self.store.record_event(None, "vpngate_refreshed", f"loaded {len(nodes)} nodes")
-        return len(nodes)
+            if report:
+                self.store.set_setting("openvpn_source_report", json.dumps(report, ensure_ascii=False, separators=(",", ":")))
+            providers = report.get("providers", {}) if report else {}
+            summary = ", ".join(
+                f"{name}={detail.get('count', 0)}"
+                for name, detail in providers.items()
+                if isinstance(detail, dict) and not detail.get("metadata_only")
+            )
+            self.store.record_event(None, "openvpn_refreshed", f"loaded {len(nodes)} rolling nodes; {summary}")
+            return len(nodes)
+        self.store.record_event(None, "openvpn_refresh_empty", "all OpenVPN sources returned no usable nodes")
+        return 0
 
     def _refresh_loop(self) -> None:
-        while not self._shutdown.wait(600):
-            count = self.refresh_nodes()
-            # 节点刷新成功后，重启因自动失败限制而停用的槽位
-            if count > 0:
-                self._try_recover_auto_disabled_slots()
+        """Periodically refresh node pool and try to recover disabled slots."""
+        refresh_interval = 600
+        recovery_interval = 60
+        next_refresh = time.time() + refresh_interval
+        while not self._shutdown.wait(recovery_interval):
+            self._try_recover_auto_disabled_slots()
+            if time.time() >= next_refresh:
+                count = self.refresh_nodes()
+                if count > 0:
+                    self._try_recover_auto_disabled_slots()
+                next_refresh = time.time() + refresh_interval
 
     def _try_recover_auto_disabled_slots(self) -> None:
-        """尝试恢复因连续失败自动停用的槽位"""
-        for slot in self.store.list_slots():
-            if not slot.enabled and slot.disabled_reason == "automatic_failure_limit":
-                # 重置失败计数并启用
-                updated = self.store.enable_slot(slot.id)
-                self.store.record_event(slot.id, "auto_recovery", "recovered after node pool refresh")
-                self.start_slot(updated.id)
+        """Recover only slots that currently have an eligible unreserved node."""
+        recoverable: list[str] = []
+        with self._selection_lock:
+            excluded = set(self._reserved_nodes.values())
+            excluded.update(
+                slot.entry_ip
+                for slot in self.store.list_slots()
+                if slot.entry_ip
+            )
+            for slot in self.store.list_slots():
+                if slot.enabled or slot.disabled_reason != "automatic_failure_limit":
+                    continue
+                node = self._select_node(slot.country, excluded)
+                if node is None:
+                    continue
+                recoverable.append(slot.id)
+                excluded.add(str(node["ip"]))
+        for slot_id in recoverable:
+            updated = self.store.enable_slot(slot_id)
+            self.store.record_event(slot_id, "auto_recovery", "eligible node became available")
+            self.start_slot(updated.id)
 
     def active_entry_ips(self, excluding: str | None = None) -> set[str]:
         with self._selection_lock:
@@ -418,6 +462,15 @@ class ExitManager:
         with self._selection_lock:
             self._reserved_nodes.pop(slot_id, None)
 
+    def _node_auth_file(self, slot: ExitSlotSnapshot, node: dict[str, Any]) -> Path:
+        username = str(node.get("username", ""))
+        password = str(node.get("password", ""))
+        if not username and not password:
+            return self.auth_file
+        path = self.workspace / f"auth-{slot.id}.txt"
+        self._write_runtime_file(path, f"{username}\n{password}\n")
+        return path
+
     @staticmethod
     def _write_runtime_file(path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -430,7 +483,12 @@ class ExitManager:
         path.touch(mode=0o600, exist_ok=True)
         path.chmod(0o600)
 
-    def _openvpn_command(self, slot: ExitSlotSnapshot, config_path: Path) -> list[str]:
+    def _openvpn_command(
+        self,
+        slot: ExitSlotSnapshot,
+        config_path: Path,
+        auth_file: Path | None = None,
+    ) -> list[str]:
         version = self._run(["openvpn", "--version"], capture_output=True, text=True, check=False).stdout
         if "2.4" in version:
             cipher_args = ["--ncp-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"]
@@ -458,7 +516,7 @@ class ExitManager:
             "ignore",
             "ifconfig-ipv6",
             "--auth-user-pass",
-            str(self.auth_file),
+            str(auth_file or self.auth_file),
             *self._openvpn_proxy_args(),
             "--connect-timeout",
             "5",
@@ -478,7 +536,7 @@ class ExitManager:
             runtime.preferred_node_ip = ""
             node = self._reserve_node(slot_id, slot.country, preferred_ip)
             if not node:
-                raise RuntimeError(f"no VPNGate node for {slot.country}; distribution={self.node_pool.counts()}")
+                raise RuntimeError(f"no OpenVPN node for {slot.country}; distribution={self.node_pool.counts()}")
             endpoint_ip = str(node["ip"])
             config_path = self.config_dir / f"{slot_id}.ovpn"
             log_path = self.workspace / f"{slot_id}.log"
@@ -487,7 +545,7 @@ class ExitManager:
             gateway, external_interface = self._default_route(self._run)
             with log_path.open("w") as log_file:
                 runtime.process = self._popen(
-                    self._openvpn_command(slot, config_path),
+                    self._openvpn_command(slot, config_path, self._node_auth_file(slot, node)),
                     stdout=log_file,
                     stderr=subprocess.STDOUT,
                 )

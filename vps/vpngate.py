@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import http.client
 import io
 import ipaddress
 import json
@@ -28,6 +29,37 @@ STREAM_URLS = (
 )
 
 
+class _EndpointHTTPSConnection(http.client.HTTPSConnection):
+    """Connect to an endpoint IP while retaining the origin hostname for TLS."""
+
+    def __init__(self, host: str, *args, server_hostname: str | None = None, **kwargs):
+        self._server_hostname = server_hostname or host
+        super().__init__(host, *args, **kwargs)
+
+    def connect(self):
+        super(http.client.HTTPSConnection, self).connect()
+        server_hostname = self._tunnel_host or self._server_hostname
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=server_hostname)
+
+
+class _EndpointHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, server_hostname: str):
+        super().__init__()
+        self.server_hostname = server_hostname
+
+    def https_open(self, request):
+        def connection_class(host, **kwargs):
+            kwargs.pop("check_hostname", None)
+            return _EndpointHTTPSConnection(host, server_hostname=self.server_hostname, **kwargs)
+
+        return self.do_open(
+            connection_class,
+            request,
+            context=self._context,
+            check_hostname=getattr(self, "_check_hostname", None),
+        )
+
+
 def direct_url_opener():
     return urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -43,10 +75,12 @@ def resolve_ipv4_endpoints(hostname: str) -> list[str]:
 
 def open_direct_url(request: urllib.request.Request, timeout: int, server_hostname: str | None = None):
     if server_hostname:
-        context = ssl.create_default_context()
-        https_handler = urllib.request.HTTPSHandler(context=context, check_hostname=True)
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), https_handler)
-        # 通过 IP 连接但保留 SNI for TLS
+        # Connect to the resolved endpoint IP, but keep TLS SNI and certificate
+        # verification bound to the original hostname on Python 3.12+.
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            _EndpointHTTPSHandler(server_hostname),
+        )
         return opener.open(request, timeout=timeout)
     return direct_url_opener().open(request, timeout=timeout)
 
@@ -202,24 +236,29 @@ def fetch_nodes(url: str = API_URL, timeout: int = 20) -> list[dict[str, Any]]:
     if not text:
         return []
     reader = csv.DictReader(io.StringIO("\n".join(_csv_lines(text))))
-    nodes: list[dict[str, Any]] = []
+    nodes_by_ip: dict[str, dict[str, Any]] = {}
     for row in reader:
         try:
             ip = str(ipaddress.IPv4Address(row["IP"].strip()))
             config = base64.b64decode(row["OpenVPN_ConfigData_Base64"], validate=True).decode("utf-8", errors="replace")
-            nodes.append(
-                {
-                    "ip": ip,
-                    "country": row.get("CountryShort", "").upper(),
-                    "ping": int(row.get("Ping") or 9999),
-                    "score": int(row.get("Score") or 0),
-                    "config": sanitize_openvpn_config(config, ip),
-                    "harvested_at": time.time(),
-                }
-            )
+            candidate = {
+                "ip": ip,
+                "country": row.get("CountryShort", "").upper(),
+                "ping": int(row.get("Ping") or 9999),
+                "score": int(row.get("Score") or 0),
+                "config": sanitize_openvpn_config(config, ip),
+                "harvested_at": time.time(),
+                "source": "vpngate",
+                "username": "vpn",
+                "password": "vpn",
+                "provider_id": row.get("HostName", ""),
+            }
+            previous = nodes_by_ip.get(ip)
+            if previous is None or (candidate["ping"], -candidate["score"]) < (previous["ping"], -previous["score"]):
+                nodes_by_ip[ip] = candidate
         except (KeyError, ValueError, TypeError):
             continue
-    return nodes
+    return list(nodes_by_ip.values())
 
 
 class NodePool:

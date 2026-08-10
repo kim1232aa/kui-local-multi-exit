@@ -6,6 +6,7 @@ import hmac
 import ipaddress
 import json
 import mimetypes
+import os
 import re
 import secrets
 import socket
@@ -19,6 +20,7 @@ from typing import Any
 from urllib.parse import quote, urljoin, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from .bridge_nodes import load_bridge_nodes, parse_proxy_url
 from .exit_manager import ExitManager
 from .proxy_server import set_credentials
 from .realm_manager import RealmManager, RealmUnavailable
@@ -135,6 +137,17 @@ COUNTRY_PRESETS = (
     "CZ", "GR", "HU", "RO", "BG", "HR", "SK", "SI", "LT", "LV", "EE", "UA",
     "RS", "BA", "CY", "MT", "IS", "LU",
 )
+COUNTRY_NAMES_ZH = {
+    "AE": "阿联酋", "AT": "奥地利", "AU": "澳大利亚", "BE": "比利时", "BR": "巴西",
+    "CA": "加拿大", "CH": "瑞士", "CZ": "捷克", "DE": "德国", "DK": "丹麦",
+    "ES": "西班牙", "FI": "芬兰", "FR": "法国", "GB": "英国", "GR": "希腊",
+    "HK": "香港", "HR": "克罗地亚", "HU": "匈牙利", "ID": "印度尼西亚",
+    "IE": "爱尔兰", "IN": "印度", "IS": "冰岛", "IT": "意大利", "JP": "日本",
+    "KR": "韩国", "LU": "卢森堡", "MY": "马来西亚", "NL": "荷兰", "NO": "挪威",
+    "NZ": "新西兰", "PH": "菲律宾", "PL": "波兰", "PT": "葡萄牙", "RO": "罗马尼亚",
+    "RU": "俄罗斯", "SE": "瑞典", "SG": "新加坡", "TH": "泰国", "TR": "土耳其",
+    "TW": "台湾", "UA": "乌克兰", "US": "美国", "VN": "越南", "ZA": "南非",
+}
 VPS_FIELDS = {
     "ip", "name", "os", "egress_mode", "proxy_mode", "proxy_categories",
     "egress_revision", "egress_status", "egress_applied_mode",
@@ -163,6 +176,7 @@ class LocalAPIServer(ThreadingHTTPServer):
         web_root: Path | str,
         username: str,
         password: str,
+        reality_nodes_file: Path | str | None = None,
     ):
         if not username or not password:
             raise ValueError("management username and password are required")
@@ -172,8 +186,165 @@ class LocalAPIServer(ThreadingHTTPServer):
         self.web_root = Path(web_root).resolve()
         self.username = username
         self.password = password
+        configured_reality_nodes = reality_nodes_file or os.environ.get("KUI_REALITY_NODES_FILE", "")
+        self.reality_nodes_file = Path(configured_reality_nodes).resolve() if configured_reality_nodes else None
         self._countries_cache: tuple[float, list[str]] | None = None
         super().__init__(address, LocalAPIHandler)
+
+
+# Name of the proxy group used only by the explicitly chained nodes.
+_FRONT_GROUP = "🔗链式前置"
+_DIRECT_GROUP = "直连节点"
+_CHAIN_GROUP = "链式节点"
+_PROXY_GROUP = "PROXY"
+
+
+# Traffic-splitting rules following the user's Clash Verge template
+# (OpenAI/ChatGPT, Claude, Google/Gemini groups, local + CN direct).
+# Group names are resolved at render time in do_GET.
+_CHATGPT_RULES: tuple[str, ...] = (
+    "DOMAIN-SUFFIX,openai.com",
+    "DOMAIN-SUFFIX,chatgpt.com",
+    "DOMAIN-SUFFIX,oaistatic.com",
+    "DOMAIN-SUFFIX,oaiusercontent.com",
+    "DOMAIN-SUFFIX,oaistatsig.com",
+    "DOMAIN-SUFFIX,openaimerge.com",
+    "DOMAIN-SUFFIX,openai.org",
+    "DOMAIN-SUFFIX,sora.com",
+    "DOMAIN-KEYWORD,openai",
+    "DOMAIN-KEYWORD,chatgpt",
+    "DOMAIN-SUFFIX,grok.com",
+    "DOMAIN-SUFFIX,x.ai",
+    "DOMAIN-SUFFIX,api.x.ai",
+    "DOMAIN-KEYWORD,grok",
+    "DOMAIN-SUFFIX,perplexity.ai",
+    "DOMAIN-SUFFIX,poe.com",
+    "DOMAIN-SUFFIX,cursor.sh",
+    "DOMAIN-SUFFIX,v0.dev",
+    "DOMAIN-SUFFIX,openrouter.ai",
+    "DOMAIN-SUFFIX,huggingface.co",
+    "DOMAIN-SUFFIX,hf.space",
+    "DOMAIN-SUFFIX,replicate.com",
+    "DOMAIN-SUFFIX,workers.dev",
+    "DOMAIN-SUFFIX,character.ai",
+    "DOMAIN-SUFFIX,pi.ai",
+    "DOMAIN-SUFFIX,inflection.ai",
+    "DOMAIN-SUFFIX,you.com",
+    "DOMAIN-SUFFIX,copy.ai",
+    "DOMAIN-SUFFIX,jasper.ai",
+    "DOMAIN-SUFFIX,writesonic.com",
+    "DOMAIN-SUFFIX,rytr.me",
+    "DOMAIN-SUFFIX,quillbot.com",
+    "DOMAIN-SUFFIX,grammarly.com",
+    "DOMAIN-SUFFIX,codeium.com",
+    "DOMAIN-SUFFIX,windsurf.com",
+    "DOMAIN-SUFFIX,replit.com",
+    "DOMAIN-SUFFIX,bolt.new",
+    "DOMAIN-SUFFIX,lovable.dev",
+    "DOMAIN-SUFFIX,tempo.new",
+    "DOMAIN-SUFFIX,devin.ai",
+    "DOMAIN-SUFFIX,t3.chat",
+    "DOMAIN-SUFFIX,githubcopilot.com",
+    "DOMAIN-SUFFIX,copilot.microsoft.com",
+    "DOMAIN-SUFFIX,copilot.cloud.microsoft",
+    "DOMAIN-SUFFIX,midjourney.com",
+    "DOMAIN-SUFFIX,stability.ai",
+    "DOMAIN-SUFFIX,dreamstudio.ai",
+    "DOMAIN-SUFFIX,leonardo.ai",
+    "DOMAIN-SUFFIX,d-id.com",
+    "DOMAIN-SUFFIX,heygen.com",
+    "DOMAIN-SUFFIX,runwayml.com",
+    "DOMAIN-SUFFIX,pika.art",
+    "DOMAIN-SUFFIX,pikalabs.net",
+    "DOMAIN-SUFFIX,lumalabs.ai",
+    "DOMAIN-SUFFIX,suno.ai",
+    "DOMAIN-SUFFIX,suno.com",
+    "DOMAIN-SUFFIX,udio.com",
+    "DOMAIN-SUFFIX,elevenlabs.io",
+    "DOMAIN-SUFFIX,elevenlabs.com",
+    "DOMAIN-SUFFIX,play.ht",
+    "DOMAIN-SUFFIX,descript.com",
+    "DOMAIN-SUFFIX,kaiber.ai",
+    "DOMAIN-SUFFIX,krea.ai",
+    "DOMAIN-SUFFIX,clipdrop.co",
+    "DOMAIN-SUFFIX,ideogram.ai",
+    "DOMAIN-SUFFIX,flux.ai",
+    "DOMAIN-SUFFIX,together.xyz",
+    "DOMAIN-SUFFIX,mistral.ai",
+    "DOMAIN-SUFFIX,cohere.com",
+    "DOMAIN-SUFFIX,ai21.com",
+    "DOMAIN-SUFFIX,groq.com",
+    "DOMAIN-SUFFIX,fireworks.ai",
+    "DOMAIN-SUFFIX,deepinfra.com",
+    "DOMAIN-SUFFIX,baseten.co",
+    "DOMAIN-SUFFIX,predibase.com",
+    "DOMAIN-SUFFIX,anyscale.com",
+    "DOMAIN-SUFFIX,lambdalabs.com",
+    "DOMAIN-SUFFIX,runpod.io",
+    "DOMAIN-SUFFIX,vast.ai",
+    "DOMAIN-SUFFIX,salad.com",
+    "DOMAIN-SUFFIX,coreweave.com",
+    "DOMAIN-SUFFIX,phind.com",
+    "DOMAIN-SUFFIX,exa.ai",
+    "DOMAIN-SUFFIX,kagi.com",
+    "DOMAIN-SUFFIX,andisearch.com",
+    "DOMAIN-SUFFIX,elicit.org",
+    "DOMAIN-SUFFIX,consensus.app",
+    "DOMAIN-SUFFIX,notion.so",
+    "DOMAIN-SUFFIX,mem.ai",
+    "DOMAIN-SUFFIX,otter.ai",
+    "DOMAIN-SUFFIX,fireflies.ai",
+    "DOMAIN-SUFFIX,reflect.app",
+    "DOMAIN-SUFFIX,readwise.io",
+    "DOMAIN-SUFFIX,ai.cloudflare.com",
+    "DOMAIN-SUFFIX,workers.ai",
+    "DOMAIN-SUFFIX,gateway.ai.cloudflare.com",
+    "DOMAIN-SUFFIX,pollen-optimization.googleapis.com",
+    "DOMAIN-SUFFIX,meta.ai",
+    "DOMAIN-SUFFIX,machinelearning.apple.com",
+    "DOMAIN-SUFFIX,pinecone.io",
+    "DOMAIN-SUFFIX,weaviate.io",
+    "DOMAIN-SUFFIX,qdrant.tech",
+    "DOMAIN-SUFFIX,chroma.db",
+)
+
+_CLAUDE_RULES: tuple[str, ...] = (
+    "DOMAIN-SUFFIX,anthropic.com",
+    "DOMAIN-SUFFIX,claude.ai",
+    "DOMAIN-SUFFIX,claude.com",
+    "DOMAIN-SUFFIX,clau.de",
+    "DOMAIN-SUFFIX,claudemcpclient.com",
+    "DOMAIN-SUFFIX,claudeusercontent.com",
+    "DOMAIN-SUFFIX,modelcontextprotocol.io",
+    "DOMAIN,anthropic.com.cdn.cloudflare.net",
+    "DOMAIN,servd-anthropic-website.b-cdn.net",
+    "DOMAIN,anthropic.auth0.com",
+    "DOMAIN-KEYWORD,claude",
+    "DOMAIN-KEYWORD,anthropic",
+)
+
+_GEMINI_RULES: tuple[str, ...] = (
+    "DOMAIN-SUFFIX,aistudio.google.com",
+    "DOMAIN-SUFFIX,makersuite.google.com",
+    "DOMAIN-SUFFIX,generativelanguage.googleapis.com",
+    "DOMAIN-SUFFIX,cloudcode-pa.googleapis.com",
+    "DOMAIN-SUFFIX,ai.google.dev",
+    "DOMAIN-SUFFIX,antigravity.google",
+    "DOMAIN-SUFFIX,gemini.google.com",
+    "DOMAIN-SUFFIX,vertexai.googleapis.com",
+    "DOMAIN-SUFFIX,aiplatform.googleapis.com",
+    "DOMAIN-SUFFIX,googleapis.com",
+)
+
+_LOCAL_DIRECT_RULES: tuple[str, ...] = (
+    "DOMAIN-SUFFIX,local,DIRECT",
+    "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve",
+    "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
+    "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
+    "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
+    "IP-CIDR,100.64.0.0/10,DIRECT,no-resolve",
+    "IP-CIDR,198.18.0.0/15,DIRECT,no-resolve",
+)
 
 
 class LocalAPIHandler(BaseHTTPRequestHandler):
@@ -215,7 +386,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
 
     def _slot_match(self, suffix: str = ""):
         path = self.path.split("?", 1)[0]
-        return re.fullmatch(rf"/api/local/exits/(exit-(?:0[1-9]|1[0-2])){suffix}", path)
+        return re.fullmatch(rf"/api/local/exits/(exit-\d+){suffix}", path)
 
     def _query_param(self, name: str) -> str | None:
         from urllib.parse import parse_qs, urlparse
@@ -390,23 +561,34 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         return ""
 
     @staticmethod
+    def _ws_path(node: dict[str, Any]) -> str:
+        ws_opts = node.get("ws-opts") if isinstance(node.get("ws-opts"), dict) else {}
+        return str(ws_opts.get("path") or node.get("path") or "/")
+
+    @staticmethod
+    def _ws_host(node: dict[str, Any]) -> str:
+        ws_opts = node.get("ws-opts") if isinstance(node.get("ws-opts"), dict) else {}
+        headers = ws_opts.get("headers") if isinstance(ws_opts.get("headers"), dict) else {}
+        return str(headers.get("Host") or node.get("host") or node.get("sni") or node["address"])
+
+    @staticmethod
     def _clash_proxy(node: dict[str, Any]) -> tuple[str, str] | None:
         name = str(node.get("name") or f"TP_{node['protocol']}_{node['port']}")
         quoted_name = json.dumps(name, ensure_ascii=False)
         address = json.dumps(str(node["address"]), ensure_ascii=False)
-        protocol = str(node["protocol"])
+        protocol = str(node["protocol"]).upper()
         lines = [
             f"  - name: {quoted_name}",
             f"    type: {protocol.lower()}",
             f"    server: {address}",
             f"    port: {int(node['port'])}",
         ]
-        if protocol in {"VLESS", "Reality"}:
+        if protocol in {"VLESS", "REALITY"}:
             lines[1] = "    type: vless"
             lines.extend((f"    uuid: {json.dumps(str(node.get('uuid', '')))}", "    udp: true"))
             network = str(node.get("network") or "tcp")
             lines.append(f"    network: {json.dumps(network)}")
-            if protocol == "Reality":
+            if protocol == "REALITY":
                 lines.extend((
                     "    tls: true",
                     f"    servername: {json.dumps(str(node.get('sni', '')))}",
@@ -417,22 +599,29 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 ))
                 if node.get("flow"):
                     lines.append(f"    flow: {json.dumps(str(node['flow']))}")
+            elif node.get("tls"):
+                lines.extend((
+                    "    tls: true",
+                    f"    servername: {json.dumps(str(node.get('servername') or node.get('sni', '')))}",
+                ))
+                fp = str(node.get("client-fingerprint", "chrome"))
+                lines.append(f"    client-fingerprint: {json.dumps(fp)}")
             if network == "ws":
                 lines.extend((
                     "    ws-opts:",
-                    f"      path: {json.dumps(str(node.get('path') or '/'))}",
+                    f"      path: {json.dumps(LocalAPIHandler._ws_path(node))}",
                     "      headers:",
-                    f"        Host: {json.dumps(str(node.get('host') or node.get('sni') or node['address']))}",
+                    f"        Host: {json.dumps(LocalAPIHandler._ws_host(node))}",
                 ))
             elif network == "grpc":
                 lines.extend(("    grpc-opts:", f"      grpc-service-name: {json.dumps(str(node.get('path', '')).lstrip('/'))}"))
-        elif protocol == "Trojan":
+        elif protocol == "TROJAN":
             lines.extend((
                 f"    password: {json.dumps(str(node.get('password', '')))}",
                 f"    sni: {json.dumps(str(node.get('sni', '')))}",
                 "    udp: true",
             ))
-        elif protocol == "Hysteria2":
+        elif protocol == "HYSTERIA2":
             lines[1] = "    type: hysteria2"
             lines.extend((
                 f"    password: {json.dumps(str(node.get('password') or node.get('uuid', '')))}",
@@ -450,11 +639,11 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         elif protocol == "SS":
             lines[1] = "    type: ss"
             lines.extend((
-                f"    cipher: {json.dumps(str(node.get('uuid', '')))}",
+                f"    cipher: {json.dumps(str(node.get('cipher') or node.get('uuid', '')))}",
                 f"    password: {json.dumps(str(node.get('password', '')))}",
                 "    udp: true",
             ))
-        elif protocol == "VMess":
+        elif protocol == "VMESS":
             lines[1] = "    type: vmess"
             lines.extend((
                 f"    uuid: {json.dumps(str(node.get('uuid', '')))}",
@@ -466,15 +655,191 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             if str(node.get("network") or "") == "ws":
                 lines.extend((
                     "    ws-opts:",
-                    f"      path: {json.dumps(str(node.get('path') or '/'))}",
+                    f"      path: {json.dumps(LocalAPIHandler._ws_path(node))}",
                     "      headers:",
-                    f"        Host: {json.dumps(str(node.get('host') or node.get('sni') or node['address']))}",
+                    f"        Host: {json.dumps(LocalAPIHandler._ws_host(node))}",
                 ))
         else:
             return None
+        if node.get("dialer-proxy"):
+            lines.append(f"    dialer-proxy: {json.dumps(str(node['dialer-proxy']), ensure_ascii=False)}")
         return name, "\n".join(lines)
 
+    def _local_reality_nodes(self) -> dict[str, dict[str, Any]]:
+        path = self.server.reality_nodes_file
+        if not path:
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return {}
+        raw_nodes = payload.get("nodes", []) if isinstance(payload, dict) else []
+        if not isinstance(raw_nodes, list):
+            return {}
+        nodes: dict[str, dict[str, Any]] = {}
+        for raw in raw_nodes:
+            if not isinstance(raw, dict):
+                continue
+            slot_id = str(raw.get("slot_id", ""))
+            address = str(raw.get("address", ""))
+            uuid = str(raw.get("uuid", ""))
+            public_key = str(raw.get("public_key", ""))
+            short_id = str(raw.get("short_id", ""))
+            sni = str(raw.get("sni", ""))
+            try:
+                port = int(raw.get("port", 0))
+            except (TypeError, ValueError):
+                continue
+            if not (
+                re.fullmatch(r"exit-(?:0[1-9]|1[0-9]|2[0-4])", slot_id)
+                or re.fullmatch(r"tr-\d+", slot_id)
+            ):
+                continue
+            if not address or len(address) > 253 or not 1 <= port <= 65535:
+                continue
+            if not re.fullmatch(r"[0-9a-fA-F-]{36}", uuid):
+                continue
+            if not re.fullmatch(r"[A-Za-z0-9_-]{32,64}", public_key):
+                continue
+            if not re.fullmatch(r"[0-9a-fA-F]{2,32}", short_id):
+                continue
+            if not re.fullmatch(r"[A-Za-z0-9.-]{1,253}", sni):
+                continue
+            nodes[slot_id] = {
+                "protocol": "Reality",
+                "address": address,
+                "port": port,
+                "uuid": uuid,
+                "sni": sni,
+                "public_key": public_key,
+                "short_id": short_id,
+                "flow": "xtls-rprx-vision",
+                "network": "tcp",
+            }
+        return nodes
+
+    @staticmethod
+    def _useful_label(value: Any) -> str:
+        text = re.sub(r"\s+", " ", str(value or "")).strip(" .|_-")
+        if text.lower() in {"", "unknown", "none", "n/a", "na", "null", "-", "未知"}:
+            return ""
+        return text[:48]
+
+    @classmethod
+    def _short_isp_name(cls, value: Any) -> str:
+        name = cls._useful_label(value)
+        aliases = (
+            ("KDDI", "KDDI"),
+            ("SoftBank", "SoftBank"),
+            ("ARTERIA", "ARTERIA"),
+            ("TOKAI", "TOKAI"),
+            ("EHIME CATV", "EHIME CATV"),
+            ("Triple T", "Triple T"),
+            ("NTT DOCOMO", "NTT DOCOMO"),
+            ("Korea Telecom", "KT"),
+        )
+        for marker, alias in aliases:
+            if marker.lower() in name.lower():
+                return alias
+        name = re.sub(
+            r"(?i)\b(?:public company limited|communications corporation|corporation|corp\.?|company|co\.?,?\s*ltd\.?|inc\.?)\b",
+            "",
+            name,
+        )
+        return re.sub(r"\s+", " ", name).strip(" ,.-")[:32]
+
+    @classmethod
+    def _slot_geo(cls, slot: dict[str, Any]) -> dict[str, Any]:
+        check_result = slot.get("check_result") if isinstance(slot.get("check_result"), dict) else {}
+        residential = check_result.get("residential") if isinstance(check_result.get("residential"), dict) else {}
+        raw = residential.get("raw") if isinstance(residential.get("raw"), dict) else {}
+        return raw.get("geo") if isinstance(raw.get("geo"), dict) else {}
+
+    @classmethod
+    def _slot_isp(cls, slot: dict[str, Any]) -> dict[str, Any]:
+        check_result = slot.get("check_result") if isinstance(slot.get("check_result"), dict) else {}
+        residential = check_result.get("residential") if isinstance(check_result.get("residential"), dict) else {}
+        raw = residential.get("raw") if isinstance(residential.get("raw"), dict) else {}
+        return raw.get("isp") if isinstance(raw.get("isp"), dict) else {}
+
+    @classmethod
+    def _slot_country_code(cls, slot: dict[str, Any]) -> str:
+        current_node = slot.get("current_node") if isinstance(slot.get("current_node"), dict) else {}
+        geo_code = cls._useful_label(cls._slot_geo(slot).get("country_code")).upper()
+        node_code = cls._useful_label(current_node.get("country")).upper()
+        target_code = cls._useful_label(slot.get("country")).upper()
+        return next(
+            (code for code in (geo_code, node_code, target_code) if re.fullmatch(r"[A-Z]{2}", code) and code != "XX"),
+            "XX",
+        )
+
+    @classmethod
+    def _friendly_slot_name(cls, slot: dict[str, Any]) -> str:
+        geo = cls._slot_geo(slot)
+        isp = cls._slot_isp(slot)
+        country_code = cls._slot_country_code(slot)
+        country_name = COUNTRY_NAMES_ZH.get(country_code) or cls._useful_label(geo.get("country"))
+        location = f"{country_code}-{country_name}" if country_name else country_code
+        city = cls._useful_label(geo.get("city"))
+        if city and city.lower() not in {country_name.lower(), location.lower()}:
+            location = f"{location}-{city}"
+
+        parts = [location]
+        provider = cls._short_isp_name(isp.get("org"))
+        if provider:
+            parts.append(provider)
+        egress_ip = cls._useful_label(slot.get("egress_ip") or slot.get("entry_ip"))
+        if egress_ip:
+            parts.append(egress_ip)
+        parts.append(str(slot["id"]))
+        return " | ".join(parts)
+
+    def _bridge_nodes(self) -> list[dict[str, Any]]:
+        """Load bridge proxy nodes from environment.
+
+        A background thread (started by entrypoint.py) refreshes subscription
+        nodes periodically. The API shares the same module-level cache, so
+        subscription requests are fast and do not block on network tests.
+        """
+        manual = [u.strip() for u in (os.environ.get("KUI_BRIDGE_NODES", "") or "").split(",") if u.strip()]
+        subs = [u.strip() for u in (os.environ.get("KUI_BRIDGE_SUB_URLS", "") or "").split(",") if u.strip()]
+        return load_bridge_nodes(
+            manual_urls=manual,
+            subscription_urls=subs,
+            test_reachability=bool(subs),
+        )
+
+    def _local_subscription_nodes(self, *, include_dialer_proxy: bool = False) -> list[dict[str, Any]]:
+        reality_nodes = self._local_reality_nodes()
+        publishable = {slot["id"]: slot for slot in self._publishable_slots()}
+        nodes = []
+        for slot_id, node in reality_nodes.items():
+            if slot_id in publishable:
+                # The 24 OpenVPN slots are direct exits and never use a
+                # client-side dialer proxy.
+                nodes.append({
+                    **node,
+                    "name": self._friendly_slot_name(publishable[slot_id]),
+                    "_subscription_group": "direct",
+                })
+            elif slot_id.startswith("tr-"):
+                # tr-01 already exits through the Turkish upstream proxy on
+                # the VPS, so it is the single chained exit.
+                base_name = str(node.get("name") or f"TR-土耳其 | ProxyScrape | {slot_id}")
+                chained = {
+                    **node,
+                    "name": f"{base_name} | 链式",
+                    "_subscription_group": "chain",
+                }
+                if include_dialer_proxy:
+                    chained["dialer-proxy"] = _FRONT_GROUP
+                nodes.append(chained)
+        return nodes
+
     def _local_subscription_links(self) -> list[str]:
+        reality_nodes = self._local_reality_nodes()
+        if self.server.reality_nodes_file:
+            return [self._subscription_link(node) for node in self._local_subscription_nodes()]
         host = self._request_proxy_host()
         username = quote(self.server.username, safe="")
         password = quote(self.server.password, safe="")
@@ -484,9 +849,55 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             links.append(f"socks5://{username}:{password}@{host}:{slot['proxy_port']}#{name}")
         return links
 
-    def _local_clash_proxies(self) -> list[tuple[str, str]]:
+    def _local_clash_proxies(self) -> dict[str, list[tuple[str, str]] | list[str]]:
+        reality_nodes = self._local_reality_nodes()
+        bridges: list[tuple[str, str]] = []
+        direct: list[tuple[str, str]] = []
+        chain: list[tuple[str, str]] = []
+        front: list[str] = []
+        if self.server.reality_nodes_file:
+            all_bridge_nodes = self._bridge_nodes()
+            # Only explicitly configured bridge URLs are first-hop candidates.
+            # Subscription-fed nodes are final exits and are handled below.
+            for bridge in all_bridge_nodes:
+                if bridge.get("_source_kind", "manual") != "manual":
+                    continue
+                entry = self._clash_proxy(bridge)
+                if entry:
+                    bridges.append(entry)
+            local_nodes = self._local_subscription_nodes(include_dialer_proxy=False)
+            for node in local_nodes:
+                entry = self._clash_proxy(node)
+                if not entry:
+                    continue
+                if node.get("_subscription_group") == "chain":
+                    node = {**node, "dialer-proxy": _FRONT_GROUP}
+                    entry = self._clash_proxy(node)
+                    chain.append(entry)
+                else:
+                    direct.append(entry)
+                    front.append(entry[0])
+            # Public subscription nodes are additional final exits. They use
+            # the selected first-hop node from the front group.
+            for node in all_bridge_nodes:
+                if node.get("_source_kind") != "subscription":
+                    continue
+                node = {
+                    **node,
+                    "name": (
+                        f"自动链式 | {node.get('_country_hint')} | {node.get('name', '订阅节点')}"
+                        if node.get("_country_hint") in {"TR", "VN", "TH", "PH"}
+                        else f"自动链式 | {node.get('name', '订阅节点')}"
+                    ),
+                    "dialer-proxy": _FRONT_GROUP,
+                    "_subscription_group": "chain",
+                }
+                if entry := self._clash_proxy(node):
+                    chain.append(entry)
+            front.extend(name for name, _ in bridges)
+            return {"bridges": bridges, "direct": direct, "chain": chain, "front": front}
+
         host = self._request_proxy_host()
-        proxies = []
         for slot in self._publishable_slots():
             name = f"{slot['country']}_{slot['id']}_{slot['state']}"
             proxy = "\n".join((
@@ -498,8 +909,8 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 f"    password: {json.dumps(self.server.password)}",
                 "    udp: true",
             ))
-            proxies.append((name, proxy))
-        return proxies
+            direct.append((name, proxy))
+        return {"bridges": bridges, "direct": direct, "chain": chain, "front": front}
 
     def _ensure_admin_subscription_token(self) -> str:
         admin_user = self.server.store.get_user(self.server.username)
@@ -658,19 +1069,96 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             thirdparty_nodes = self.server.store.list_enabled_thirdparty_nodes()
             links.extend(link for node in thirdparty_nodes if (link := self._subscription_link(node)))
             if self._query_param("format") == "clash":
-                proxy_entries = self._local_clash_proxies()
+                groups = self._local_clash_proxies()
+                thirdparty_entries: list[tuple[str, str]] = []
                 for node in thirdparty_nodes:
                     if entry := self._clash_proxy(node):
-                        proxy_entries.append(entry)
-                proxy_lines = [entry for _, entry in proxy_entries]
-                names = [name for name, _ in proxy_entries]
-                names_yaml = "\n".join(f"      - {json.dumps(name, ensure_ascii=False)}" for name in names) or "      - DIRECT"
+                        thirdparty_entries.append(entry)
+                        groups["direct"].append(entry)
+
+                all_entries = groups["bridges"] + groups["direct"] + groups["chain"]
+                proxy_lines = [entry for _, entry in all_entries]
+
+                def _list_yaml(items: list[str]) -> str:
+                    return "\n".join(f"      - {json.dumps(n, ensure_ascii=False)}" for n in items)
+
+                direct_names = [name for name, _ in groups["direct"]]
+                chain_names = [name for name, _ in groups["chain"]]
+                front_names = list(groups.get("front", []))
+                direct_yaml = _list_yaml(direct_names) if direct_names else "      - DIRECT"
+                chain_yaml = _list_yaml(chain_names) if chain_names else "      - DIRECT"
+                front_yaml = _list_yaml(front_names) if front_names else "      - DIRECT"
+                # The site groups expose PROXY plus the leaf nodes for manual
+                # selection, while PROXY itself stays as the two-level entry.
+                site_items = [_PROXY_GROUP, "⚡ 自动选择"] + direct_names + chain_names + ["DIRECT"]
+                site_yaml = _list_yaml(site_items)
+                group_lines = [
+                    "  - name: " + _PROXY_GROUP,
+                    "    type: select",
+                    "    proxies:",
+                    "      - " + json.dumps(_DIRECT_GROUP, ensure_ascii=False),
+                    "      - " + json.dumps(_CHAIN_GROUP, ensure_ascii=False),
+                    "  - name: " + _DIRECT_GROUP,
+                    "    type: select",
+                    "    proxies:",
+                    direct_yaml,
+                    "  - name: " + _CHAIN_GROUP,
+                    "    type: select",
+                    "    proxies:",
+                    chain_yaml,
+                    f"  - name: {_FRONT_GROUP}",
+                    "    type: select",
+                    "    proxies:",
+                    front_yaml,
+                    "  - name: ⚡ 自动选择",
+                    "    type: url-test",
+                    "    hidden: true",
+                    "    url: https://www.gstatic.com/generate_204",
+                    "    interval: 300",
+                    "    tolerance: 50",
+                    "    lazy: true",
+                    "    proxies:",
+                    direct_yaml,
+                    "  - name: 🔵 Google / Gemini",
+                    "    type: select",
+                    "    proxies:",
+                    site_yaml,
+                    "  - name: 🤖 ChatGPT",
+                    "    type: select",
+                    "    proxies:",
+                    site_yaml,
+                    "  - name: 🧠 Claude",
+                    "    type: select",
+                    "    proxies:",
+                    site_yaml,
+                    "  - name: 🌐 其他流量",
+                    "    type: select",
+                    "    proxies:",
+                    site_yaml,
+                    "  - name: 🇨🇳 中国流量",
+                    "    type: select",
+                    "    proxies:",
+                    "      - DIRECT",
+                    "      - 🌐 其他流量",
+                ]
+                rule_lines = ["  - DOMAIN-SUFFIX,alibb123.ccwu.cc,DIRECT"]
+                rule_lines.extend(f"  - {rule},🤖 ChatGPT" for rule in _CHATGPT_RULES)
+                rule_lines.extend(f"  - {rule},🧠 Claude" for rule in _CLAUDE_RULES)
+                rule_lines.extend(f"  - {rule},🔵 Google / Gemini" for rule in _GEMINI_RULES)
+                rule_lines.extend(f"  - {rule}" for rule in _LOCAL_DIRECT_RULES)
+                rule_lines.extend((
+                    "  - GEOSITE,CN,🇨🇳 中国流量",
+                    "  - GEOIP,CN,🇨🇳 中国流量,no-resolve",
+                    "  - MATCH,🌐 其他流量",
+                ))
                 body = (
                     "port: 7890\nsocks-port: 7891\nallow-lan: true\nmode: rule\nproxies:\n"
                     + "\n".join(proxy_lines)
-                    + "\nproxy-groups:\n  - name: PROXY\n    type: select\n    proxies:\n"
-                    + names_yaml
-                    + "\nrules:\n  - MATCH,PROXY\n"
+                    + "\nproxy-groups:\n"
+                    + "\n".join(group_lines)
+                    + "\nrules:\n"
+                    + "\n".join(rule_lines)
+                    + "\n"
                 )
                 self._send_text(HTTPStatus.OK, body)
                 return

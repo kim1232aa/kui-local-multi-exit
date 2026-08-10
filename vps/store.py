@@ -12,7 +12,14 @@ from typing import Any
 from .models import ExitSlotSnapshot
 
 
-DEFAULT_COUNTRIES = ("JP", "JP", "US", "US", "GB", "GB", "DE", "DE", "KR", "KR", "SG", "SG")
+DEFAULT_COUNTRIES = (
+    "JP", "JP", "JP", "JP",
+    "KR", "KR", "KR", "KR",
+    "US", "US", "CA", "CA",
+    "GB", "GB", "DE", "DE",
+    "FR", "FR", "RU", "RU",
+    "TH", "TH", "ANY", "ANY",
+)
 VALID_STATES = {"idle", "starting", "connecting", "ready", "degraded", "failed", "disabled"}
 
 
@@ -167,7 +174,13 @@ class LocalStore:
                     config TEXT NOT NULL,
                     harvested_at REAL NOT NULL,
                     penalty INTEGER NOT NULL DEFAULT 0,
-                    updated_at INTEGER NOT NULL
+                    updated_at INTEGER NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'vpngate',
+                    username TEXT NOT NULL DEFAULT '',
+                    password TEXT NOT NULL DEFAULT '',
+                    provider_id TEXT NOT NULL DEFAULT '',
+                    first_seen_at INTEGER NOT NULL DEFAULT 0,
+                    last_seen_at INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS check_results (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -213,6 +226,14 @@ class LocalStore:
                     "target_ip": "TEXT NOT NULL DEFAULT ''",
                     "target_port": "INTEGER NOT NULL DEFAULT 0",
                     "target_id": "INTEGER NOT NULL DEFAULT 0",
+                },
+                "vpn_nodes": {
+                    "source": "TEXT NOT NULL DEFAULT 'vpngate'",
+                    "username": "TEXT NOT NULL DEFAULT ''",
+                    "password": "TEXT NOT NULL DEFAULT ''",
+                    "provider_id": "TEXT NOT NULL DEFAULT ''",
+                    "first_seen_at": "INTEGER NOT NULL DEFAULT 0",
+                    "last_seen_at": "INTEGER NOT NULL DEFAULT 0",
                 },
             }
             for table, definitions in migrations.items():
@@ -278,8 +299,8 @@ class LocalStore:
         next_port = current.proxy_port if proxy_port is None else int(proxy_port)
         if not re.fullmatch(r"[A-Z]{2}|ANY", next_country):
             raise ValueError("country must be a two-letter code or ANY")
-        if not 7920 <= next_port <= 7931:
-            raise ValueError("proxy port must be between 7920 through 7931")
+        if not 7920 <= next_port <= 7943:
+            raise ValueError("proxy port must be between 7920 through 7943")
         with self._lock, self._connect() as db:
             row = db.execute(
                 "SELECT id FROM exit_slots WHERE proxy_port = ? AND id <> ?",
@@ -405,16 +426,30 @@ class LocalStore:
             row = db.execute("SELECT * FROM exit_slots WHERE id = ?", (slot_id,)).fetchone()
         return self._row_to_slot(row)
 
-    def replace_vpn_nodes(self, nodes: list[dict[str, Any]]) -> None:
+    def replace_vpn_nodes(self, nodes: list[dict[str, Any]], *, retention_days: int = 30) -> None:
+        """Merge the latest provider snapshot into a rolling OpenVPN history pool."""
         now = int(time.time())
+        cutoff = now - max(1, int(retention_days)) * 86400
         with self._lock, self._connect() as db:
-            db.execute("DELETE FROM vpn_nodes")
             for node in nodes:
                 db.execute(
                     """
                     INSERT INTO vpn_nodes
-                    (ip, country, ping, score, config, harvested_at, penalty, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (ip, country, ping, score, config, harvested_at, penalty, updated_at,
+                     source, username, password, provider_id, first_seen_at, last_seen_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(ip) DO UPDATE SET
+                        country = excluded.country,
+                        ping = excluded.ping,
+                        score = excluded.score,
+                        config = excluded.config,
+                        harvested_at = excluded.harvested_at,
+                        updated_at = excluded.updated_at,
+                        source = excluded.source,
+                        username = excluded.username,
+                        password = excluded.password,
+                        provider_id = excluded.provider_id,
+                        last_seen_at = excluded.last_seen_at
                     """,
                     (
                         node["ip"],
@@ -425,13 +460,21 @@ class LocalStore:
                         float(node["harvested_at"]),
                         int(node.get("penalty", 0)),
                         now,
+                        str(node.get("source", "vpngate")),
+                        str(node.get("username", "")),
+                        str(node.get("password", "")),
+                        str(node.get("provider_id", "")),
+                        now,
+                        now,
                     ),
                 )
+            db.execute("DELETE FROM vpn_nodes WHERE last_seen_at > 0 AND last_seen_at < ?", (cutoff,))
 
     def load_vpn_nodes(self) -> list[dict[str, Any]]:
         with self._lock, self._connect() as db:
             rows = db.execute(
-                "SELECT ip, country, ping, score, config, harvested_at FROM vpn_nodes ORDER BY ip"
+                "SELECT ip, country, ping, score, config, harvested_at, source, username, password, provider_id "
+                "FROM vpn_nodes ORDER BY last_seen_at DESC, ip"
             ).fetchall()
         return [dict(row) for row in rows]
 

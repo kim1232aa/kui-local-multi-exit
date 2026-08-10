@@ -8,6 +8,7 @@ from .models import ExitSlotSnapshot
 
 class RouteManager:
     _MISSING_MESSAGES = ("No such file", "Cannot find device", "FIB table does not exist")
+    _FAIL_CLOSED_PREF_BASE = 1000
 
     def __init__(self, run: Callable[..., object] = subprocess.run):
         self._run = run
@@ -19,10 +20,21 @@ class RouteManager:
             return
         raise RuntimeError(f"{' '.join(command)}: {detail}")
 
+    @classmethod
+    def _fail_closed_preference(cls, slot: ExitSlotSnapshot) -> int:
+        return cls._FAIL_CLOSED_PREF_BASE + slot.route_table
+
     def cleanup(self, slot: ExitSlotSnapshot) -> None:
         preference = slot.route_table
         self._execute(
             ["ip", "rule", "del", "fwmark", str(slot.mark), "lookup", str(slot.route_table), "pref", str(preference)],
+            allow_missing=True,
+        )
+        self._execute(
+            [
+                "ip", "rule", "del", "fwmark", str(slot.mark), "unreachable",
+                "pref", str(self._fail_closed_preference(slot)),
+            ],
             allow_missing=True,
         )
         self._execute(["ip", "route", "flush", "table", str(slot.route_table)], allow_missing=True)
@@ -64,6 +76,20 @@ class RouteManager:
                     table,
                     "pref",
                     str(slot.route_table),
+                ]
+            )
+            # If the per-slot table stops matching, reject marked traffic instead
+            # of letting it fall through to the container's main/VPS route.
+            self._execute(
+                [
+                    "ip",
+                    "rule",
+                    "add",
+                    "fwmark",
+                    str(slot.mark),
+                    "unreachable",
+                    "pref",
+                    str(self._fail_closed_preference(slot)),
                 ]
             )
         except Exception:

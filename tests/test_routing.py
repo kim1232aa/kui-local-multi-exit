@@ -57,6 +57,8 @@ class RouteManagerTest(unittest.TestCase):
         self.assertTrue(any("table 211" in command and "dev tun11" in command for command in commands))
         self.assertTrue(any("198.51.100.1/32 via 172.18.0.1 dev eth0" in command for command in commands))
         self.assertTrue(any("198.51.100.12/32 via 172.18.0.1 dev eth0" in command for command in commands))
+        self.assertTrue(any("fwmark 200 unreachable pref 1200" in command for command in commands))
+        self.assertTrue(any("fwmark 211 unreachable pref 1211" in command for command in commands))
 
     def test_cleanup_is_idempotent_and_slot_scoped(self):
         self.routing.cleanup(self.first)
@@ -64,6 +66,7 @@ class RouteManagerTest(unittest.TestCase):
 
         commands = [" ".join(command) for command in self.recorder.commands]
         self.assertEqual(2, sum("route flush table 200" in command for command in commands))
+        self.assertEqual(2, sum("fwmark 200 unreachable pref 1200" in command for command in commands))
         self.assertFalse(any("table 201" in command for command in commands))
 
     def test_install_raises_when_required_route_command_fails(self):
@@ -96,6 +99,17 @@ class RouteManagerTest(unittest.TestCase):
 
         commands = [" ".join(command) for command in recorder.commands]
         self.assertEqual(2, sum("route flush table 200" in command for command in commands))
+
+    def test_install_cleans_lookup_rule_if_fail_closed_rule_fails(self):
+        recorder = SelectiveFailureRecorder("rule add fwmark 200 unreachable pref 1200")
+        routing = RouteManager(run=recorder)
+
+        with self.assertRaises(RuntimeError):
+            routing.install(self.first, "198.51.100.1", "172.18.0.1", "eth0")
+
+        commands = [" ".join(command) for command in recorder.commands]
+        self.assertGreaterEqual(sum("rule del fwmark 200 lookup 200 pref 200" in command for command in commands), 1)
+        self.assertGreaterEqual(sum("route flush table 200" in command for command in commands), 2)
 
     def test_is_installed_requires_default_route_on_slot_tunnel(self):
         class RouteStateRecorder(CommandRecorder):

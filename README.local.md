@@ -1,16 +1,16 @@
 # K-UI Local Multi-Exit
 
-这是从 K-UI 原有 VPNGate/OpenVPN/住宅检测逻辑派生的单 VPS 本地版。它不使用 Cloudflare Pages、Workers、D1 或 Realtime 控制中心，单个 Docker 容器内运行本地面板、SQLite、VPNGate 调度器和多个 OpenVPN 出口。
+这是从 K-UI 原有 VPNGate/OpenVPN/住宅检测逻辑派生的单 VPS 本地版。它不使用 Cloudflare Pages、Workers、D1 或 Realtime 控制中心，单个 Docker 容器内运行本地面板、SQLite、多源 OpenVPN 调度器和多个出口。
 
 ## 当前能力
 
 - 固定 12 个出口槽位，默认 `JP/US/GB/DE/KR/SG` 每国两个。
 - 每个槽位可独立修改国家和端口。
-- 每个槽位一条 OpenVPN 隧道、一个 TUN 设备、一个 SOCKS5/HTTP 端口。
+- 每个槽位一条 OpenVPN 隧道、一个 TUN 设备、一个 SOCKS5/HTTP 端口，并在同端口支持 SOCKS5 UDP ASSOCIATE。
 - 端口 `7920` 至 `7931` 对应 `exit-01` 至 `exit-12`。
 - 单槽位换 IP、停用、启用和独立失败状态。
-- 连续三次拨号/健康失败后自动停用该槽位。
-- 沿用原项目的 VPNGate 节点、出口 IP、TestISP 和流媒体检查逻辑。
+- 连续三次拨号/健康失败后暂时停用；节点刷新时仅在存在对应国家候选后自动恢复。
+- 节点源包括 VPNGate、VPNBook、30 天历史池和 `providers/` 手工 `.ovpn`；沿用出口 IP、TestISP 和流媒体检查逻辑。
 - 管理面板和本地管理 API 免登录；12 个 SOCKS5 出口仍使用同一组代理账号密码。
 
 ## 启动
@@ -81,4 +81,78 @@ curl --socks5-hostname admin:"$KUI_MANAGEMENT_PASSWORD"@127.0.0.1:7921 https://a
 
 VPNGate 是出口来源；TestISP 等服务只是对当前出口 IP 做 ISP/住宅属性检测。检测结果未知不能显示为住宅成功，VPNGate 节点也不能仅因为标签或可连通就被保证为真实住宅线路。
 
-本地容器已包含 12 槽调度、订阅输出和管理操作；实际可用槽数仍取决于 VPNGate 节点、目标国家和外部网络条件。部署后应按上面的命令逐槽核验真实出口。
+本地容器已包含 24 槽调度、订阅输出和管理操作；实际可用槽数仍取决于 VPNGate 节点、目标国家和外部网络条件。部署后应按上面的命令逐槽核验真实出口。
+
+## 桥接节点（链式代理）
+
+在 `.env` 中配置 `KUI_BRIDGE_NODES` 和 `KUI_BRIDGE_SUB_URLS` 后，订阅会自动生成两类节点：
+
+1. **桥接节点本身**：作为第一跳，可被 Clash/Mihomo 的 `dialer-proxy` 引用。
+2. **链式节点**：每个 ready 槽位都会为每个桥接节点生成一个 `exit-XX-via-<桥接名>` 的节点，其 `dialer-proxy` 指向对应桥接节点。
+
+流量路径：
+
+```text
+客户端 -> 桥接节点（VLESS/Hysteria2/SS/Trojan/HTTP/SOCKS5）
+       -> VPS 上的 Reality 入站
+       -> OpenVPN 出口
+       -> 目标网站
+```
+
+配置示例（`.env`）：
+
+```env
+KUI_BRIDGE_NODES=hysteria2://pass@host:8443?sni=x#Hysteria2,vless://uuid@host:443?type=ws&security=tls&sni=x&path=/&host=x#BridgeNode
+KUI_BRIDGE_SUB_URLS=https://example.com/sub1,https://example.com/sub2
+```
+
+- `KUI_BRIDGE_NODES`：逗号分隔的手动节点分享 URL，**直接信任**并加入订阅。
+- `KUI_BRIDGE_SUB_URLS`：逗号分隔的免费订阅地址，本机会拉取、解析，并对每个节点做**连通性测试**，只保留能通 2 个及以上目标站的节点。
+
+测试目标站固定为：
+
+```text
+https://chatgpt.com
+https://claude.com
+https://google.com
+https://tradingview.com
+```
+
+测试方式：
+
+- HTTP/SOCKS5 节点：直接用 `curl --proxy` 测试。
+- VLESS/Hysteria2/Trojan/SS/VMess 节点：在容器内临时启动 `sing-box` 客户端，通过本地 SOCKS5 中转后 `curl` 测试。
+
+并发限制为 8 个测试任务，结果缓存 5 分钟，避免频繁拉取/测试占用资源。
+
+订阅输出示例（Clash YAML）：
+
+```yaml
+proxies:
+  - name: "Hysteria2"
+    type: hysteria2
+    ...
+  - name: "JP-日本 | KDDI | x.x.x.x | exit-01-via-Hysteria2"
+    type: vless
+    ...
+    dialer-proxy: "Hysteria2"
+```
+
+注意：链式节点只在 Clash YAML 订阅中生效（依赖 `dialer-proxy`），普通 base64 订阅链接只能表示直连 Reality 节点。
+
+### 自动刷新与测速
+
+后台线程会按 `KUI_BRIDGE_REFRESH_INTERVAL`（默认 300 秒）自动拉取订阅、测试节点并更新缓存。相关环境变量：
+
+```env
+KUI_BRIDGE_REFRESH_INTERVAL=300   # 自动刷新周期（秒）
+KUI_BRIDGE_SPEED_TEST=0           # 是否测速：0=只测连通性，1=测速并按速度取前 N
+KUI_BRIDGE_TOP_N=16               # 测速时最多保留多少个节点
+```
+
+- 默认**不测速**，只保留能通 2 个目标站以上的节点，刷新较快。
+- 开启 `KUI_BRIDGE_SPEED_TEST=1` 后，会对每个有效节点下载一个 200KB 文件测速，并保留最快的 `KUI_BRIDGE_TOP_N` 个。
+
+## 自动恢复停用的槽位
+
+槽位连续 3 次拨号/健康失败后会自动停用。容器启动后会每 **60 秒** 检查一次：如果当前节点池中有可用且未被其他槽位占用的节点，就自动重新启用该槽位并尝试重拨。节点池本身仍每 10 分钟刷新一次。

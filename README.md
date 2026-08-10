@@ -1,6 +1,6 @@
 # K-UI Local Multi-Exit
 
-`kui-local-multi-exit` 是一个面向单台 Linux VPS 的本地多出口代理控制器。它在一个 Docker 容器中运行管理面板、本地 SQLite、VPNGate/OpenVPN 调度器和 12 个独立 SOCKS5 出口，不依赖 Cloudflare 或外部控制中心。
+`kui-local-multi-exit` 是一个面向单台 Linux VPS 的本地多出口代理控制器。它在一个 Docker 容器中运行管理面板、本地 SQLite、VPNGate/OpenVPN 调度器和 12 个独立 SOCKS5 出口，不依赖 Cloudflare 或外部控制中心。公网客户端可通过原版 K-UI 同款 sing-box 加密入口接入，避免直接暴露裸 SOCKS5 协议。
 
 ## 功能与边界
 
@@ -10,7 +10,8 @@
 - 管理页/API 免登录；12 个 SOCKS5 出口共用一组用户名和密码。
 - 本地 SQLite 和运行状态保存在 Docker volume `kui-local-data`。
 - 只有隧道、策略路由、真实 listener、住宅属性和全部目标探针均通过的槽位才会发布到订阅。
-- VPNGate 是动态公网节点池，**不保证 12 个槽位始终同时可用**。
+- OpenVPN 节点池支持 VPNGate、VPNBook、30 天滚动历史池和 `providers/` 手工配置；PublicVPNList 用于国家覆盖元数据。**免费公共节点仍不保证 12 个槽位始终同时可用**。
+- `scripts/install-reality-gateway.sh` 可部署单节点 XTLS-Reality 加密入口，并把流量固定交给指定 OpenVPN 出口槽位。
 
 ## 部署前提
 
@@ -71,6 +72,8 @@ chmod 600 .env
 | `KUI_MANAGEMENT_PORT` | 否 | `8080` | 面板映射到宿主机的 TCP 端口 |
 | `KUI_FETCH_PROXY` | 否 | 空 | 拉取 VPNGate 数据时使用的显式 HTTP/HTTPS/SOCKS5 代理 |
 | `KUI_OPENVPN_SOCKS_PROXY` | 否 | 空 | OpenVPN 握手使用的 SOCKS5 上游代理 |
+| `KUI_ENABLE_VPNBOOK` | 否 | `1` | 自动导入 VPNBook 的 US/CA/GB/DE/FR TCP 443 配置和当前动态密码 |
+| `KUI_VPN_HISTORY_DAYS` | 否 | `30` | 历史 OpenVPN 节点滚动保留天数 |
 
 也可以只为当前 shell 导出必填变量：
 
@@ -94,22 +97,85 @@ docker compose logs --tail=100 kui-local-multi-exit
 
 容器状态最终应为 `healthy`。首次启动会拉取 VPNGate 节点并拨号，槽位状态可能需要一段时间才能稳定。
 
+## XTLS-Reality 多出口入口
+
+`7920-7931` 是本机 OpenVPN 出口选择器，不适合作为中国大陆客户端的裸公网入口。按原版 K-UI 的 sing-box 结构部署 12 个 XTLS-Reality 入站，并一一映射到 12 个 OpenVPN 出口：
+
+```bash
+sudo KUI_REALITY_PORT=8443 \
+  KUI_REALITY_EXIT_PORT=7920 \
+  KUI_REALITY_SNI=addons.mozilla.org \
+  KUI_PUBLIC_HOST=YOUR_VPS_IP \
+  ./scripts/install-reality-gateway.sh
+
+docker compose up -d --build
+```
+
+默认映射：
+
+```text
+8443/TCP → exit-01 → 127.0.0.1:7920
+8444/TCP → exit-02 → 127.0.0.1:7921
+...
+8454/TCP → exit-12 → 127.0.0.1:7931
+```
+
+脚本沿用原版 sing-box `1.13.14` 和 XTLS-Reality 配置，生成文件保存在：
+
+```text
+/etc/kui-reality-gateway/client.txt         # 12 条 VLESS 导入链接
+/etc/kui-reality-gateway/mihomo.yaml        # Mihomo/Clash Meta 节点片段
+/etc/kui-reality-gateway/config.json        # 服务端配置
+/etc/kui-reality-gateway/nodes-private.json # UUID 和 Reality 私钥，权限 0600
+runtime/reality/public-nodes.json            # 订阅服务读取的公开参数
+```
+
+检查服务：
+
+```bash
+systemctl status kui-reality-gateway --no-pager
+/usr/local/bin/kui-sing-box check -c /etc/kui-reality-gateway/config.json
+ss -ltnp | grep -E ':(8443|8454)'
+```
+
+Clash/Mihomo 使用面板生成的 `format=clash` 订阅。订阅只下发当前真正 ready 的槽位，节点类型为 `VLESS + XTLS-Reality`，名称按实际出口动态生成：
+
+```text
+JP-日本 | KDDI | 59.136.199.164 | exit-01
+KR-韩国 | KT | 211.199.34.191 | exit-09
+```
+
+国家取当前 OpenVPN 节点而不是槽位目标，因此 `ANY` 不会出现在节点名中。可获得城市时名称会自动加入城市；换出口 IP 后，刷新 Clash 订阅即可更新名称。重新执行安装脚本会保留已有 Reality UUID 和密钥。
+
 ## 防火墙
 
 默认端口：
 
 - TCP `8080`：管理面板和 API。
-- TCP `7920-7931`：12 个 SOCKS5 出口。
+- TCP `8443-8454`：12 个 XTLS-Reality 加密入口。
+- TCP/UDP `7920-7931`：只绑定宿主机 `127.0.0.1` 的内部 SOCKS5 出口选择器。
 
 使用 UFW 且只允许一个管理来源时，可按实际来源 IP 调整：
 
 ```bash
 ufw allow from YOUR_TRUSTED_IP to any port 8080 proto tcp
-ufw allow from YOUR_TRUSTED_IP to any port 7920:7931 proto tcp
+ufw allow 8443:8454/tcp
 ufw status
 ```
 
 云厂商安全组也必须配置相同规则。不要因为 SOCKS5 有密码就默认向整个互联网开放端口。
+
+## OpenVPN 多源节点池
+
+当前自动源：
+
+- VPNGate：当前实时 CSV 配置。
+- VPNBook：US、CA、GB、DE、FR 官方免费 TCP 443 配置，自动读取当前账号密码。
+- 历史池：节点快照按 IP 合并，默认滚动保留 30 天，临时消失的配置仍可重新尝试。
+- PublicVPNList：只保存各国在线数量和数据集状态，用于发现覆盖，不抓取其短时签名配置。
+- Proton/其他供应商：把账号下载的 `.ovpn` 和凭据放到 `providers/`，参见 `providers/README.md`。
+
+不同来源可以使用不同 OpenVPN 用户名和密码。VPNBook、Proton 等机房型 VPN 仍需通过本项目的住宅属性和目标探针，未通过的节点不会发布。
 
 ## 网络受限时使用上游代理
 
@@ -159,7 +225,7 @@ socks5://admin:YOUR_PASSWORD@YOUR_VPS_IP:7931  # exit-12
 - 单独换 IP、启用或停用一个槽位。
 - 查看本地出口事件日志。
 
-连续三次失败后槽位会停用，需要手动点击“启用”或选择候选重新连接。接受重拨请求只代表任务开始，不代表隧道已经 ready。
+连续三次失败后槽位会暂时停用；节点池刷新后，只有当前存在对应国家（或 `ANY`）可用候选的槽位才会自动恢复。也可以手动点击“启用”或选择候选重新连接。接受重拨请求只代表任务开始，不代表隧道已经 ready。
 
 ## 可发布条件
 

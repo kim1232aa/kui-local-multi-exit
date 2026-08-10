@@ -86,7 +86,7 @@ def parse_addr_port(raw: str):
     return raw, 443
 
 
-def _query_doh(host: str, mark: int, timeout: float) -> tuple[list[str], int]:
+def _query_doh(host: str, mark: int, timeout: float, record_type: str = "A") -> tuple[list[str], int]:
     error = None
     for address in DOH_ADDRESSES:
         raw = None
@@ -97,7 +97,7 @@ def _query_doh(host: str, mark: int, timeout: float) -> tuple[list[str], int]:
             raw.setsockopt(socket.SOL_SOCKET, SO_MARK, int(mark))
             raw.connect((address, 443))
             tls = ssl.create_default_context().wrap_socket(raw, server_hostname=DOH_HOST)
-            path = "/dns-query?" + urllib.parse.urlencode({"name": host, "type": "A"})
+            path = "/dns-query?" + urllib.parse.urlencode({"name": host, "type": record_type})
             request = (
                 f"GET {path} HTTP/1.1\r\n"
                 f"Host: {DOH_HOST}\r\n"
@@ -113,11 +113,13 @@ def _query_doh(host: str, mark: int, timeout: float) -> tuple[list[str], int]:
             answers = payload.get("Answer") or []
             addresses = []
             ttls = []
+            expected_type = 28 if record_type == "AAAA" else 1
+            address_parser = ipaddress.IPv6Address if expected_type == 28 else ipaddress.IPv4Address
             for answer in answers:
-                if answer.get("type") != 1:
+                if answer.get("type") != expected_type:
                     continue
                 try:
-                    candidate = str(ipaddress.IPv4Address(answer.get("data", "")))
+                    candidate = str(address_parser(answer.get("data", "")))
                 except ipaddress.AddressValueError:
                     continue
                 if candidate not in addresses:
@@ -149,7 +151,9 @@ def resolve_host(host: str, mark: int, timeout: float = 20) -> list[str]:
         cached = DNS_CACHE.get(key)
         if cached and cached[0] > now:
             return list(cached[1])
-    addresses, ttl = _query_doh(normalized, mark, timeout)
+    addresses, ttl = _query_doh(normalized, mark, timeout, "A")
+    if not addresses:
+        addresses, ttl = _query_doh(normalized, mark, timeout, "AAAA")
     with DNS_CACHE_LOCK:
         DNS_CACHE[key] = (now + max(5, min(ttl, 300)), list(addresses))
     return addresses
@@ -298,7 +302,6 @@ class ProxyListener:
                 client.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
                 relay(client, upstream)
             elif command == 3:  # UDP ASSOCIATE
-                # 消费客户端提供的地址（但我们不使用它）
                 if address_type == 1:
                     recv_exact(client, 4)
                 elif address_type == 3:
@@ -307,16 +310,15 @@ class ProxyListener:
                     recv_exact(client, 16)
                 else:
                     return
-                recv_exact(client, 2)  # port
-                # 创建 UDP relay socket
+                recv_exact(client, 2)
                 udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                udp_sock.setsockopt(socket.SOL_SOCKET, SO_MARK, self.mark)
-                udp_sock.bind((self.host, 0))
-                udp_port = udp_sock.getsockname()[1]
-                # 返回 UDP relay 地址
-                bind_addr = socket.inet_aton(self.host)
-                client.sendall(b"\x05\x00\x00\x01" + bind_addr + udp_port.to_bytes(2, "big"))
-                # UDP relay 循环
+                # Client-facing replies must use the VPS route. Only the
+                # separate upstream UDP socket is marked for the VPN exit.
+                udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                udp_sock.bind((self.host if ":" not in self.host else "0.0.0.0", self.port))
+                # TCP and UDP intentionally use the same slot port. Compose
+                # publishes both protocols, so remote clients can reach it.
+                client.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00" + self.port.to_bytes(2, "big"))
                 self._udp_relay(client, udp_sock)
             else:
                 client.sendall(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
@@ -375,19 +377,32 @@ class ProxyListener:
                         client_udp_addr = addr
                     elif client_udp_addr != addr:
                         continue  # 忽略来自其他地址的包
-                    # 解析目标并转发
-                    targets = resolve_with_doh(dst_addr, self.mark, timeout=5.0)
+                    # 解析目标并转发；与 TCP CONNECT 共用按出口 mark 的 DoH。
+                    targets = resolve_host(dst_addr, self.mark, timeout=5.0)
                     if not targets:
                         continue
-                    out_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    resolved = ipaddress.ip_address(targets[0])
+                    family = socket.AF_INET6 if resolved.version == 6 else socket.AF_INET
+                    target = (str(resolved), dst_port, 0, 0) if family == socket.AF_INET6 else (str(resolved), dst_port)
+                    out_sock = socket.socket(family, socket.SOCK_DGRAM)
                     out_sock.setsockopt(socket.SOL_SOCKET, SO_MARK, self.mark)
                     out_sock.settimeout(2.0)
                     try:
-                        out_sock.sendto(payload, (targets[0], dst_port))
-                        # 等待响应
-                        reply_data, _ = out_sock.recvfrom(65536)
-                        # 封装响应: RSV(2) | FRAG(1) | ATYP(1) | BND.ADDR | BND.PORT | DATA
-                        reply_header = b"\x00\x00\x00" + data[3:header_len]
+                        out_sock.sendto(payload, target)
+                        reply_data, reply_addr = out_sock.recvfrom(65536)
+                        reply_ip = ipaddress.ip_address(reply_addr[0])
+                        if reply_ip.version == 4:
+                            reply_header = (
+                                b"\x00\x00\x00\x01"
+                                + socket.inet_aton(str(reply_ip))
+                                + int(reply_addr[1]).to_bytes(2, "big")
+                            )
+                        else:
+                            reply_header = (
+                                b"\x00\x00\x00\x04"
+                                + socket.inet_pton(socket.AF_INET6, str(reply_ip))
+                                + int(reply_addr[1]).to_bytes(2, "big")
+                            )
                         udp_sock.sendto(reply_header + reply_data, client_udp_addr)
                     finally:
                         out_sock.close()

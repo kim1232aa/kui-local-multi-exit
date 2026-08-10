@@ -82,6 +82,32 @@ class VPNGateFetchTest(unittest.TestCase):
             attempted,
         )
 
+    def test_endpoint_https_handler_keeps_origin_hostname_for_tls(self):
+        class Result:
+            def __init__(self):
+                self.value = "ok"
+
+        captured = {}
+        handler = vpngate._EndpointHTTPSHandler("www.vpngate.net")
+
+        def do_open(connection_class, request, **kwargs):
+            with patch.object(vpngate, "_EndpointHTTPSConnection") as connection:
+                connection_class("130.158.75.35", check_hostname=True)
+            captured["call"] = connection.call_args
+            captured["request_host"] = request.headers.get("Host")
+            return Result()
+
+        with patch.object(handler, "do_open", side_effect=do_open):
+            request = vpngate.build_endpoint_request("130.158.75.35", vpngate.API_URL)
+            response = handler.https_open(request)
+
+        self.assertEqual("ok", response.value)
+        args, kwargs = captured["call"]
+        self.assertEqual(("130.158.75.35",), args)
+        self.assertEqual("www.vpngate.net", kwargs["server_hostname"])
+        self.assertNotIn("check_hostname", kwargs)
+        self.assertEqual("www.vpngate.net", captured["request_host"])
+
     def test_fetch_nodes_handles_hash_header_line_like_kui(self):
         # K-UI 会去掉首行开头的 #；当前项目只跳过 * 行，需对齐
         csv_body = (
@@ -112,6 +138,33 @@ class VPNGateFetchTest(unittest.TestCase):
         self.assertEqual("JP", nodes[0]["country"])
         self.assertEqual(12, nodes[0]["ping"])
         self.assertEqual(100, nodes[0]["score"])
+
+    def test_fetch_nodes_deduplicates_duplicate_endpoint_ips(self):
+        encoded = __import__("base64").b64encode(b"client\ndev tun\nremote 203.0.113.9 1194\n").decode()
+        csv_body = (
+            "*vpn_servers\n"
+            "#HostName,IP,Score,Ping,Speed,CountryLong,CountryShort,NumVpnSessions,Uptime,TotalUsers,TotalTraffic,LogType,Operator,Message,OpenVPN_ConfigData_Base64\n"
+            f"jp1,203.0.113.9,100,50,3,Japan,JP,1,99,10,100,Free,Test,OK,{encoded}\n"
+            f"jp2,203.0.113.9,90,10,3,Japan,JP,1,99,10,100,Free,Test,OK,{encoded}\n"
+        )
+
+        class TextResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return csv_body.encode()
+
+        with patch.dict(os.environ, {"KUI_FETCH_PROXY": ""}, clear=False), patch.object(
+            vpngate, "resolve_ipv4_endpoints", return_value=["199.59.150.12"]
+        ), patch.object(vpngate, "open_direct_url", return_value=TextResponse()):
+            nodes = vpngate.fetch_nodes()
+
+        self.assertEqual(1, len(nodes))
+        self.assertEqual(10, nodes[0]["ping"])
 
     def test_node_pool_replace_preserves_worst_ping_like_kui(self):
         # K-UI 刷新快照时保留惩罚性 ping（取 max），防止坏节点回到前列

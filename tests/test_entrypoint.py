@@ -73,7 +73,7 @@ class ApplicationTest(unittest.TestCase):
             enabled_ids = [slot.id for slot in store.list_slots() if slot.enabled]
 
         self.assertNotIn("exit-01", enabled_ids)
-        self.assertEqual(11, len(enabled_ids))
+        self.assertEqual(23, len(enabled_ids))
 
     def test_proxy_environment_is_removed_before_network_startup(self):
         variables = {

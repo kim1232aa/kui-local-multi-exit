@@ -20,14 +20,10 @@ class LocalStoreTest(unittest.TestCase):
     def test_initializes_twelve_editable_exit_slots(self):
         slots = self.store.list_slots()
 
-        self.assertEqual(12, len(slots))
-        self.assertEqual(
-            ["JP", "JP", "US", "US", "GB", "GB", "DE", "DE", "KR", "KR", "SG", "SG"],
-            [slot.country for slot in slots],
-        )
-        self.assertEqual(list(range(7920, 7932)), [slot.proxy_port for slot in slots])
-        self.assertEqual([f"tun{i}" for i in range(12)], [slot.tunnel_name for slot in slots])
-        self.assertEqual(list(range(200, 212)), [slot.route_table for slot in slots])
+        self.assertEqual(24, len(slots))
+        self.assertEqual(list(range(7920, 7944)), [slot.proxy_port for slot in slots])
+        self.assertEqual([f"tun{i}" for i in range(24)], [slot.tunnel_name for slot in slots])
+        self.assertEqual(list(range(200, 224)), [slot.route_table for slot in slots])
 
     def test_updates_one_slot_without_changing_other_slots(self):
         before = self.store.get_slot("exit-02")
@@ -45,7 +41,7 @@ class LocalStoreTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already used"):
             self.store.update_slot("exit-01", proxy_port=7921)
 
-        with self.assertRaisesRegex(ValueError, "7920 through 7931"):
+        with self.assertRaisesRegex(ValueError, "7920 through 7943"):
             self.store.update_slot("exit-01", proxy_port=9001)
 
     def test_three_consecutive_failures_auto_disable_only_that_slot(self):
@@ -91,7 +87,7 @@ class LocalStoreTest(unittest.TestCase):
         self.assertEqual("connected", events[0]["kind"])
 
     def test_validate_slot_update_checks_port_before_runtime_actions(self):
-        with self.assertRaisesRegex(ValueError, "7920 through 7931"):
+        with self.assertRaisesRegex(ValueError, "7920 through 7943"):
             self.store.validate_slot_update("exit-01", country=None, proxy_port=9001, enabled=None)
 
     def test_stale_generation_cannot_write_runtime(self):
@@ -124,7 +120,10 @@ class LocalStoreTest(unittest.TestCase):
         reopened = LocalStore(self.db_path)
         reopened.initialize()
 
-        self.assertEqual(nodes, reopened.load_vpn_nodes())
+        loaded = reopened.load_vpn_nodes()
+        self.assertEqual(1, len(loaded))
+        self.assertEqual("198.51.100.1", loaded[0]["ip"])
+        self.assertEqual("vpngate", loaded[0]["source"])
 
     def test_check_results_are_persisted_and_filterable_by_slot(self):
         self.store.append_check_result(

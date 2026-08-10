@@ -12,13 +12,25 @@ services:
       KUI_MANAGEMENT_PASSWORD: ${KUI_MANAGEMENT_PASSWORD:?set KUI_MANAGEMENT_PASSWORD}
       KUI_FETCH_PROXY: ${KUI_FETCH_PROXY:-}
       KUI_OPENVPN_SOCKS_PROXY: ${KUI_OPENVPN_SOCKS_PROXY:-}
+      KUI_ENABLE_VPNBOOK: ${KUI_ENABLE_VPNBOOK:-1}
+      KUI_VPN_HISTORY_DAYS: ${KUI_VPN_HISTORY_DAYS:-30}
+      KUI_OPENVPN_PROVIDER_DIR: /opt/kui-providers
+      KUI_REALITY_NODES_FILE: /run/kui-reality/public-nodes.json
+      KUI_BRIDGE_NODES: ${KUI_BRIDGE_NODES:-}
+      KUI_BRIDGE_SUB_URLS: ${KUI_BRIDGE_SUB_URLS:-}
+      KUI_BRIDGE_REFRESH_INTERVAL: ${KUI_BRIDGE_REFRESH_INTERVAL:-300}
+      KUI_BRIDGE_SPEED_TEST: ${KUI_BRIDGE_SPEED_TEST:-0}
+      KUI_BRIDGE_TOP_N: ${KUI_BRIDGE_TOP_N:-16}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
       - "${KUI_MANAGEMENT_PORT:-8080}:8080"
-      - "7920-7931:7920-7931"
+      - "127.0.0.1:7920-7943:7920-7943/tcp"
+      - "127.0.0.1:7920-7943:7920-7943/udp"
     volumes:
       - kui-local-data:/opt/kui-local
+      - ./providers:/opt/kui-providers:ro
+      - ./runtime/reality:/run/kui-reality:ro
 
 volumes:
   kui-local-data:

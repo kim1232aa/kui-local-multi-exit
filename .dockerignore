@@ -10,6 +10,7 @@ __pycache__
 *.db-shm
 *.db-wal
 *.ovpn
+providers/
 *.log
 auth.txt
 socks_auth.txt

@@ -145,6 +145,114 @@ class ProxyServerTest(unittest.TestCase):
             client.close()
             listener.stop()
 
+    def test_udp_relay_uses_marked_shared_resolver(self):
+        listener = proxy_server.ProxyListener("exit-01", "127.0.0.1", 7920, "tun0", 200)
+
+        class StopAfterOne:
+            def is_set(self):
+                return False
+
+        class FakeTCP:
+            def settimeout(self, _timeout):
+                pass
+
+        class FakeUDP:
+            def __init__(self):
+                self.calls = 0
+                self.sent = []
+                self.closed = False
+
+            def settimeout(self, _timeout):
+                pass
+
+            def recvfrom(self, _size):
+                self.calls += 1
+                if self.calls == 1:
+                    packet = b"\x00\x00\x00\x03\x0bexample.com\x00\x35query"
+                    return packet, ("127.0.0.1", 50000)
+                raise KeyboardInterrupt
+
+            def sendto(self, data, address):
+                self.sent.append((data, address))
+
+            def close(self):
+                self.closed = True
+
+        class FakeOutbound:
+            def setsockopt(self, *_args):
+                pass
+
+            def settimeout(self, _timeout):
+                pass
+
+            def sendto(self, data, address):
+                self.request = (data, address)
+
+            def recvfrom(self, _size):
+                return b"reply", ("203.0.113.53", 53)
+
+            def close(self):
+                pass
+
+        udp = FakeUDP()
+        listener._stop = StopAfterOne()
+        with patch.object(proxy_server.select, "select", return_value=([], [], [])), patch.object(
+            proxy_server, "resolve_host", return_value=["203.0.113.53"]
+        ) as resolver, patch.object(proxy_server.socket, "socket", return_value=FakeOutbound()):
+            with self.assertRaises(KeyboardInterrupt):
+                listener._udp_relay(FakeTCP(), udp)
+
+        resolver.assert_called_once_with("example.com", 200, timeout=5.0)
+        self.assertTrue(udp.closed)
+        self.assertEqual(("127.0.0.1", 50000), udp.sent[0][1])
+        self.assertEqual(b"\x00\x00\x00\x01\xcb\x00\x71\x35\x00\x35reply", udp.sent[0][0])
+
+    def test_udp_associate_binds_the_public_slot_port(self):
+        proxy_server.set_credentials("alice", "secret")
+        listener = proxy_server.ProxyListener("exit-01", "0.0.0.0", 7920, "tun0", 200)
+
+        class FakeClient:
+            def __init__(self):
+                self.input = bytearray(
+                    b"\x01\x02"  # one method: username/password
+                    b"\x01\x05alice\x06secret"
+                    b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00"
+                )
+                self.sent = bytearray()
+
+            def recv(self, size, *_args):
+                result = bytes(self.input[:size])
+                del self.input[:size]
+                return result
+
+            def sendall(self, data):
+                self.sent.extend(data)
+
+        class FakeUDP:
+            def __init__(self):
+                self.bound = None
+                self.options = []
+
+            def setsockopt(self, *args):
+                self.options.append(args)
+
+            def bind(self, address):
+                self.bound = address
+
+            def close(self):
+                pass
+
+        client = FakeClient()
+        udp = FakeUDP()
+        with patch.object(proxy_server.socket, "socket", return_value=udp), patch.object(
+            listener, "_udp_relay", return_value=None
+        ):
+            listener._socks5_client(client)
+
+        self.assertEqual(("0.0.0.0", 7920), udp.bound)
+        self.assertNotIn((socket.SOL_SOCKET, proxy_server.SO_MARK, 200), udp.options)
+        self.assertTrue(bytes(client.sent).endswith(b"\x05\x00\x00\x01\x00\x00\x00\x00\x1e\xf0"))
+
     def test_listener_reports_ready_only_while_bound(self):
         listener = proxy_server.ProxyListener("exit-01", "127.0.0.1", 0, "tun0", 200)
 

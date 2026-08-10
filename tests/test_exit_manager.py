@@ -127,6 +127,61 @@ class ExitManagerTest(unittest.TestCase):
 
         self.assertEqual("198.51.100.2", selected["ip"])
 
+    def test_refresh_nodes_persists_snapshot_for_restart_fallback(self):
+        nodes = [
+            {
+                "ip": "198.51.100.1",
+                "country": "JP",
+                "ping": 1,
+                "score": 100,
+                "config": "proto tcp\n",
+                "harvested_at": 1.0,
+            }
+        ]
+        with patch("vps.exit_manager.fetch_all_openvpn_nodes", return_value=(nodes, {"providers": {"vpngate": {"count": 1}}})):
+            self.assertEqual(1, self.manager.refresh_nodes())
+
+        persisted = self.store.load_vpn_nodes()
+        self.assertEqual("198.51.100.1", persisted[0]["ip"])
+        self.assertEqual("vpngate", persisted[0]["source"])
+
+    def test_empty_refresh_loads_cached_snapshot(self):
+        nodes = [
+            {
+                "ip": "198.51.100.1",
+                "country": "JP",
+                "ping": 1,
+                "score": 100,
+                "config": "proto tcp\n",
+                "harvested_at": 1.0,
+            }
+        ]
+        self.store.replace_vpn_nodes(nodes)
+        with patch("vps.exit_manager.fetch_all_openvpn_nodes", return_value=([], {"providers": {}})):
+            self.assertEqual(1, self.manager.refresh_nodes())
+
+        self.assertEqual("198.51.100.1", self.manager.node_pool.select("JP", set())["ip"])
+
+    def test_auto_recovery_only_enables_slots_with_distinct_eligible_nodes(self):
+        for slot_id in ("exit-01", "exit-02", "exit-03"):
+            for attempt in range(3):
+                self.manager.fail_slot(slot_id, f"failed {attempt}")
+        self.manager.node_pool.replace(
+            [
+                {"ip": "198.51.100.1", "country": "JP", "ping": 1, "score": 100, "config": "proto tcp\n"},
+                {"ip": "198.51.100.2", "country": "JP", "ping": 2, "score": 90, "config": "proto tcp\n"},
+            ]
+        )
+        started = []
+        self.manager.start_slot = lambda slot_id: started.append(slot_id)
+
+        self.manager._try_recover_auto_disabled_slots()
+
+        self.assertEqual(["exit-01", "exit-02"], started)
+        self.assertTrue(self.store.get_slot("exit-01").enabled)
+        self.assertTrue(self.store.get_slot("exit-02").enabled)
+        self.assertFalse(self.store.get_slot("exit-03").enabled)
+
     def test_concurrent_selection_reserves_distinct_nodes_until_released(self):
         self.manager.node_pool.replace(
             [

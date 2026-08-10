@@ -5,6 +5,7 @@ import signal
 import threading
 from pathlib import Path
 
+from .bridge_nodes import start_background_refresh
 from .exit_manager import ExitManager
 from .local_api import LocalAPIServer
 from .proxy_server import set_credentials
@@ -69,6 +70,21 @@ def build_application() -> Application:
     auth_file.chmod(0o600)
     set_credentials(proxy_user, proxy_password)
     manager = ExitManager(store, workspace=workspace)
+
+    manual_urls = [u.strip() for u in (os.environ.get("KUI_BRIDGE_NODES", "") or "").split(",") if u.strip()]
+    subscription_urls = [u.strip() for u in (os.environ.get("KUI_BRIDGE_SUB_URLS", "") or "").split(",") if u.strip()]
+    if subscription_urls:
+        refresh_interval = int(os.environ.get("KUI_BRIDGE_REFRESH_INTERVAL", "300"))
+        enable_speed_test = os.environ.get("KUI_BRIDGE_SPEED_TEST", "") == "1"
+        top_n = int(os.environ.get("KUI_BRIDGE_TOP_N", "16"))
+        start_background_refresh(
+            interval=refresh_interval,
+            manual_urls=manual_urls,
+            subscription_urls=subscription_urls,
+            enable_speed_test=enable_speed_test,
+            top_n=top_n,
+        )
+
     server = LocalAPIServer(
         (management_host, management_port),
         store=store,
