@@ -292,9 +292,61 @@ def _decode_subscription(text: str) -> str:
     return text
 
 
+def _parse_monosans_json(text: str) -> list[dict[str, Any]] | None:
+    """Parse monosans/proxy-list proxies.json (hourly-verified, geo metadata).
+
+    Returns None when the text is not that format. socks4 entries are skipped
+    (mihomo has no socks4 outbound) and transparent proxies are dropped
+    (exit_ip != host means the real client IP is forwarded).
+    """
+    stripped = text.lstrip()
+    if not stripped.startswith("["):
+        return None
+    try:
+        data = json.loads(stripped)
+    except ValueError:
+        return None
+    if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+        return None
+    if "protocol" not in data[0] or "host" not in data[0]:
+        return None
+    nodes: list[dict[str, Any]] = []
+    for item in data:
+        proto = str(item.get("protocol", "")).lower()
+        if proto not in {"http", "socks5"}:
+            continue
+        host = str(item.get("host", ""))
+        try:
+            port = int(item.get("port", 0))
+        except (TypeError, ValueError):
+            continue
+        if not host or not 1 <= port <= 65535:
+            continue
+        if item.get("exit_ip") and str(item["exit_ip"]) != host:
+            continue
+        iso = str(((item.get("geolocation") or {}).get("country") or {}).get("iso_code", ""))
+        node: dict[str, Any] = {
+            "protocol": proto.upper(),
+            "type": proto,
+            "name": _clean_name(f"{iso or 'ZZ'}-{proto}-{host}:{port}"),
+            "server": host,
+            "address": host,
+            "port": port,
+            "_country_hint": iso,
+        }
+        if item.get("username"):
+            node["username"] = str(item["username"])
+            node["password"] = str(item.get("password") or "")
+        nodes.append(node)
+    return nodes
+
+
 def parse_subscription(text: str) -> list[dict[str, Any]]:
     """Parse a subscription text (base64 or plain) into node dicts."""
     text = _decode_subscription(text)
+    monosans = _parse_monosans_json(text)
+    if monosans is not None:
+        return monosans[:150]
     nodes: list[dict[str, Any]] = []
     seen = set()
     for line in text.splitlines():
@@ -737,7 +789,11 @@ def load_bridge_nodes(
                     seen.add(node["name"])
                     node["_source_kind"] = "subscription"
                     name_match = re.match(r"^\s*([A-Z]{2})[-_ ]", str(node.get("name", "")))
-                    node["_country_hint"] = source_country or (name_match.group(1) if name_match else "")
+                    node["_country_hint"] = (
+                        node.get("_country_hint")
+                        or source_country
+                        or (name_match.group(1) if name_match else "")
+                    )
                     candidate_urls.append(node)
         except Exception:
             continue
@@ -745,8 +801,13 @@ def load_bridge_nodes(
     if test_reachability and candidate_urls:
         tested: list[dict[str, Any]] = []
         lock = threading.Lock()
-        test_candidates = candidate_urls[:80]
-        max_workers = 16
+        priority_countries = {"TR", "VN", "TH", "PH"}
+        ordered = sorted(
+            candidate_urls,
+            key=lambda n: 0 if n.get("_country_hint") in priority_countries else 1,
+        )
+        test_candidates = ordered[:150]
+        max_workers = 24
 
         def _test_one(node: dict[str, Any]) -> dict[str, Any] | None:
             proxy_url = _node_to_proxy_url(node)

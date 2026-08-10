@@ -643,6 +643,21 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 f"    password: {json.dumps(str(node.get('password', '')))}",
                 "    udp: true",
             ))
+        elif protocol == "HTTP":
+            lines[1] = "    type: http"
+            if node.get("username"):
+                lines.extend((
+                    f"    username: {json.dumps(str(node['username']))}",
+                    f"    password: {json.dumps(str(node.get('password', '')))}",
+                ))
+        elif protocol == "SOCKS5":
+            lines[1] = "    type: socks5"
+            lines.append("    udp: true")
+            if node.get("username"):
+                lines.extend((
+                    f"    username: {json.dumps(str(node['username']))}",
+                    f"    password: {json.dumps(str(node.get('password', '')))}",
+                ))
         elif protocol == "VMESS":
             lines[1] = "    type: vmess"
             lines.extend((
@@ -882,12 +897,14 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             for node in all_bridge_nodes:
                 if node.get("_source_kind") != "subscription":
                     continue
+                raw_name = str(node.get("name", "订阅节点"))
+                hint = str(node.get("_country_hint") or "")
                 node = {
                     **node,
                     "name": (
-                        f"自动链式 | {node.get('_country_hint')} | {node.get('name', '订阅节点')}"
-                        if node.get("_country_hint") in {"TR", "VN", "TH", "PH"}
-                        else f"自动链式 | {node.get('name', '订阅节点')}"
+                        f"自动链式 | {hint} | {raw_name}"
+                        if hint in {"TR", "VN", "TH", "PH"} and not raw_name.startswith(hint + "-")
+                        else f"自动链式 | {raw_name}"
                     ),
                     "dialer-proxy": _FRONT_GROUP,
                     "_subscription_group": "chain",
