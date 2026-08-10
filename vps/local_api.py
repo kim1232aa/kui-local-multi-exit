@@ -20,7 +20,7 @@ from typing import Any
 from urllib.parse import quote, urljoin, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from .bridge_nodes import load_bridge_nodes, parse_proxy_url
+from .bridge_nodes import _cache_key, _get_cache, load_bridge_nodes, parse_proxy_url
 from .exit_manager import ExitManager
 from .proxy_server import set_credentials
 from .realm_manager import RealmManager, RealmUnavailable
@@ -815,14 +815,20 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         A background thread (started by entrypoint.py) refreshes subscription
         nodes periodically. The API shares the same module-level cache, so
         subscription requests are fast and do not block on network tests.
+
+        When the cache is empty (first boot or refresh still running) the API
+        returns only trusted manual nodes instead of blocking a request on
+        live testing; the background refresher fills the cache shortly after.
         """
         manual = [u.strip() for u in (os.environ.get("KUI_BRIDGE_NODES", "") or "").split(",") if u.strip()]
         subs = [u.strip() for u in (os.environ.get("KUI_BRIDGE_SUB_URLS", "") or "").split(",") if u.strip()]
-        return load_bridge_nodes(
-            manual_urls=manual,
-            subscription_urls=subs,
-            test_reachability=bool(subs),
-        )
+        if not subs:
+            return load_bridge_nodes(manual_urls=manual, test_reachability=False)
+        key = _cache_key(manual, subs, True)
+        cached = _get_cache(key, max_age=300)
+        if cached is not None:
+            return cached
+        return load_bridge_nodes(manual_urls=manual, test_reachability=False)
 
     def _local_subscription_nodes(self, *, include_dialer_proxy: bool = False) -> list[dict[str, Any]]:
         reality_nodes = self._local_reality_nodes()
@@ -1127,6 +1133,48 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     "    type: select",
                     "    proxies:",
                     front_yaml,
+                ]
+                # Per-country url-test groups: generated dynamically for every
+                # country present in the chain/direct nodes. The client probes
+                # the full chain from its own network every 300s and skips
+                # dead nodes automatically, so stale proxies never need cleanup.
+                def _node_country(name: str) -> str:
+                    rest = name.removeprefix("自动链式 | ")
+                    match = re.match(r"([A-Z]{2})(?:-|\s*\|)", rest)
+                    return match.group(1) if match else ""
+
+                country_members: dict[str, list[str]] = {}
+                for node_name in chain_names + direct_names:
+                    code = _node_country(node_name)
+                    if code:
+                        country_members.setdefault(code, [])
+                        if node_name not in country_members[code]:
+                            country_members[code].append(node_name)
+                for node_name in chain_names:
+                    if "| tr-" in node_name and node_name not in country_members.get("TR", []):
+                        country_members.setdefault("TR", []).append(node_name)
+
+                def _country_flag(code: str) -> str:
+                    if len(code) != 2 or not code.isalpha():
+                        return "🌐"
+                    return "".join(chr(0x1F1E6 + ord(ch) - ord("A")) for ch in code)
+
+                priority_order = ["TR", "VN", "TH", "PH", "US", "JP"]
+                ordered_codes = [c for c in priority_order if c in country_members]
+                ordered_codes += sorted(c for c in country_members if c not in priority_order)
+                for code in ordered_codes:
+                    zh_name = COUNTRY_NAMES_ZH.get(code) or code
+                    group_lines.extend([
+                        f"  - name: {_country_flag(code)} {zh_name}",
+                        "    type: url-test",
+                        "    url: https://www.gstatic.com/generate_204",
+                        "    interval: 300",
+                        "    tolerance: 50",
+                        "    lazy: true",
+                        "    proxies:",
+                        _list_yaml(country_members[code]),
+                    ])
+                group_lines.extend([
                     "  - name: ⚡ 自动选择",
                     "    type: url-test",
                     "    hidden: true",
@@ -1157,7 +1205,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     "    proxies:",
                     "      - DIRECT",
                     "      - 🌐 其他流量",
-                ]
+                ])
                 rule_lines = ["  - DOMAIN-SUFFIX,alibb123.ccwu.cc,DIRECT"]
                 rule_lines.extend(f"  - {rule},🤖 ChatGPT" for rule in _CHATGPT_RULES)
                 rule_lines.extend(f"  - {rule},🧠 Claude" for rule in _CLAUDE_RULES)

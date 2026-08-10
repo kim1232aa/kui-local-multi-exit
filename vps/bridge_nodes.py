@@ -36,9 +36,7 @@ CHECK_TIMEOUT = 12
 CHECK_WORKERS = 8
 CHECK_TARGETS = [
     "https://chatgpt.com",
-    "https://claude.com",
     "https://google.com",
-    "https://tradingview.com",
 ]
 
 # Module-level cache shared between the API handler and the background refresher.
@@ -346,7 +344,7 @@ def parse_subscription(text: str) -> list[dict[str, Any]]:
     text = _decode_subscription(text)
     monosans = _parse_monosans_json(text)
     if monosans is not None:
-        return monosans[:150]
+        return monosans[:60]
     nodes: list[dict[str, Any]] = []
     seen = set()
     for line in text.splitlines():
@@ -806,8 +804,8 @@ def load_bridge_nodes(
             candidate_urls,
             key=lambda n: 0 if n.get("_country_hint") in priority_countries else 1,
         )
-        test_candidates = ordered[:150]
-        max_workers = 24
+        test_candidates = ordered[:60]
+        max_workers = 8
 
         def _test_one(node: dict[str, Any]) -> dict[str, Any] | None:
             proxy_url = _node_to_proxy_url(node)
@@ -905,7 +903,8 @@ def start_background_refresh(
     def _loop() -> None:
         # Run an immediate refresh on startup to populate the cache.
         try:
-            load_bridge_nodes(
+            start = time.time()
+            loaded = load_bridge_nodes(
                 manual_urls=manual_urls,
                 subscription_urls=subscription_urls,
                 test_reachability=True,
@@ -914,12 +913,14 @@ def start_background_refresh(
                 enable_speed_test=enable_speed_test,
                 top_n=top_n,
             )
-        except Exception:
-            pass
+            print(f"bridge-refresh: initial load {len(loaded)} nodes in {time.time() - start:.0f}s", flush=True)
+        except Exception as error:
+            print(f"bridge-refresh: initial load failed: {type(error).__name__}: {error}", flush=True)
         while True:
             time.sleep(interval)
             try:
-                load_bridge_nodes(
+                start = time.time()
+                loaded = load_bridge_nodes(
                     manual_urls=manual_urls,
                     subscription_urls=subscription_urls,
                     test_reachability=True,
@@ -928,8 +929,9 @@ def start_background_refresh(
                     enable_speed_test=enable_speed_test,
                     top_n=top_n,
                 )
-            except Exception:
-                pass
+                print(f"bridge-refresh: refreshed {len(loaded)} nodes in {time.time() - start:.0f}s", flush=True)
+            except Exception as error:
+                print(f"bridge-refresh: cycle failed: {type(error).__name__}: {error}", flush=True)
 
     thread = threading.Thread(target=_loop, daemon=True, name="bridge-refresh")
     thread.start()
