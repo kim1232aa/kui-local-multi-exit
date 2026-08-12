@@ -25,6 +25,25 @@ class LocalStoreTest(unittest.TestCase):
         self.assertEqual([f"tun{i}" for i in range(24)], [slot.tunnel_name for slot in slots])
         self.assertEqual(list(range(200, 224)), [slot.route_table for slot in slots])
 
+    def test_initialize_creates_only_requested_slots_and_never_removes_existing_slots(self):
+        limited_path = Path(self.tempdir.name) / "limited.db"
+        limited = LocalStore(limited_path)
+
+        limited.initialize(slot_count=2)
+        self.assertEqual(["exit-01", "exit-02"], [slot.id for slot in limited.list_slots()])
+
+        limited.initialize(slot_count=4)
+        self.assertEqual([f"exit-{index:02d}" for index in range(1, 5)], [slot.id for slot in limited.list_slots()])
+
+        limited.initialize(slot_count=2)
+        self.assertEqual([f"exit-{index:02d}" for index in range(1, 5)], [slot.id for slot in limited.list_slots()])
+
+    def test_initialize_rejects_invalid_slot_count(self):
+        with self.assertRaisesRegex(ValueError, "slot_count"):
+            self.store.initialize(slot_count=0)
+        with self.assertRaisesRegex(ValueError, "slot_count"):
+            self.store.initialize(slot_count=25)
+
     def test_updates_one_slot_without_changing_other_slots(self):
         before = self.store.get_slot("exit-02")
 

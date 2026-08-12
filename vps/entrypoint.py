@@ -7,8 +7,10 @@ from pathlib import Path
 
 from .bridge_nodes import start_background_refresh
 from .exit_manager import ExitManager
+from .internal_proxy import load_or_create_internal_proxy_credentials
 from .local_api import LocalAPIServer
-from .proxy_server import set_credentials
+from .proxy_server import configure_connection_limit, set_additional_credentials, set_credentials
+from .runtime_profile import resolve_runtime_profile
 from .store import LocalStore
 
 
@@ -59,17 +61,23 @@ def build_application() -> Application:
     management_port = int(os.environ.get("KUI_MANAGEMENT_PORT", "8080"))
     management_user = os.environ.get("KUI_MANAGEMENT_USER", "admin")
     management_password = os.environ.get("KUI_MANAGEMENT_PASSWORD", "")
-    proxy_user = management_user
-    proxy_password = management_password
-
+    profile = resolve_runtime_profile()
     store = LocalStore(database)
-    store.initialize()
+    store.initialize(slot_count=profile.slot_count)
     workspace.mkdir(parents=True, exist_ok=True)
     auth_file = workspace / "auth.txt"
     auth_file.write_text("vpn\nvpn\n", encoding="utf-8")
     auth_file.chmod(0o600)
-    set_credentials(proxy_user, proxy_password)
-    manager = ExitManager(store, workspace=workspace)
+    internal_proxy_user, internal_proxy_password = load_or_create_internal_proxy_credentials(workspace)
+    set_credentials(internal_proxy_user, internal_proxy_password)
+    set_additional_credentials([(management_user, management_password)])
+    configure_connection_limit(profile.max_connections)
+    manager = ExitManager(
+        store,
+        workspace=workspace,
+        slot_count=profile.slot_count,
+        dial_workers=profile.dial_workers,
+    )
 
     manual_urls = [u.strip() for u in (os.environ.get("KUI_BRIDGE_NODES", "") or "").split(",") if u.strip()]
     subscription_urls = [u.strip() for u in (os.environ.get("KUI_BRIDGE_SUB_URLS", "") or "").split(",") if u.strip()]
@@ -83,6 +91,7 @@ def build_application() -> Application:
             subscription_urls=subscription_urls,
             enable_speed_test=enable_speed_test,
             top_n=top_n,
+            max_workers=profile.dial_workers,
         )
 
     server = LocalAPIServer(

@@ -363,9 +363,11 @@
                 </div>
                 <div class="flex flex-wrap justify-center lg:justify-end items-center gap-2 w-full lg:w-auto">
                     <span class="text-[10px] md:text-xs font-bold text-emerald-600 bg-emerald-100/50 px-3 py-2 rounded-full border border-emerald-200">本地模式状态 · 轮询监控中</span>
-                    <button v-if="role === 'admin'" @click="copyCommand(generateSubLink('', ''), '全量普通订阅已复制！')" class="bg-gradient-to-r from-indigo-500 to-purple-500 text-white px-4 py-2 rounded-full text-xs font-bold shadow-md hover:scale-105 active:scale-95 transition-all">🔗 普通订阅</button>
-                    <button v-if="role === 'admin'" @click="copyCommand(generateSubLink('', 'clash'), '全量Clash订阅已复制！')" class="bg-gradient-to-r from-orange-500 to-red-500 text-white px-4 py-2 rounded-full text-xs font-bold shadow-md hover:scale-105 active:scale-95 transition-all">🔗 Clash订阅</button>
-                    <button v-if="role === 'admin'" @click="showQrCode(generateSubLink('', ''))" class="bg-gradient-to-r from-blue-500 to-cyan-500 text-white px-4 py-2 rounded-full text-xs font-bold shadow-md hover:scale-105 active:scale-95 transition-all">📱 二维码</button>
+                    <button v-if="role === 'admin'" :disabled="!subscriptionLinkReady" @click="copyCommand(generateSubLink('', ''), '全量普通订阅已复制！')" class="bg-gradient-to-r from-indigo-500 to-purple-500 text-white px-4 py-2 rounded-full text-xs font-bold shadow-md hover:scale-105 active:scale-95 transition-all disabled:opacity-50 disabled:cursor-not-allowed">🔗 普通订阅</button>
+                    <button v-if="role === 'admin'" :disabled="!subscriptionLinkReady" @click="copyCommand(generateSubLink('', 'clash'), '全量Clash订阅已复制！')" class="bg-gradient-to-r from-orange-500 to-red-500 text-white px-4 py-2 rounded-full text-xs font-bold shadow-md hover:scale-105 active:scale-95 transition-all disabled:opacity-50 disabled:cursor-not-allowed">🔗 Clash订阅</button>
+                    <button v-if="role === 'admin'" :disabled="!subscriptionLinkReady" @click="copyCommand(generateSubLink('', 'sing-box'), '全量Sing-Box订阅已复制！')" class="bg-gradient-to-r from-teal-500 to-emerald-500 text-white px-4 py-2 rounded-full text-xs font-bold shadow-md hover:scale-105 active:scale-95 transition-all disabled:opacity-50 disabled:cursor-not-allowed">🔗 Sing-Box</button>
+                    <button v-if="role === 'admin'" :disabled="!subscriptionLinkReady" @click="copyCommand(generateSubLink('', 'shadowrocket'), '全量Shadowrocket订阅已复制！')" class="bg-gradient-to-r from-purple-500 to-pink-500 text-white px-4 py-2 rounded-full text-xs font-bold shadow-md hover:scale-105 active:scale-95 transition-all disabled:opacity-50 disabled:cursor-not-allowed">🔗 Shadowrocket</button>
+                    <button v-if="role === 'admin'" :disabled="!subscriptionLinkReady" @click="showQrCode(generateSubLink('', ''))" class="bg-gradient-to-r from-blue-500 to-cyan-500 text-white px-4 py-2 rounded-full text-xs font-bold shadow-md hover:scale-105 active:scale-95 transition-all disabled:opacity-50 disabled:cursor-not-allowed">📱 二维码</button>
                     <button @click="refreshData" class="bg-white/50 hover:bg-white/80 border border-slate-200 px-4 py-2 rounded-full text-xs font-medium transition-all shadow-sm">🔄 刷新</button>
                 </div>
             </div>
@@ -721,7 +723,17 @@
                                 </h3>
                                 <p class="text-xs text-slate-500 mt-1">每个槽位独立国家、端口、OpenVPN 隧道和健康状态。</p>
                             </div>
-                            <div id="multi-exit-summary" class="text-xs pc-font-mono text-slate-400">正在读取本地槽位...</div>
+                            <div class="flex items-center gap-2 flex-wrap">
+                                <button onclick="pcRefreshExitSnapshot()" class="px-3 py-1.5 bg-sky-600/80 hover:bg-sky-500 text-white rounded-lg text-xs font-semibold shadow transition flex items-center gap-1.5">
+                                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                                    刷新槽位快照
+                                </button>
+                                <button onclick="pcBatchRedialOfflineSlots()" class="px-3 py-1.5 bg-amber-600/80 hover:bg-amber-500 text-white rounded-lg text-xs font-semibold shadow transition flex items-center gap-1.5">
+                                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                                    批量重拨离线槽位
+                                </button>
+                                <div id="multi-exit-summary" class="text-xs pc-font-mono text-slate-400 ml-2">正在读取本地槽位...</div>
+                            </div>
                         </div>
                         <div id="multi-exit-grid" class="p-4 grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4">
                             <div class="col-span-full py-12 text-center text-slate-500">正在加载 12 个出口槽位...</div>
@@ -776,10 +788,12 @@
                         <div class="w-full bg-slate-100 rounded-full h-3 overflow-hidden shadow-inner mb-4"><div :class="users[0]?.traffic_used >= users[0]?.traffic_limit && users[0]?.traffic_limit > 0 ? 'bg-rose-500' : 'bg-gradient-to-r from-blue-400 to-indigo-500'" class="h-3 transition-all duration-1000 rounded-full" :style="{ width: getTrafficPercent(users[0]?.traffic_used||0, users[0]?.traffic_limit||0) + '%' }"></div></div>
                         <div class="flex justify-between mt-4 pt-4 border-t border-slate-100 text-xs text-slate-500 font-medium"><span>账户状态: <span :class="users[0]?.enable === 1 ? 'text-emerald-500 font-bold bg-emerald-50 px-2 py-1 rounded' : 'text-rose-500 font-bold bg-rose-50 px-2 py-1 rounded'">{{ users[0]?.enable === 1 ? '🟢 正常运行' : '🔴 已被封禁' }}</span></span><span>到期时间: <span class="font-bold text-slate-700">{{ formatDate(users[0]?.expire_time) }}</span></span></div>
                     </div>
-                    <div class="flex flex-col md:flex-row justify-center gap-4 relative z-10">
-                        <button @click="copyCommand(generateSubLink('', ''), '普通订阅链接已复制！')" class="bg-gradient-to-r from-slate-800 to-black text-white font-black py-4 px-8 rounded-full shadow-2xl transition-all transform hover:scale-105 active:scale-95 text-lg">🔗 复制普通订阅</button>
-                        <button @click="copyCommand(generateSubLink('', 'clash'), 'Clash订阅链接已复制！')" class="bg-gradient-to-r from-orange-500 to-red-500 text-white font-black py-4 px-8 rounded-full shadow-2xl transition-all transform hover:scale-105 active:scale-95 text-lg">🔗 复制Clash订阅</button>
-                        <button @click="showQrCode(generateSubLink('', ''))" class="bg-gradient-to-r from-blue-500 to-cyan-500 text-white font-black py-4 px-8 rounded-full shadow-2xl transition-all transform hover:scale-105 active:scale-95 text-lg">📱 显示二维码</button>
+                    <div class="flex flex-col md:flex-row flex-wrap justify-center gap-3 relative z-10">
+                        <button :disabled="!subscriptionLinkReady" @click="copyCommand(generateSubLink('', ''), '普通订阅链接已复制！')" class="bg-gradient-to-r from-slate-800 to-black text-white font-black py-3 px-6 rounded-full shadow-2xl transition-all transform hover:scale-105 active:scale-95 text-base disabled:opacity-50 disabled:cursor-not-allowed">🔗 复制普通订阅</button>
+                        <button :disabled="!subscriptionLinkReady" @click="copyCommand(generateSubLink('', 'clash'), 'Clash订阅链接已复制！')" class="bg-gradient-to-r from-orange-500 to-red-500 text-white font-black py-3 px-6 rounded-full shadow-2xl transition-all transform hover:scale-105 active:scale-95 text-base disabled:opacity-50 disabled:cursor-not-allowed">🔗 复制Clash订阅</button>
+                        <button :disabled="!subscriptionLinkReady" @click="copyCommand(generateSubLink('', 'sing-box'), 'Sing-Box订阅链接已复制！')" class="bg-gradient-to-r from-teal-500 to-emerald-500 text-white font-black py-3 px-6 rounded-full shadow-2xl transition-all transform hover:scale-105 active:scale-95 text-base disabled:opacity-50 disabled:cursor-not-allowed">🔗 复制Sing-Box</button>
+                        <button :disabled="!subscriptionLinkReady" @click="copyCommand(generateSubLink('', 'shadowrocket'), 'Shadowrocket订阅链接已复制！')" class="bg-gradient-to-r from-purple-500 to-pink-500 text-white font-black py-3 px-6 rounded-full shadow-2xl transition-all transform hover:scale-105 active:scale-95 text-base disabled:opacity-50 disabled:cursor-not-allowed">🔗 复制Shadowrocket</button>
+                        <button :disabled="!subscriptionLinkReady" @click="showQrCode(generateSubLink('', ''))" class="bg-gradient-to-r from-blue-500 to-cyan-500 text-white font-black py-3 px-6 rounded-full shadow-2xl transition-all transform hover:scale-105 active:scale-95 text-base disabled:opacity-50 disabled:cursor-not-allowed">📱 显示二维码</button>
                     </div>
                 </div>
                 <div>
@@ -997,14 +1011,23 @@
         </div>
 
         <div v-if="qrModalOpen" class="fixed inset-0 z-[300] bg-black/50 backdrop-blur-sm flex items-center justify-center p-4" @click.self="qrModalOpen = false">
-            <div class="bg-white rounded-3xl p-8 shadow-2xl w-full max-w-sm relative text-center">
+            <div class="bg-white rounded-3xl p-8 shadow-2xl w-full max-w-md relative text-center">
                 <button @click="qrModalOpen = false" class="absolute top-4 right-5 text-2xl text-slate-400 hover:text-slate-600">&times;</button>
-                <h3 class="text-xl font-black text-slate-800 mb-2">订阅二维码</h3>
-                <p class="text-xs text-slate-500 mb-6">请使用客户端扫描 (暂仅支持普通订阅解析)</p>
-                <div class="flex justify-center bg-slate-50 p-4 rounded-2xl border border-slate-100">
+                <h3 class="text-xl font-black text-slate-800 mb-1">订阅二维码</h3>
+                <p class="text-xs text-slate-500 mb-4">使用代理客户端扫描二维码订阅节点</p>
+                <div class="flex items-center justify-center gap-1.5 mb-5 bg-slate-100 p-1.5 rounded-2xl border border-slate-200 text-xs font-bold">
+                    <button @click="setQrFormat('')" :class="qrFormat === '' ? 'bg-sky-600 text-white shadow-md' : 'text-slate-600 hover:text-slate-900'" class="px-3 py-1.5 rounded-xl transition-all">普通</button>
+                    <button @click="setQrFormat('clash')" :class="qrFormat === 'clash' ? 'bg-orange-500 text-white shadow-md' : 'text-slate-600 hover:text-slate-900'" class="px-3 py-1.5 rounded-xl transition-all">Clash</button>
+                    <button @click="setQrFormat('sing-box')" :class="qrFormat === 'sing-box' ? 'bg-teal-600 text-white shadow-md' : 'text-slate-600 hover:text-slate-900'" class="px-3 py-1.5 rounded-xl transition-all">Sing-Box</button>
+                    <button @click="setQrFormat('shadowrocket')" :class="qrFormat === 'shadowrocket' ? 'bg-purple-600 text-white shadow-md' : 'text-slate-600 hover:text-slate-900'" class="px-3 py-1.5 rounded-xl transition-all">Shadowrocket</button>
+                </div>
+                <div class="flex justify-center bg-slate-50 p-4 rounded-2xl border border-slate-100 mb-5">
                     <img :src="qrCodeImage" alt="QR Code" class="w-48 h-48 object-contain rounded-xl">
                 </div>
-                <button @click="qrModalOpen = false" class="mt-6 w-full bg-slate-800 text-white px-4 py-3 rounded-xl font-bold hover:bg-black transition-all">关 闭</button>
+                <div class="flex gap-2">
+                    <button @click="copyCommand(qrCurrentLink, '订阅链接已复制！')" class="flex-1 bg-sky-600 text-white px-4 py-3 rounded-xl font-bold hover:bg-sky-700 transition-all shadow-md text-xs">复制当前链接</button>
+                    <button @click="qrModalOpen = false" class="bg-slate-800 text-white px-5 py-3 rounded-xl font-bold hover:bg-black transition-all text-xs">关 闭</button>
+                </div>
             </div>
         </div>
 
@@ -1024,6 +1047,36 @@
         const signedAuthHeader = async (keyHex, username, method, path) => { const timestamp = Date.now().toString(); const nonce = crypto.randomUUID(); const signature = await generateHMAC(keyHex, `${username}\n${timestamp}\n${nonce}\n${method}\n${new URL(path, location.origin).pathname}`); return `${btoa(username)}.${timestamp}.${nonce}.${signature}`; };
         const toBase64Url = (uint8Array) => { let str = ''; for (let i = 0; i < uint8Array.length; i++) str += String.fromCharCode(uint8Array[i]); return btoa(str).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, ''); };
         const generateRealityKeys = () => { const keypair = nacl.box.keyPair(); return { privateKey: toBase64Url(keypair.secretKey), publicKey: toBase64Url(keypair.publicKey), shortId: crypto.randomUUID().replace(/-/g, '').substring(0, 16) }; };
+        const copyTextWithFallback = async (text) => {
+            const value = String(text ?? '');
+            if (!value) throw new Error('没有可复制的内容');
+            if (navigator.clipboard?.writeText) {
+                try {
+                    await navigator.clipboard.writeText(value);
+                    return;
+                } catch (error) {
+                    console.warn('[clipboard] Clipboard API failed; trying fallback', error);
+                }
+            }
+            const textarea = document.createElement('textarea');
+            textarea.value = value;
+            textarea.setAttribute('readonly', '');
+            textarea.setAttribute('aria-hidden', 'true');
+            textarea.style.position = 'fixed';
+            textarea.style.top = '-9999px';
+            textarea.style.opacity = '0';
+            document.body.appendChild(textarea);
+            textarea.select();
+            textarea.setSelectionRange(0, value.length);
+            let copied = false;
+            try {
+                copied = document.execCommand('copy');
+            } finally {
+                textarea.remove();
+            }
+            if (!copied) throw new Error('浏览器不允许复制，请手动复制');
+        };
+        window.kuiCopyText = copyTextWithFallback;
 
         const iso2To3 = {"US":"USA","CN":"CHN","JP":"JPN","HK":"HKG","SG":"SGP","KR":"KOR","DE":"DEU","GB":"GBR","NL":"NLD","FR":"FRA","CA":"CAN","AU":"AUS","IN":"IND","BR":"BRA","RU":"RUS","ZA":"ZAF","TW":"TWN","IT":"ITA","SE":"SWE","CH":"CHE","ES":"ESP","PL":"POL","FI":"FIN","NO":"NOR","DK":"DNK","IE":"IRL","AT":"AUT","TR":"TUR","AE":"ARE","MY":"MYS","TH":"THA","VN":"VNM","PH":"PHL","ID":"IDN"};
         const countryCoords = {'US': [37.09, -95.71], 'CN': [35.86, 104.19], 'JP': [36.20, 138.25], 'HK': [22.31, 114.16], 'SG': [1.35, 103.81], 'KR': [35.90, 127.76], 'DE': [51.16, 10.45], 'GB': [55.37, -3.43], 'NL': [52.13, 5.29], 'FR': [46.22, 2.21], 'CA': [56.13, -106.34], 'AU': [-25.27, 133.77], 'IN': [20.59, 78.96], 'BR': [-14.23, -51.92], 'RU': [61.52, 105.31], 'ZA': [-30.55, 22.93], 'TW': [23.69, 120.96], 'IT': [41.87, 12.56], 'SE': [60.12, 18.64], 'CH': [46.81, 8.22], 'ES': [40.46, -3.74], 'PL': [51.91, 19.14], 'FI': [61.92, 25.74], 'NO': [60.47, 8.46], 'DK': [56.26, 9.50], 'IE': [53.14, -7.69], 'AT': [47.51, 14.55], 'TR': [38.96, 35.24], 'AE': [23.42, 53.84], 'MY': [4.21, 101.97], 'TH': [15.87, 100.99], 'VN': [14.05, 108.27], 'PH': [12.87, 121.77], 'ID': [-0.78, 113.92]};
@@ -1037,6 +1090,13 @@
                 const servers = ref([]); const nodes = ref([]); const users = ref([]);
                 const newVps = ref({ name: '', ip: '', os: 'debian' }); const newNodeParams = reactive({}); const newUser = reactive({ username: '', password: '', traffic_limit_gb: '', expire_date: '' });
                 const mySubToken = ref(''); const siteTitle = ref(''); const siteTitleInput = ref(''); const userNewPassword = ref('');
+                const subscriptionUsername = computed(() => {
+                    const token = String(mySubToken.value || '');
+                    if (!token) return '';
+                    const owner = users.value.find(user => String(user.sub_token || '') === token);
+                    return String(owner?.username || '').trim();
+                });
+                const subscriptionLinkReady = computed(() => Boolean(mySubToken.value && subscriptionUsername.value));
                 const batchStartPort = reactive({}); const batchUser = reactive({});
                 const thirdPartySubscriptions = ref([]); const newThirdParty = reactive({ name: '', url: '' }); const loadingThirdParty = ref(false);
 
@@ -1373,7 +1433,7 @@ body.theme11 #app, body.theme13 #app, body.theme14 #app, body.theme15 #app, body
                         const res = await fetchApi('/api/data'); const data = await res.json();
                         servers.value = data.servers || []; nodes.value = data.nodes || []; users.value = data.users || [];
                         if (data.siteTitle) { siteTitle.value = data.siteTitle; siteTitleInput.value = data.siteTitle; }
-                        if (data.mySubToken) mySubToken.value = data.mySubToken;
+                        mySubToken.value = String(data.mySubToken || '').trim();
                         servers.value.forEach(s => { 
                             if(!newNodeParams[s.ip]) newNodeParams[s.ip] = { protocol: 'XTLS-Reality', port: 443, username: 'admin', sni: '', relay_type: 'external', target_ip: '', target_port: '', target_id: '', traffic_limit_gb: '', expire_date: '' };
                             if(!deployOsMap[s.ip]) deployOsMap[s.ip] = 'debian'; if(!batchStartPort[s.ip]) batchStartPort[s.ip] = ''; if(!batchUser[s.ip]) batchUser[s.ip] = 'admin';
@@ -1512,22 +1572,91 @@ body.theme11 #app, body.theme13 #app, body.theme14 #app, body.theme15 #app, body
 
                 const saveSiteTitle = async () => { if(!siteTitleInput.value) return alert('名称不能为空！'); await fetchApi('/api/settings', { method: 'POST', body: JSON.stringify({ site_title: siteTitleInput.value }) }); siteTitle.value = siteTitleInput.value; alert('✅ KUI 聚合面板名称保存成功！'); };
                 const updateUserPassword = async () => { if(!userNewPassword.value) return alert('请输入新密码'); await fetchApi('/api/user/password', { method: 'PUT', body: JSON.stringify({ password: userNewPassword.value }) }); userNewPassword.value = ''; alert('✅ SOCKS5 代理凭据已更新；管理页面仍免登录。'); };
-                const resetMySubLink = async () => { if(confirm('🚨 危险操作！重置后系统将为您签发全新的 UUID 订阅令牌，原链接将【立即作废】！确定要继续重置吗？')) { await fetchApi('/api/user/sub_token', { method: 'PUT' }); alert('✅ 订阅令牌已刷新！'); refreshData(); } };
-                
-                const generateSubLink = (ip='', format='') => {
-                    let link = `${currentDomain}/api/sub?user=admin&token=${encodeURIComponent(mySubToken.value)}`;
-                    if (ip) link += `&ip=${ip}`;
-                    if (format) link += `&format=${format}`;
-                    return link;
+                const resetMySubLink = async () => {
+                    if (!confirm('🚨 危险操作！重置后系统将为您签发全新的 UUID 订阅令牌，原链接将【立即作废】！确定要继续重置吗？')) return;
+                    try {
+                        const res = await fetchApi('/api/user/sub_token', { method: 'PUT' });
+                        const data = await res.json();
+                        mySubToken.value = String(data.sub_token || '').trim();
+                        await refreshData();
+                        alert('✅ 订阅令牌已刷新！');
+                    } catch (error) {
+                        alert(`订阅令牌刷新失败：${error.message || error}`);
+                    }
                 };
                 
-                const copyCommand = (txt, msg) => navigator.clipboard.writeText(txt).then(() => alert(msg));
-
-                const showQrCode = (text) => {
+                const generateSubLink = (ip='', format='') => {
+                    const username = subscriptionUsername.value;
+                    const token = String(mySubToken.value || '').trim();
+                    if (!username || !token) return '';
+                    const params = new URLSearchParams({ user: username, token });
+                    if (ip) params.set('ip', ip);
+                    if (format) params.set('format', format);
+                    return `${currentDomain}/api/sub?${params.toString()}`;
+                };
+                
+                const copyCommand = async (txt, msg) => {
+                    const value = String(txt ?? '');
+                    if (!value.trim()) {
+                        alert('订阅链接暂不可用：订阅令牌尚未加载，请稍后刷新页面后再试。');
+                        return false;
+                    }
                     try {
-                        const qr = new QRious({ value: text, size: 300, level: 'L', background: '#ffffff', foreground: '#1e293b' });
-                        qrCodeImage.value = qr.toDataURL(); qrModalOpen.value = true;
-                    } catch (err) { alert('生成二维码失败！请检查链接长度或浏览器控制台。'); }
+                        await window.kuiCopyText(value);
+                        alert(msg);
+                        return true;
+                    } catch (error) {
+                        alert(`复制失败：${error.message || '请手动复制链接'}`);
+                        return false;
+                    }
+                };
+
+                const qrFormat = ref('');
+                const qrCurrentLink = ref('');
+                const qrTargetIp = ref('');
+
+                const showQrCode = (text, format='', ip='') => {
+                    if (!subscriptionLinkReady.value) {
+                        alert('二维码暂不可用：订阅令牌尚未加载，请稍后刷新页面后再试。');
+                        return false;
+                    }
+                    const targetLink = text || generateSubLink(ip, format);
+                    if (!targetLink) {
+                        alert('二维码暂不可用：订阅链接尚未生成，请稍后再试。');
+                        return false;
+                    }
+                    try {
+                        qrTargetIp.value = ip;
+                        qrFormat.value = format;
+                        qrCurrentLink.value = targetLink;
+                        const qr = new QRious({ value: targetLink, size: 300, level: 'L', background: '#ffffff', foreground: '#1e293b' });
+                        qrCodeImage.value = qr.toDataURL();
+                        qrModalOpen.value = true;
+                        return true;
+                    } catch (err) {
+                        alert('生成二维码失败！请检查链接长度或浏览器控制台。');
+                        return false;
+                    }
+                };
+
+                const setQrFormat = (fmt) => {
+                    const link = generateSubLink(qrTargetIp.value, fmt);
+                    if (!link) {
+                        qrModalOpen.value = false;
+                        qrCurrentLink.value = '';
+                        alert('二维码暂不可用：订阅令牌尚未加载，请稍后刷新页面后再试。');
+                        return false;
+                    }
+                    qrFormat.value = fmt;
+                    qrCurrentLink.value = link;
+                    try {
+                        const qr = new QRious({ value: link, size: 300, level: 'L', background: '#ffffff', foreground: '#1e293b' });
+                        qrCodeImage.value = qr.toDataURL();
+                        return true;
+                    } catch (err) {
+                        alert('生成二维码失败！');
+                        return false;
+                    }
                 };
 
                 const realmState = reactive({ listen: '', remote: '', use_udp: false, available: false, running: false, state: 'unknown', error: '', binary: '' });
@@ -1680,13 +1809,13 @@ body.theme11 #app, body.theme13 #app, body.theme14 #app, body.theme15 #app, body
                     role, activeTab,
                     servers, nodes, users, newVps, newNodeParams, newUser,
                     refreshData, addUser, toggleUser, deleteUser, resetUserTraffic, addVps, deleteVps, addNode, deleteNode, toggleNode, resetTraffic,
-                    getNodesByIp, getVpsName, formatBytes, formatDate, getExpireText, getTrafficPercent, getPingColor, isOnline, generateCmd, generateSubLink, copyCommand,
+                    getNodesByIp, getVpsName, formatBytes, formatDate, getExpireText, getTrafficPercent, getPingColor, isOnline, generateCmd, generateSubLink, copyCommand, subscriptionUsername, subscriptionLinkReady,
                     globalOnline, globalTraffic, globalSpeedIn, globalSpeedOut, deployOsMap, saveOsMap, deployCommand, loadDeployCommand, siteTitle, siteTitleInput, saveSiteTitle, userNewPassword, updateUserPassword, resetMySubLink, generateUUIDForNewUser, batchStartPort, batchUser, deployAllProtocols,
                     probeSys, publicProbeServers, filteredProbeServers, probeView, probeDetailId, probeDetail, setProbeView, openProbeDetail, probeGlobalOnline, probeGlobalOffline, probeGlobalSpeedIn, probeGlobalSpeedOut, probeGlobalNetRx, probeGlobalNetTx, filteredProbeGroups, probeCountryStats, currentFilter,
                     saveProbeSettings, saveSubscriptionProtection, adminProbeServers, probeEditModalOpen, editingProbeNode, openProbeEditModal, saveProbeEdit, deleteProbeNode, currentDomain,
                     realmState, loadRealmStatus, saveRealmConfig, startRealm, stopRealm, restartRealm,
                     thirdPartySubscriptions, newThirdParty, loadingThirdParty, loadThirdPartySubscriptions, addThirdPartySubscription, toggleThirdPartySubscription, deleteThirdPartySubscription,
-                    qrModalOpen, qrCodeImage, showQrCode,
+                    qrModalOpen, qrCodeImage, showQrCode, qrFormat, qrCurrentLink, setQrFormat,
                     showWelcomePopup, closePopup,
                     availableThemes, pingNodes, pullGithubNodes, hasCustomCssFlag,
                     proxyConfig, toggleNodeProxy, saveProxyConfig, proxyPool, loadProxyPool, egressModeLabel, updateVpsEgress, egressModeOf, proxyModeOf, proxyCategoriesOf, proxyCategoryOptions, proxyCategoryActive, toggleProxyCategory, setProxyMode, applyProxyCategories, onEgressModeChange,
@@ -1776,11 +1905,22 @@ body.theme11 #app, body.theme13 #app, body.theme14 #app, body.theme15 #app, body
             }).join('');
         }
 
+        async function pcReadJsonResponse(response) {
+            const raw = await response.text();
+            if (!raw) return {};
+            try {
+                return JSON.parse(raw);
+            } catch (error) {
+                return { error: raw.slice(0, 500) };
+            }
+        }
+
         async function pcLoadCandidateNodes(country = 'ANY') {
             const res = await fetch(`/api/local/nodes?country=${encodeURIComponent(country || 'ANY')}`, { cache: 'no-store' });
-            const body = await res.json();
-            if (!res.ok) throw new Error(body.error || res.status);
-            pcCandidateNodes = Array.isArray(body) ? body : [];
+            const body = await pcReadJsonResponse(res);
+            if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+            if (!Array.isArray(body)) throw new Error('候选节点响应格式无效');
+            pcCandidateNodes = body;
             return pcCandidateNodes;
         }
 
@@ -1790,16 +1930,64 @@ body.theme11 #app, body.theme13 #app, body.theme14 #app, body.theme15 #app, body
                     fetch('/api/local/exits', { cache: 'no-store' }),
                     fetch('/api/local/nodes?country=ANY', { cache: 'no-store' }),
                 ]);
-                const body = await slotsRes.json();
-                const candidates = await nodesRes.json();
-                if (!slotsRes.ok) throw new Error(body.error || slotsRes.status);
-                if (!nodesRes.ok) throw new Error(candidates.error || nodesRes.status);
-                pcExitSlots = Array.isArray(body.exits) ? body.exits : [];
-                pcCandidateNodes = Array.isArray(candidates) ? candidates : [];
+                const [body, candidates] = await Promise.all([
+                    pcReadJsonResponse(slotsRes),
+                    pcReadJsonResponse(nodesRes),
+                ]);
+                if (!slotsRes.ok) throw new Error(body.error || `HTTP ${slotsRes.status}`);
+                if (!nodesRes.ok) throw new Error(candidates.error || `HTTP ${nodesRes.status}`);
+                if (!Array.isArray(body.exits)) throw new Error('槽位响应格式无效');
+                if (!Array.isArray(candidates)) throw new Error('候选节点响应格式无效');
+                pcExitSlots = body.exits;
+                pcCandidateNodes = candidates;
                 pcRenderExitSlots();
+                return true;
             } catch (error) {
                 const grid = document.getElementById('multi-exit-grid');
-                if (grid) grid.innerHTML = `<div class="col-span-full rounded-xl border border-rose-500/30 bg-rose-500/10 p-6 text-center text-rose-300">本地多出口 API 不可用：${pcEscapeHtml(error.message)}</div>`;
+                if (grid) grid.innerHTML = `<div class="col-span-full rounded-xl border border-rose-500/30 bg-rose-500/10 p-6 text-center text-rose-300">本地多出口 API 不可用：${pcEscapeHtml(error.message || error)}</div>`;
+                return false;
+            }
+        }
+
+        async function pcRefreshExitSnapshot() {
+            const summary = document.getElementById('multi-exit-summary');
+            if (summary) summary.innerText = '正在刷新槽位快照...';
+            const refreshed = await pcFetchExitSlots();
+            if (!refreshed) {
+                if (summary) summary.innerText = '槽位快照刷新失败';
+                return false;
+            }
+            if (summary) summary.innerText = `槽位快照已刷新（共 ${pcExitSlots.length} 个槽位）`;
+            return true;
+        }
+
+        async function pcBatchRedialOfflineSlots() {
+            if (!await pcFetchExitSlots()) {
+                alert('无法读取槽位快照，未发起批量重拨。');
+                return false;
+            }
+            const offlineSlots = pcExitSlots.filter(slot => slot.enabled && (slot.state !== 'ready' || !slot.listener_ready || slot.last_error));
+            if (offlineSlots.length === 0) {
+                alert('当前没有处于离线/异常状态的启用槽位。');
+                return false;
+            }
+            const summary = document.getElementById('multi-exit-summary');
+            if (summary) summary.innerText = `正在重拨 ${offlineSlots.length} 个离线槽位...`;
+            try {
+                await Promise.all(offlineSlots.map(async slot => {
+                    const res = await fetch(`/api/local/exits/${encodeURIComponent(slot.id)}/redial`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' });
+                    const body = await pcReadJsonResponse(res);
+                    if (!res.ok) throw new Error(`${slot.id}: ${body.error || `HTTP ${res.status}`}`);
+                    if (body.accepted === false) throw new Error(`${slot.id}: 重拨请求未接受`);
+                    return body;
+                }));
+                if (!await pcFetchExitSlots()) throw new Error('批量重拨请求已发送，但槽位快照刷新失败');
+                alert(`已针对 ${offlineSlots.length} 个离线槽位发起批量重拨请求，槽位快照已刷新。`);
+                return true;
+            } catch (error) {
+                alert('批量重拨离线槽位失败: ' + (error.message || error));
+                await pcFetchExitSlots();
+                return false;
             }
         }
 
@@ -2090,7 +2278,7 @@ body.theme11 #app, body.theme13 #app, body.theme14 #app, body.theme15 #app, body
                             scoreLink.href = `https://testisp.info/?ip=${newIp}`;
                             scoreLink.onclick = (e) => {
                                 e.preventDefault();
-                                navigator.clipboard.writeText(newIp).then(() => {
+                                window.kuiCopyText(newIp).then(() => {
                                     alert('🟢 已自动复制隧道节点 IP: ' + newIp + '\n\n由于 testisp.info 官网默认仅检测本机，请在随后打开的网页【输入框】中【粘贴】并回车查询！');
                                     window.open(`https://testisp.info/?ip=${newIp}`, '_blank');
                                 }).catch(() => {

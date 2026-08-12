@@ -4,15 +4,17 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl iproute2 openvpn \
     && rm -rf /var/lib/apt/lists/*
 
-# Install sing-box for bridge-node reachability testing inside the container.
+# Install the matching sing-box release for bridge checks and Reality.
+ARG TARGETARCH
 ARG SING_BOX_VERSION=1.13.14
-RUN curl -fsSL -o /tmp/sing-box.tar.gz \
-        "https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/sing-box-${SING_BOX_VERSION}-linux-amd64.tar.gz" \
+RUN case "$TARGETARCH" in amd64|arm64) ;; *) echo "unsupported architecture: $TARGETARCH" >&2; exit 1 ;; esac \
+    && curl -fsSL -o /tmp/sing-box.tar.gz \
+        "https://github.com/SagerNet/sing-box/releases/download/v${SING_BOX_VERSION}/sing-box-${SING_BOX_VERSION}-linux-${TARGETARCH}.tar.gz" \
     && tar -xzf /tmp/sing-box.tar.gz -C /tmp \
-    && mv /tmp/sing-box-${SING_BOX_VERSION}-linux-amd64/sing-box /usr/local/bin/sing-box \
+    && mv "/tmp/sing-box-${SING_BOX_VERSION}-linux-${TARGETARCH}/sing-box" /usr/local/bin/sing-box \
     && chmod +x /usr/local/bin/sing-box \
     && ln -sf /usr/local/bin/sing-box /usr/local/bin/kui-sing-box \
-    && rm -rf /tmp/sing-box.tar.gz /tmp/sing-box-${SING_BOX_VERSION}-linux-amd64
+    && rm -rf /tmp/sing-box.tar.gz "/tmp/sing-box-${SING_BOX_VERSION}-linux-${TARGETARCH}"
 
 WORKDIR /app
 COPY vps /app/vps
@@ -27,7 +29,7 @@ ENV PYTHONUNBUFFERED=1 \
     KUI_MANAGEMENT_PORT=8080
 
 VOLUME ["/opt/kui-local"]
-EXPOSE 8080 7920-7931
+EXPOSE 8080 8443
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8080/healthz || exit 1
 

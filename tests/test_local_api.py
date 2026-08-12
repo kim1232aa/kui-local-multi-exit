@@ -1,5 +1,6 @@
 import base64
 import json
+import re
 import tempfile
 import threading
 import unittest
@@ -59,6 +60,9 @@ class FakeManager:
 
     def stop_slot(self, slot_id):
         self.actions.append(("stop", slot_id))
+
+    def is_managed_slot(self, slot_id):
+        return any(slot.id == slot_id for slot in self.store.list_slots())
 
     def list_nodes(self, country="ANY"):
         return []
@@ -136,6 +140,12 @@ class LocalAPITest(unittest.TestCase):
             finally:
                 error.close()
 
+    def request_text_with_content_type(self, path, *, authenticated=True):
+        headers = dict(self.auth) if authenticated else {}
+        request = urllib.request.Request(self.base + path, headers=headers)
+        with urllib.request.urlopen(request, timeout=3) as response:
+            return response.status, response.headers.get_content_type(), response.read().decode("utf-8")
+
     def test_management_api_accessible_without_login_in_local_mode(self):
         status, body = self.request("/api/local/exits", authenticated=False)
 
@@ -204,10 +214,31 @@ class LocalAPITest(unittest.TestCase):
         self.assertIn("K-UI Local", body)
 
     def test_lists_all_exit_slots(self):
+        self.store.set_runtime(
+            "exit-01",
+            state="ready",
+            egress_ip="203.0.113.1",
+            check_result={
+                "residential": {
+                    "status": "checked",
+                    "egress_type": "datacenter",
+                    "egress_type_label": "机房IP",
+                    "is_residential": False,
+                }
+            },
+        )
         status, body = self.request("/api/local/exits")
 
         self.assertEqual(200, status)
         self.assertEqual(24, len(body["exits"]))
+        slot = next(item for item in body["exits"] if item["id"] == "exit-01")
+        self.assertEqual("datacenter", slot["egress_type"])
+        self.assertEqual("机房IP", slot["egress_type_label"])
+
+        status, status_body = self.request("/api/local/status")
+        self.assertEqual(200, status)
+        status_slot = next(item for item in status_body["exits"] if item["id"] == "exit-01")
+        self.assertEqual("机房IP", status_slot["egress_type_label"])
 
     def test_kui_data_endpoint_returns_local_dashboard_shape(self):
         status, body = self.request("/api/data")
@@ -400,6 +431,15 @@ class LocalAPITest(unittest.TestCase):
 
         self.assertEqual(400, status)
         self.assertEqual("invalid_request", body["code"])
+
+    def test_inactive_runtime_slot_returns_not_found(self):
+        self.manager.is_managed_slot = lambda slot_id: slot_id in {"exit-01", "exit-02"}
+
+        status, body = self.request("/api/local/exits/exit-03/redial", method="POST", body={})
+
+        self.assertEqual(404, status)
+        self.assertEqual("not_found", body["code"])
+        self.assertEqual([], self.manager.actions)
 
     def test_redial_and_enable_actions(self):
         redial_status, _ = self.request("/api/local/exits/exit-02/redial", method="POST", body={})
@@ -683,7 +723,7 @@ class LocalAPITest(unittest.TestCase):
         status, data = self.request("/api/data")
         self.assertEqual(200, status)
         token = data["mySubToken"]
-        status, encoded = self.request(f"/api/sub?user=admin&token={token}", expect_json=False)
+        status, encoded = self.request(f"/api/sub?user={data['mySubUser']}&token={token}", expect_json=False)
         self.assertEqual(200, status)
         links = base64.b64decode(encoded).decode()
         self.assertIn("vless://11111111-1111-1111-1111-111111111111@vpn.example.com:443", links)
@@ -696,7 +736,7 @@ class LocalAPITest(unittest.TestCase):
             body={"id": listed[0]["id"], "enable": False},
         )
         self.assertEqual(200, status)
-        status, encoded = self.request(f"/api/sub?user=admin&token={token}", expect_json=False)
+        status, encoded = self.request(f"/api/sub?user={data['mySubUser']}&token={token}", expect_json=False)
         self.assertEqual(200, status)
         links = base64.b64decode(encoded).decode()
         self.assertNotIn("vpn.example.com", links)
@@ -707,19 +747,33 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(200, status)
         token = data["mySubToken"]
 
-        status, encoded = self.request(f"/api/sub?user=admin&token={token}", expect_json=False)
+        status, encoded = self.request(f"/api/sub?user={data['mySubUser']}&token={token}", expect_json=False)
 
         self.assertEqual(200, status)
         links = base64.b64decode(encoded).decode().splitlines()
         self.assertEqual(1, len(links))
         self.assertTrue(links[0].startswith("socks5://admin:secret@127.0.0.1:7920#JP_exit-01_"))
 
+    def test_configured_missing_reality_manifest_does_not_publish_loopback_socks(self):
+        self.manager.set_slot_ready("exit-01")
+        self.server.reality_nodes_file = Path(self.tempdir.name) / "missing-public-nodes.json"
+        status, data = self.request("/api/data")
+        token = data["mySubToken"]
+
+        status, encoded = self.request(
+            f"/api/sub?user={data['mySubUser']}&token={token}",
+            expect_json=False,
+        )
+
+        self.assertEqual(200, status)
+        self.assertEqual("", base64.b64decode(encoded).decode())
+
     def test_subscription_excludes_store_ready_slot_without_listener(self):
         self.manager.set_slot_ready("exit-01", listener_ready=False)
         status, data = self.request("/api/data")
         token = data["mySubToken"]
 
-        status, encoded = self.request(f"/api/sub?user=admin&token={token}", expect_json=False)
+        status, encoded = self.request(f"/api/sub?user={data['mySubUser']}&token={token}", expect_json=False)
 
         self.assertEqual(200, status)
         self.assertEqual("", base64.b64decode(encoded).decode())
@@ -730,13 +784,156 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(200, status)
         token = data["mySubToken"]
 
-        status, body = self.request(f"/api/sub?user=admin&token={token}&format=clash", expect_json=False)
+        status, body = self.request(f"/api/sub?user={data['mySubUser']}&token={token}&format=clash", expect_json=False)
 
         self.assertEqual(200, status)
         self.assertIn("type: socks5", body)
         self.assertIn("server: 127.0.0.1", body)
         self.assertIn("port: 7920", body)
         self.assertIn("exit-01", body)
+
+    def test_subscription_endpoint_formats(self):
+        self.manager.set_slot_ready("exit-01")
+        self.store.set_runtime(
+            "exit-01",
+            state="ready",
+            entry_ip="198.51.100.1",
+            egress_ip="203.0.113.1",
+            current_node={"ip": "203.0.113.1", "country": "CA", "source": "vpngate"},
+        )
+        status, data = self.request("/api/data")
+        self.assertEqual(200, status)
+        self.assertEqual("admin", data["mySubUser"])
+        token = data["mySubToken"]
+        user = data["mySubUser"]
+        token_owner = next(item for item in data["users"] if item["sub_token"] == token)
+        self.assertEqual(user, token_owner["username"])
+
+        # sing-box format
+        status, content_type, body = self.request_text_with_content_type(
+            f"/api/sub?user={user}&token={token}&format=sing-box"
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("application/json", content_type)
+        sb_json = json.loads(body)
+        self.assertIn("outbounds", sb_json)
+        self.assertNotIn("dns", {outbound["type"] for outbound in sb_json["outbounds"]})
+        local_socks = next(outbound for outbound in sb_json["outbounds"] if outbound["type"] == "socks")
+        self.assertEqual("127.0.0.1", local_socks["server"])
+        self.assertEqual(7920, local_socks["server_port"])
+        known_tags = {outbound["tag"] for outbound in sb_json["outbounds"]}
+        for outbound in sb_json["outbounds"]:
+            if outbound["type"] in {"selector", "urltest"}:
+                self.assertTrue(set(outbound["outbounds"]) <= known_tags)
+
+        # v2ray and shadowrocket format
+        for fmt in ["v2ray", "shadowrocket"]:
+            status, content_type, encoded = self.request_text_with_content_type(
+                f"/api/sub?user={user}&token={token}&format={fmt}"
+            )
+            self.assertEqual(200, status)
+            self.assertEqual("text/plain", content_type)
+            links = base64.b64decode(encoded).decode("utf-8").splitlines()
+            self.assertEqual(1, len(links))
+            self.assertTrue(links[0].startswith("socks5://admin:secret@127.0.0.1:7920#"))
+
+        # clash-meta groups use actual egress country and only reference known targets.
+        status, content_type, body = self.request_text_with_content_type(
+            f"/api/sub?user={user}&token={token}&format=clash-meta"
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("text/yaml", content_type)
+        self.assertIn('  - name: "🇨🇦 CA"', body)
+        self.assertNotIn('  - name: "🇯🇵 JP"', body)
+        country_start = body.index('  - name: "🇨🇦 CA"')
+        country_end = body.find("\n  - name:", country_start + 1)
+        country_block = body[country_start:] if country_end < 0 else body[country_start:country_end]
+        self.assertIn('      - "JP_exit-01_ready"', country_block)
+        self.assertIn("proxies:", body)
+
+        proxy_section, group_section = body.split("\nproxy-groups:\n", 1)
+        group_section = group_section.split("\nrules:\n", 1)[0]
+
+        def yaml_name(raw: str) -> str:
+            raw = raw.strip()
+            return json.loads(raw) if raw.startswith('"') else raw
+
+        proxy_names = {
+            yaml_name(match.group(1))
+            for match in re.finditer(r"^  - name: (.+)$", proxy_section, re.MULTILINE)
+        }
+        group_matches = list(re.finditer(r"^  - name: (.+)$", group_section, re.MULTILINE))
+        group_names = {yaml_name(match.group(1)) for match in group_matches}
+        self.assertEqual(len(group_names), len(group_matches))
+        for index, match in enumerate(group_matches):
+            end = group_matches[index + 1].start() if index + 1 < len(group_matches) else len(group_section)
+            group_block = group_section[match.start():end]
+            references = [yaml_name(item) for item in re.findall(r"^      - (.+)$", group_block, re.MULTILINE)]
+            self.assertTrue(set(references) <= proxy_names | group_names | {"DIRECT"})
+
+    def test_subscription_user_parameter_is_not_hardcoded(self):
+        self.server.username = "panel-user"
+        status, data = self.request("/api/data")
+        self.assertEqual(200, status)
+        self.assertEqual("panel-user", data["mySubUser"])
+        token = data["mySubToken"]
+
+        status, _ = self.request(
+            f"/api/sub?user={data['mySubUser']}&token={token}",
+            expect_json=False,
+        )
+        self.assertEqual(200, status)
+        status, body = self.request(
+            f"/api/sub?user=admin&token={token}",
+            expect_json=True,
+        )
+        self.assertEqual(404, status)
+        self.assertEqual("not_found", body["code"])
+
+    def test_subscription_formats_include_enabled_thirdparty_nodes(self):
+        content = "\n".join((
+            "vless://11111111-1111-1111-1111-111111111111@reality.example.com:443"
+            "?encryption=none&security=reality&sni=www.example.com&pbk=public-key&sid=abcd#TP Reality",
+            "socks5://tp-user:tp-pass@socks.example.com:1080#TP SOCKS",
+        ))
+        with patch("vps.local_api.fetch_subscription_text", return_value=content):
+            status, created = self.request(
+                "/api/thirdparty",
+                method="POST",
+                body={"name": "mixed", "url": "https://subscription.example.com/mixed"},
+            )
+        self.assertEqual(200, status)
+        self.assertEqual(2, created["parsedCount"])
+
+        status, data = self.request("/api/data")
+        self.assertEqual(200, status)
+        user = data["mySubUser"]
+        token = data["mySubToken"]
+
+        status, body = self.request(
+            f"/api/sub?user={user}&token={token}&format=sing-box",
+            expect_json=False,
+        )
+        self.assertEqual(200, status)
+        config = json.loads(body)
+        servers = {outbound.get("server") for outbound in config["outbounds"]}
+        self.assertIn("reality.example.com", servers)
+        self.assertIn("socks.example.com", servers)
+        reality = next(outbound for outbound in config["outbounds"] if outbound.get("server") == "reality.example.com")
+        self.assertTrue(reality["tls"]["reality"]["enabled"])
+        socks = next(outbound for outbound in config["outbounds"] if outbound.get("server") == "socks.example.com")
+        self.assertEqual("tp-user", socks["username"])
+        self.assertEqual("tp-pass", socks["password"])
+
+        status, encoded = self.request(
+            f"/api/sub?user={user}&token={token}&format=shadowrocket",
+            expect_json=False,
+        )
+        self.assertEqual(200, status)
+        links = base64.b64decode(encoded).decode("utf-8").splitlines()
+        self.assertEqual(2, len(links))
+        self.assertTrue(any(link.startswith("vless://") for link in links))
+        self.assertTrue(any(link.startswith("socks5://tp-user:tp-pass@socks.example.com:1080#") for link in links))
 
     def test_reality_clash_subscription_uses_actual_country_isp_and_egress_ip(self):
         self.manager.set_slot_ready("exit-03")
@@ -775,10 +972,10 @@ class LocalAPITest(unittest.TestCase):
         status, data = self.request("/api/data")
         token = data["mySubToken"]
 
-        status, body = self.request(f"/api/sub?user=admin&token={token}&format=clash", expect_json=False)
+        status, body = self.request(f"/api/sub?user={data['mySubUser']}&token={token}&format=clash", expect_json=False)
 
         self.assertEqual(200, status)
-        self.assertIn('name: "JP-日本 | KDDI | 203.0.113.30 | exit-03"', body)
+        self.assertIn('name: "JP-日本 | 住宅IP | KDDI | 203.0.113.30 | exit-03"', body)
         self.assertIn("type: vless", body)
         self.assertIn('server: "153.121.38.245"', body)
         self.assertIn("port: 8445", body)
@@ -787,10 +984,10 @@ class LocalAPITest(unittest.TestCase):
         self.assertNotIn("type: socks5", body)
         self.assertNotIn("ANY_exit-03_ready", body)
 
-        status, encoded = self.request(f"/api/sub?user=admin&token={token}", expect_json=False)
+        status, encoded = self.request(f"/api/sub?user={data['mySubUser']}&token={token}", expect_json=False)
         links = base64.b64decode(encoded).decode()
         self.assertIn("vless://11111111-1111-1111-1111-111111111111@153.121.38.245:8445", links)
-        self.assertIn("JP-%E6%97%A5%E6%9C%AC%20%7C%20KDDI%20%7C%20203.0.113.30%20%7C%20exit-03", links)
+        self.assertIn("JP-%E6%97%A5%E6%9C%AC%20%7C%20%E4%BD%8F%E5%AE%85IP%20%7C%20KDDI%20%7C%20203.0.113.30%20%7C%20exit-03", links)
         self.assertNotIn("socks5://", links)
 
     def test_reality_clash_subscription_separates_direct_and_chained_exits(self):
@@ -836,12 +1033,12 @@ class LocalAPITest(unittest.TestCase):
 
         with patch("vps.local_api.load_bridge_nodes", return_value=[bridge]):
             status, body = self.request(
-                f"/api/sub?user=admin&token={token}&format=clash",
+                f"/api/sub?user={data['mySubUser']}&token={token}&format=clash",
                 expect_json=False,
             )
 
         self.assertEqual(200, status)
-        direct_name = "JP-日本 | 203.0.113.1 | exit-01"
+        direct_name = "JP-日本 | 未知IP类型 | 203.0.113.1 | exit-01"
         chain_name = "TR-土耳其 | ProxyScrape | tr-01 | 链式"
         direct_start = body.index(f'  - name: "{direct_name}"')
         chain_start = body.index(f'  - name: "{chain_name}"')
@@ -866,7 +1063,7 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(200, status)
         token = data["mySubToken"]
 
-        status, encoded = self.request(f"/api/sub?user=admin&token={token}", expect_json=False)
+        status, encoded = self.request(f"/api/sub?user={data['mySubUser']}&token={token}", expect_json=False)
 
         self.assertEqual(200, status)
         links = base64.b64decode(encoded).decode()
@@ -1022,12 +1219,12 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual("true", probe["settings"]["is_public"])
         self.assertEqual("Probe Title", probe["settings"]["site_title"])
 
-    @patch("vps.local_api.set_credentials")
-    def test_user_password_change_updates_shared_proxy_credentials(self, set_credentials):
+    @patch("vps.local_api.set_additional_credentials")
+    def test_user_password_change_updates_admin_proxy_without_replacing_gateway_credentials(self, set_additional_credentials):
         status, body = self.request("/api/user/password", method="PUT", body={"password": "newpass123"})
         self.assertEqual(200, status)
         self.assertTrue(body["success"])
-        set_credentials.assert_called_once_with("admin", "newpass123")
+        set_additional_credentials.assert_called_once_with([("admin", "newpass123")])
         stored = self.store.get_user("admin")
         self.assertIsNotNone(stored)
         expected_hash = LocalAPIHandler._hash_password("newpass123")

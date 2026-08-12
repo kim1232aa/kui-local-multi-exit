@@ -41,7 +41,13 @@ class LocalStore:
         finally:
             connection.close()
 
-    def initialize(self) -> None:
+    def initialize(self, slot_count: int = len(DEFAULT_COUNTRIES)) -> None:
+        try:
+            slot_count = int(slot_count)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"slot_count must be between 1 and {len(DEFAULT_COUNTRIES)}") from error
+        if not 1 <= slot_count <= len(DEFAULT_COUNTRIES):
+            raise ValueError(f"slot_count must be between 1 and {len(DEFAULT_COUNTRIES)}")
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self._lock, self._connect() as db:
@@ -242,7 +248,7 @@ class LocalStore:
                     if name not in existing:
                         db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
             now = int(time.time())
-            for index, country in enumerate(DEFAULT_COUNTRIES):
+            for index, country in enumerate(DEFAULT_COUNTRIES[:slot_count]):
                 db.execute(
                     """
                     INSERT OR IGNORE INTO exit_slots

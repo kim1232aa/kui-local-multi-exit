@@ -1,3 +1,4 @@
+import re
 import unittest
 from pathlib import Path
 
@@ -142,6 +143,61 @@ class DashboardContractTest(unittest.TestCase):
         self.assertNotIn("const tags = isHosting\n", self.html)
         self.assertIn("本地模式状态", self.html)
         self.assertIn("每个槽位独立运行一条 OpenVPN 隧道", self.html)
+
+    def test_singbox_shadowrocket_qrcode_and_batch_actions_in_dashboard(self):
+        for marker in (
+            "Sing-Box",
+            "Shadowrocket",
+            "sing-box",
+            "shadowrocket",
+            "setQrFormat",
+            "qrFormat",
+            "pcRefreshExitSnapshot",
+            "pcBatchRedialOfflineSlots",
+            "刷新槽位快照",
+            "批量重拨离线槽位",
+        ):
+            self.assertIn(marker, self.html)
+        for misleading in ("一键检测槽位", "已完成一键检测"):
+            self.assertNotIn(misleading, self.html)
+
+    def test_subscription_links_use_loaded_username_and_token(self):
+        match = re.search(
+            r"const generateSubLink = \(ip='', format=''\) => \{(?P<body>.*?)\n\s*\};",
+            self.html,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        body = match.group("body")
+        self.assertIn("subscriptionUsername.value", body)
+        self.assertIn("new URLSearchParams({ user: username, token })", body)
+        self.assertIn("if (!username || !token) return ''", body)
+        self.assertNotIn("user=admin", body)
+        self.assertIn("subscriptionLinkReady", self.html)
+
+    def test_subscription_copy_has_http_fallback_and_token_gate(self):
+        for marker in (
+            "window.kuiCopyText = copyTextWithFallback",
+            "navigator.clipboard?.writeText",
+            "document.execCommand('copy')",
+            "订阅令牌尚未加载",
+            ':disabled="!subscriptionLinkReady"',
+        ):
+            self.assertIn(marker, self.html)
+        self.assertNotIn("navigator.clipboard.writeText(newIp)", self.html)
+
+    def test_batch_redial_checks_responses_and_refresh_result(self):
+        match = re.search(
+            r"async function pcBatchRedialOfflineSlots\(\) \{(?P<body>.*?)(?=\n\s*async function pcExitAction)",
+            self.html,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(match)
+        body = match.group("body")
+        self.assertIn("if (!res.ok)", body)
+        self.assertIn("await pcFetchExitSlots()", body)
+        self.assertIn("if (!await pcFetchExitSlots()) throw", body)
+        self.assertIn("return false", body)
 
 
 if __name__ == "__main__":

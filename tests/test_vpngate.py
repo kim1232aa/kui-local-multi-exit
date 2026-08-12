@@ -219,15 +219,18 @@ class VPNGateFetchTest(unittest.TestCase):
 
         self.assertFalse(residential)
         self.assertEqual("unknown", detail["status"])
+        self.assertEqual("unknown", detail["egress_type"])
+        self.assertEqual("未知IP类型", detail["egress_type_label"])
         self.assertIn("lookup unavailable", detail["error"])
 
-    def test_non_residential_or_unknown_testisp_flag_is_not_classified_as_residential(self):
+    def test_unknown_testisp_classification_is_not_reported_as_datacenter(self):
         for flag in ("isp", "unknown", ""):
             with self.subTest(flag=flag):
                 report = {
                     "geo": {"is_native": True},
                     "isp": {"flag": flag, "type": "broadband", "warning": ""},
                 }
+
                 class Response:
                     def __enter__(self):
                         return self
@@ -247,6 +250,35 @@ class VPNGateFetchTest(unittest.TestCase):
 
                 self.assertFalse(residential)
                 self.assertFalse(detail["is_residential"])
+                self.assertEqual("unknown", detail["egress_type"])
+                self.assertEqual("未知IP类型", detail["egress_type_label"])
+
+    def test_explicit_hosting_testisp_classification_is_datacenter(self):
+        report = {
+            "geo": {"is_native": True},
+            "isp": {"flag": "hosting", "type": "datacenter", "warning": ""},
+        }
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return __import__("json").dumps(report).encode()
+
+        class Opener:
+            def open(self, *_args, **_kwargs):
+                return Response()
+
+        with patch.object(vpngate, "direct_url_opener", return_value=Opener()):
+            residential, detail = vpngate.check_residential("203.0.113.9")
+
+        self.assertFalse(residential)
+        self.assertEqual("datacenter", detail["egress_type"])
+        self.assertEqual("机房IP", detail["egress_type_label"])
 
         class Result:
             returncode = 0
@@ -417,6 +449,40 @@ class VPNGateFetchTest(unittest.TestCase):
                     urls=("https://chatgpt.com",),
                 )
                 self.assertEqual(accepted, ok)
+
+    def test_probe_204_uses_the_slot_interface_and_explicit_doh_route(self):
+        commands = []
+
+        class CmdResult:
+            returncode = 0
+            stdout = "204"
+
+        def run(command, **_kwargs):
+            commands.append(command)
+            return CmdResult()
+
+        self.assertTrue(vpngate.probe_204("tun-slot-7", run=run))
+        self.assertEqual(1, len(commands))
+        command = commands[0]
+        self.assertEqual("tun-slot-7", command[command.index("--interface") + 1])
+        self.assertEqual("https://cloudflare-dns.com/dns-query", command[command.index("--doh-url") + 1])
+        self.assertIn("cloudflare-dns.com:443:1.1.1.1", command)
+        self.assertEqual(vpngate.DEFAULT_STREAM_URL, command[-1])
+
+    def test_probe_204_returns_true_only_on_zero_exit_and_204_status(self):
+        class CmdResult:
+            def __init__(self, returncode, stdout):
+                self.returncode = returncode
+                self.stdout = stdout
+
+        # Success case: code 200 returncode 0 -> returncode 0 but 204 endpoint needs code 204
+        self.assertFalse(vpngate.probe_204("tun0", run=lambda *_args, **_kwargs: CmdResult(0, "200")))
+        # Success case: code 204 returncode 0
+        self.assertTrue(vpngate.probe_204("tun0", run=lambda *_args, **_kwargs: CmdResult(0, "204")))
+        # Failure case: returncode != 0
+        self.assertFalse(vpngate.probe_204("tun0", run=lambda *_args, **_kwargs: CmdResult(7, "204")))
+        # Failure case: code 500
+        self.assertFalse(vpngate.probe_204("tun0", run=lambda *_args, **_kwargs: CmdResult(0, "500")))
 
 
 if __name__ == "__main__":

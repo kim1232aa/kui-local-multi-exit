@@ -30,14 +30,23 @@ _PROXY_USER = env_secret("PROXY_USER")
 _PROXY_PASS = env_secret("PROXY_PASS")
 PROXY_USER = _PROXY_USER.encode()
 PROXY_PASS = _PROXY_PASS.encode()
+_ADDITIONAL_PROXY_CREDENTIALS: tuple[tuple[bytes, bytes], ...] = ()
 SO_MARK = getattr(socket, "SO_MARK", 36)
-MAX_CONNECTIONS = max(16, int(os.environ.get("PROXY_MAX_CONNECTIONS", "256")))
+MAX_CONNECTIONS = max(1, int(os.environ.get("PROXY_MAX_CONNECTIONS", "").strip() or "256"))
 RELAY_IDLE_TIMEOUT = max(60, int(os.environ.get("PROXY_IDLE_TIMEOUT", "600")))
 CONNECTION_SLOTS = threading.BoundedSemaphore(MAX_CONNECTIONS)
-DOH_HOST = "cloudflare-dns.com"
-DOH_ADDRESSES = ("1.1.1.1", "1.0.0.1")
-DNS_CACHE: dict[tuple[int, str], tuple[float, list[str]]] = {}
-DNS_CACHE_LOCK = threading.RLock()
+
+
+def configure_connection_limit(limit: int) -> None:
+    global MAX_CONNECTIONS, CONNECTION_SLOTS
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError) as error:
+        raise ValueError("connection limit must be a positive integer") from error
+    if limit < 1:
+        raise ValueError("connection limit must be a positive integer")
+    MAX_CONNECTIONS = limit
+    CONNECTION_SLOTS = threading.BoundedSemaphore(limit)
 
 
 def set_credentials(user: str, passwd: str) -> None:
@@ -48,9 +57,36 @@ def set_credentials(user: str, passwd: str) -> None:
     PROXY_PASS = passwd.encode()
 
 
+def set_additional_credentials(credentials: list[tuple[str, str]] | tuple[tuple[str, str], ...]) -> None:
+    global _ADDITIONAL_PROXY_CREDENTIALS
+    _ADDITIONAL_PROXY_CREDENTIALS = tuple(
+        (user.encode(), password.encode())
+        for user, password in credentials
+        if user and password
+    )
+
+
+def credentials_match(username: bytes, password: bytes) -> bool:
+    candidates = ((PROXY_USER, PROXY_PASS), *_ADDITIONAL_PROXY_CREDENTIALS)
+    return any(
+        expected_user
+        and expected_password
+        and hmac.compare_digest(username, expected_user)
+        and hmac.compare_digest(password, expected_password)
+        for expected_user, expected_password in candidates
+    )
+
+
 def set_enabled(enabled: bool) -> None:
     if not enabled:
         set_credentials("", "")
+        set_additional_credentials(())
+
+
+DOH_HOST = "cloudflare-dns.com"
+DOH_ADDRESSES = ("1.1.1.1", "1.0.0.1")
+DNS_CACHE: dict[tuple[int, str], tuple[float, list[str]]] = {}
+DNS_CACHE_LOCK = threading.RLock()
 
 
 def parse_int(value: Any) -> int:
@@ -219,7 +255,6 @@ class ProxyListener:
         self._clients_lock = threading.RLock()
         self._thread: threading.Thread | None = None
         self._startup_error: OSError | None = None
-        self._connection_slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
 
     def is_ready(self) -> bool:
         return self.ready.is_set() and self._thread is not None and self._thread.is_alive()
@@ -279,7 +314,7 @@ class ProxyListener:
                 return
             username = recv_exact(client, auth_request[1])
             password = recv_exact(client, recv_exact(client, 1)[0])
-            if not hmac.compare_digest(username, PROXY_USER) or not hmac.compare_digest(password, PROXY_PASS):
+            if not credentials_match(username, password):
                 client.sendall(b"\x01\x01")
                 return
             client.sendall(b"\x01\x00")
@@ -427,12 +462,18 @@ class ProxyListener:
                 data += chunk
             head, rest = data.split(b"\r\n\r\n", 1)
             lines = head.decode("iso-8859-1", errors="replace").split("\r\n")
-            expected = "Basic " + base64.b64encode(PROXY_USER + b":" + PROXY_PASS).decode("ascii")
-            authenticated = any(
-                line.lower().startswith("proxy-authorization:")
-                and hmac.compare_digest(line.split(":", 1)[1].strip(), expected)
-                for line in lines[1:]
-            )
+            authenticated = False
+            for line in lines[1:]:
+                if not line.lower().startswith("proxy-authorization:"):
+                    continue
+                try:
+                    scheme, encoded = line.split(":", 1)[1].strip().split(" ", 1)
+                    username, password = base64.b64decode(encoded).split(b":", 1)
+                except (ValueError, UnicodeError):
+                    continue
+                if scheme.lower() == "basic" and credentials_match(username, password):
+                    authenticated = True
+                    break
             if not authenticated:
                 client.sendall(b'HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="Proxy"\r\n\r\n')
                 return
@@ -487,7 +528,7 @@ class ProxyListener:
             try:
                 client.close()
             finally:
-                self._connection_slots.release()
+                CONNECTION_SLOTS.release()
 
     def serve_forever(self) -> None:
         servers: list[socket.socket] = []
@@ -526,7 +567,7 @@ class ProxyListener:
                         client, _ = server.accept()
                     except OSError:
                         continue
-                    if not self._connection_slots.acquire(blocking=False):
+                    if not CONNECTION_SLOTS.acquire(blocking=False):
                         client.close()
                         continue
                     with self._clients_lock:
@@ -536,7 +577,7 @@ class ProxyListener:
                     except Exception:
                         with self._clients_lock:
                             self._clients.discard(client)
-                        self._connection_slots.release()
+                        CONNECTION_SLOTS.release()
                         client.close()
         except OSError as error:
             self._startup_error = error

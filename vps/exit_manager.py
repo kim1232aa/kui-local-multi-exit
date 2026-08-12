@@ -17,7 +17,7 @@ from .openvpn_sources import fetch_all_openvpn_nodes
 from .proxy_server import ProxyListener
 from .routing import RouteManager
 from .store import LocalStore
-from .vpngate import STREAM_URLS, NodePool, check_residential, detect_egress, probe_targets
+from .vpngate import STREAM_URLS, NodePool, check_residential, detect_egress, probe_204, probe_targets
 
 
 @dataclass
@@ -40,6 +40,8 @@ class ExitManager:
         listener_factory=ProxyListener,
         workspace: Path | str = "/opt/kui-local",
         start_workers: bool = True,
+        slot_count: int | None = None,
+        dial_workers: int | None = None,
         run=subprocess.run,
         popen=subprocess.Popen,
         sleep=time.sleep,
@@ -56,13 +58,46 @@ class ExitManager:
         self._popen = popen
         self._sleep = sleep
         self._shutdown = threading.Event()
+        all_slots = self.store.list_slots()
+        if slot_count is None:
+            slot_count = len(all_slots)
+        try:
+            slot_count = int(slot_count)
+        except (TypeError, ValueError) as error:
+            raise ValueError("slot_count must be a positive integer") from error
+        if not 1 <= slot_count <= len(all_slots):
+            raise ValueError(f"slot_count must be between 1 and {len(all_slots)}")
+        self._managed_slot_ids = tuple(slot.id for slot in all_slots[:slot_count])
         self._runtimes = {
-            slot.id: SlotRuntime(stop=threading.Event(), lock=threading.RLock())
-            for slot in self.store.list_slots()
+            slot_id: SlotRuntime(stop=threading.Event(), lock=threading.RLock())
+            for slot_id in self._managed_slot_ids
         }
+        if dial_workers is None:
+            dial_workers = slot_count
+        try:
+            dial_workers = int(dial_workers)
+        except (TypeError, ValueError) as error:
+            raise ValueError("dial_workers must be a positive integer") from error
+        if not 1 <= dial_workers <= slot_count:
+            raise ValueError(f"dial_workers must be between 1 and {slot_count}")
+        self._dial_slots = threading.BoundedSemaphore(dial_workers)
         self._selection_lock = threading.RLock()
         self._reserved_nodes: dict[str, str] = {}
         self._refresh_thread: threading.Thread | None = None
+
+    @property
+    def managed_slot_ids(self) -> tuple[str, ...]:
+        return self._managed_slot_ids
+
+    def is_managed_slot(self, slot_id: str) -> bool:
+        return slot_id in self._runtimes
+
+    def _require_managed_slot(self, slot_id: str) -> None:
+        if not self.is_managed_slot(slot_id):
+            raise KeyError(f"slot {slot_id} is outside the active runtime profile")
+
+    def _managed_slots(self) -> list[ExitSlotSnapshot]:
+        return [slot for slot in self.store.list_slots() if self.is_managed_slot(slot.id)]
 
     def runtime(self, slot_id: str) -> SlotRuntime:
         try:
@@ -91,7 +126,7 @@ class ExitManager:
         if self.start_workers:
             self._refresh_thread = threading.Thread(target=self._refresh_loop, name="vpngate-refresh", daemon=True)
             self._refresh_thread.start()
-        for slot in self.store.list_slots():
+        for slot in self._managed_slots():
             if slot.enabled:
                 self.start_slot(slot.id)
 
@@ -141,16 +176,12 @@ class ExitManager:
                 next_refresh = time.time() + refresh_interval
 
     def _try_recover_auto_disabled_slots(self) -> None:
-        """Recover only slots that currently have an eligible unreserved node."""
+        """Recover only managed slots that have an eligible unreserved node."""
         recoverable: list[str] = []
         with self._selection_lock:
             excluded = set(self._reserved_nodes.values())
-            excluded.update(
-                slot.entry_ip
-                for slot in self.store.list_slots()
-                if slot.entry_ip
-            )
-            for slot in self.store.list_slots():
+            excluded.update(slot.entry_ip for slot in self._managed_slots() if slot.entry_ip)
+            for slot in self._managed_slots():
                 if slot.enabled or slot.disabled_reason != "automatic_failure_limit":
                     continue
                 node = self._select_node(slot.country, excluded)
@@ -170,7 +201,7 @@ class ExitManager:
             }
         return reserved | {
             slot.entry_ip
-            for slot in self.store.list_slots()
+            for slot in self._managed_slots()
             if slot.id != excluding and slot.entry_ip
         }
 
@@ -179,14 +210,17 @@ class ExitManager:
             return set(self._reserved_nodes.values())
 
     def start_slot(self, slot_id: str) -> ExitSlotSnapshot:
+        self._require_managed_slot(slot_id)
         slot = self.store.get_slot(slot_id)
         if not slot.enabled:
             return slot
         runtime = self.runtime(slot_id)
         assert runtime.lock is not None and runtime.stop is not None
         with runtime.lock:
-            if runtime.worker is not None and runtime.worker.is_alive():
-                return slot
+            if runtime.worker is not None:
+                if runtime.worker.is_alive():
+                    return slot
+                runtime.worker = None
             if runtime.retry_timer:
                 runtime.retry_timer.cancel()
                 runtime.retry_timer = None
@@ -206,27 +240,31 @@ class ExitManager:
                 runtime.worker.start()
         return slot
 
-    def _terminate_process(self, runtime: SlotRuntime) -> None:
-        process = runtime.process
-        if not process:
+    def _terminate_process(self, runtime: SlotRuntime, process: Any | None = None) -> None:
+        target = runtime.process if process is None else process
+        if not target:
             return
         try:
-            process.terminate()
-            process.wait(timeout=3)
+            target.terminate()
+            target.wait(timeout=3)
         except Exception:
             try:
-                process.kill()
+                target.kill()
             except Exception:
                 pass
-        runtime.process = None
+        if runtime.process is target:
+            runtime.process = None
 
     def stop_slot(self, slot_id: str, *, stop_listener: bool = True) -> None:
-        slot = self.store.get_slot(slot_id)
+        self._require_managed_slot(slot_id)
         runtime = self.runtime(slot_id)
         assert runtime.lock is not None and runtime.stop is not None
         worker = None
         with runtime.lock:
+            slot = self.store.get_slot(slot_id)
             runtime.stop.set()
+            if slot.enabled:
+                slot = self.store.update_slot(slot_id, enabled=True)
             if runtime.retry_timer:
                 runtime.retry_timer.cancel()
                 runtime.retry_timer = None
@@ -247,21 +285,27 @@ class ExitManager:
                         runtime.worker = None
 
     def redial_slot(self, slot_id: str) -> ExitSlotSnapshot:
+        self._require_managed_slot(slot_id)
         slot = self.store.get_slot(slot_id)
         if slot.entry_ip:
             self.node_pool.penalize(slot.entry_ip, 3000)
         self.stop_slot(slot_id, stop_listener=False)
-        updated = self.store.update_slot(slot_id, enabled=True)
+        updated = self.store.get_slot(slot_id)
+        if not updated.enabled:
+            updated = self.store.update_slot(slot_id, enabled=True)
         self.store.record_event(slot_id, "redial", "manual redial requested")
         return self.start_slot(updated.id)
 
     def connect_slot(self, slot_id: str, node_ip: str) -> ExitSlotSnapshot:
+        self._require_managed_slot(slot_id)
         slot = self.store.get_slot(slot_id)
         node = self.node_pool.get(node_ip, slot.country)
         if node is None:
             raise ValueError(f"node {node_ip} is not available for {slot.country}")
         self.stop_slot(slot_id, stop_listener=False)
-        updated = self.store.update_slot(slot_id, enabled=True)
+        updated = self.store.get_slot(slot_id)
+        if not updated.enabled:
+            updated = self.store.update_slot(slot_id, enabled=True)
         runtime = self.runtime(slot_id)
         assert runtime.lock is not None
         with runtime.lock:
@@ -270,6 +314,7 @@ class ExitManager:
         return self.start_slot(updated.id)
 
     def enable_slot(self, slot_id: str) -> ExitSlotSnapshot:
+        self._require_managed_slot(slot_id)
         current = self.store.get_slot(slot_id)
         if current.enabled and current.state in {"connecting", "ready"}:
             return current
@@ -277,19 +322,26 @@ class ExitManager:
         return self.start_slot(slot.id)
 
     def disable_slot(self, slot_id: str) -> ExitSlotSnapshot:
+        self._require_managed_slot(slot_id)
         self.stop_slot(slot_id)
         slot = self.store.update_slot(slot_id, enabled=False)
         self.store.record_event(slot_id, "disabled", "slot disabled manually")
         return slot
 
     def fail_slot(self, slot_id: str, error: str) -> ExitSlotSnapshot:
-        slot = self.store.record_failure(slot_id, error)
+        self._require_managed_slot(slot_id)
         runtime = self.runtime(slot_id)
-        if runtime.listener:
-            runtime.listener.stop()
+        assert runtime.lock is not None and runtime.stop is not None
+        with runtime.lock:
+            runtime.stop.set()
+            slot = self.store.record_failure(slot_id, error)
+            listener = runtime.listener
             runtime.listener = None
-        if runtime.process:
-            self._terminate_process(runtime)
+            process = runtime.process
+        if listener:
+            listener.stop()
+        if process:
+            self._terminate_process(runtime, process)
         self._release_node(slot_id)
         self.routing.cleanup(slot)
         if not slot.enabled:
@@ -323,6 +375,9 @@ class ExitManager:
                 or current.state != "failed"
             ):
                 return
+            if runtime.worker is not None and runtime.worker.is_alive():
+                self._schedule_retry(slot_id, failed_generation, 1)
+                return
             self.start_slot(slot_id)
 
     def _handle_connection_failure(
@@ -332,12 +387,15 @@ class ExitManager:
         error: str,
         endpoint_ip: str = "",
     ) -> ExitSlotSnapshot:
-        current = self.store.get_slot(slot_id)
-        if not current.enabled or current.generation != generation:
-            return current
+        runtime = self.runtime(slot_id)
+        assert runtime.lock is not None
+        with runtime.lock:
+            current = self.store.get_slot(slot_id)
+            if not current.enabled or current.generation != generation:
+                return current
+            failed = self.fail_slot(slot_id, error)
         if endpoint_ip:
             self.node_pool.penalize(endpoint_ip, 10000)
-        failed = self.fail_slot(slot_id, error)
         if failed.enabled and self.start_workers:
             delay = min(5 * (2 ** max(0, failed.failure_streak - 1)), 60)
             self._schedule_retry(slot_id, failed.generation, delay)
@@ -364,7 +422,9 @@ class ExitManager:
         if not current.enabled or current.generation != generation or current.country not in {"ANY", node.get("country")}:
             return False
         runtime = self.runtime(slot_id)
-        assert runtime.lock is not None
+        assert runtime.lock is not None and runtime.stop is not None
+        if self._shutdown.is_set() or runtime.stop.is_set():
+            return False
         listener = self.listener_factory(
             current.id,
             "0.0.0.0",
@@ -374,6 +434,9 @@ class ExitManager:
         )
         try:
             listener.start(timeout=3)
+            if self._shutdown.is_set() or runtime.stop.is_set():
+                listener.stop()
+                return False
             self.store.append_check_result(slot_id, generation, check_result)
             updated = self.store.set_runtime_if_generation(
                 slot_id,
@@ -519,7 +582,7 @@ class ExitManager:
             str(auth_file or self.auth_file),
             *self._openvpn_proxy_args(),
             "--connect-timeout",
-            "5",
+            "10",
             "--connect-retry-max",
             "1",
             "--verb",
@@ -527,84 +590,163 @@ class ExitManager:
             *cipher_args,
         ]
 
+    def _worker_is_stale(
+        self,
+        slot_id: str,
+        generation: int,
+        stop_event: threading.Event,
+    ) -> bool:
+        if self._shutdown.is_set() or stop_event.is_set():
+            return True
+        current = self.store.get_slot(slot_id)
+        return not current.enabled or current.generation != generation
+
+    def _acquire_dial_slot(
+        self,
+        slot_id: str,
+        generation: int,
+        stop_event: threading.Event,
+    ) -> bool:
+        while not self._worker_is_stale(slot_id, generation, stop_event):
+            if self._dial_slots.acquire(timeout=1):
+                return True
+        return False
+
     def _connect_worker(self, slot_id: str, generation: int) -> None:
+        self._require_managed_slot(slot_id)
         slot = self.store.get_slot(slot_id)
         runtime = self.runtime(slot_id)
+        assert runtime.lock is not None and runtime.stop is not None
+        stop_event = runtime.stop
         endpoint_ip = ""
+        process: Any | None = None
         try:
-            preferred_ip = runtime.preferred_node_ip
-            runtime.preferred_node_ip = ""
-            node = self._reserve_node(slot_id, slot.country, preferred_ip)
-            if not node:
-                raise RuntimeError(f"no OpenVPN node for {slot.country}; distribution={self.node_pool.counts()}")
-            endpoint_ip = str(node["ip"])
-            config_path = self.config_dir / f"{slot_id}.ovpn"
-            log_path = self.workspace / f"{slot_id}.log"
-            self._write_runtime_file(config_path, node["config"])
-            self._prepare_runtime_log(log_path)
-            gateway, external_interface = self._default_route(self._run)
-            with log_path.open("w") as log_file:
-                runtime.process = self._popen(
-                    self._openvpn_command(slot, config_path, self._node_auth_file(slot, node)),
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT,
-                )
-            initialized = False
-            for _ in range(20):
-                assert runtime.stop is not None
-                if runtime.stop.wait(1):
-                    return
-                if runtime.process.poll() is not None:
-                    break
-                if "Initialization Sequence Completed" in log_path.read_text(errors="replace"):
-                    initialized = True
-                    break
-            if not initialized:
-                raise RuntimeError("OpenVPN initialization failed")
-            if self.store.get_slot(slot_id).generation != generation:
+            if not self._acquire_dial_slot(slot_id, generation, stop_event):
                 return
-            self.routing.install(slot, endpoint_ip, gateway, external_interface)
-            egress_ip = detect_egress(slot.tunnel_name, self._run)
-            if not egress_ip:
-                raise RuntimeError("real egress IP unavailable")
-            residential, residential_result = check_residential(egress_ip)
-            if not residential:
-                self.node_pool.penalize(endpoint_ip, 50000)
-                raise RuntimeError("exit classified as datacenter")
-            probe_result = probe_targets(slot.tunnel_name, STREAM_URLS, self._run)
-            check_result = {"residential": residential_result, "targets": probe_result}
-            if not probe_result["accepted"]:
-                self.record_failed_check(slot_id, generation, check_result)
-                self.node_pool.penalize(endpoint_ip, 3000)
-                raise RuntimeError("target probes failed")
-            if not self.commit_ready(
-                slot_id,
-                generation,
-                entry_ip=endpoint_ip,
-                egress_ip=egress_ip,
-                node={key: value for key, value in node.items() if key != "config"},
-                check_result=check_result,
-            ):
-                raise RuntimeError("slot configuration changed during dial")
+            try:
+                with runtime.lock:
+                    preferred_ip = runtime.preferred_node_ip
+                    runtime.preferred_node_ip = ""
+                node = self._reserve_node(slot_id, slot.country, preferred_ip)
+                if not node:
+                    raise RuntimeError(f"no OpenVPN node for {slot.country}; distribution={self.node_pool.counts()}")
+                endpoint_ip = str(node["ip"])
+                config_path = self.config_dir / f"{slot_id}.ovpn"
+                log_path = self.workspace / f"{slot_id}.log"
+                self._write_runtime_file(config_path, node["config"])
+                self._prepare_runtime_log(log_path)
+                if self._worker_is_stale(slot_id, generation, stop_event):
+                    return
+                gateway, external_interface = self._default_route(self._run)
+                if self._worker_is_stale(slot_id, generation, stop_event):
+                    return
+                with log_path.open("w") as log_file:
+                    process = self._popen(
+                        self._openvpn_command(slot, config_path, self._node_auth_file(slot, node)),
+                        stdout=log_file,
+                        stderr=subprocess.STDOUT,
+                    )
+                with runtime.lock:
+                    process_started_after_stop = (
+                        stop_event.is_set()
+                        or self._shutdown.is_set()
+                        or self.store.get_slot(slot_id).generation != generation
+                    )
+                    if not process_started_after_stop:
+                        runtime.process = process
+                if process_started_after_stop:
+                    self._terminate_process(runtime, process)
+                    return
+                initialized = False
+                for _ in range(25):
+                    if stop_event.wait(1):
+                        return
+                    if self._worker_is_stale(slot_id, generation, stop_event):
+                        return
+                    if process.poll() is not None:
+                        break
+                    if "Initialization Sequence Completed" in log_path.read_text(errors="replace"):
+                        initialized = True
+                        break
+                if not initialized:
+                    raise RuntimeError("OpenVPN initialization failed")
+                if self._worker_is_stale(slot_id, generation, stop_event):
+                    return
+                self.routing.install(slot, endpoint_ip, gateway, external_interface)
+                if self._worker_is_stale(slot_id, generation, stop_event):
+                    return
+                egress_ip = detect_egress(slot.tunnel_name, self._run)
+                if self._worker_is_stale(slot_id, generation, stop_event):
+                    return
+                if not egress_ip:
+                    raise RuntimeError("real egress IP unavailable")
+                residential, residential_result = check_residential(egress_ip)
+                if self._worker_is_stale(slot_id, generation, stop_event):
+                    return
+                status = str(residential_result.get("status", "")).lower()
+                egress_type = str(residential_result.get("egress_type", "unknown")).lower()
+                allow_non_residential = os.environ.get("KUI_ALLOW_NON_RESIDENTIAL", "1").strip().lower() in {"1", "true", "yes", "on"}
+                if status != "checked" or egress_type == "unknown":
+                    self.node_pool.penalize(endpoint_ip, 5000)
+                    raise RuntimeError("TestISP check failed or unknown IP type")
+                if egress_type == "datacenter" and not allow_non_residential:
+                    self.node_pool.penalize(endpoint_ip, 50000)
+                    raise RuntimeError("exit classified as datacenter")
+                probe_result = probe_targets(slot.tunnel_name, STREAM_URLS, self._run)
+                if self._worker_is_stale(slot_id, generation, stop_event):
+                    return
+                check_result = {"residential": residential_result, "targets": probe_result}
+                if not probe_result["accepted"]:
+                    self.record_failed_check(slot_id, generation, check_result)
+                    self.node_pool.penalize(endpoint_ip, 3000)
+                    raise RuntimeError("target probes failed")
+                if not self.commit_ready(
+                    slot_id,
+                    generation,
+                    entry_ip=endpoint_ip,
+                    egress_ip=egress_ip,
+                    node={key: value for key, value in node.items() if key != "config"},
+                    check_result=check_result,
+                ):
+                    raise RuntimeError("slot configuration changed during dial")
+            finally:
+                self._dial_slots.release()
             self._health_loop(slot_id, generation)
         except Exception as error:
-            self._handle_connection_failure(slot_id, generation, str(error), endpoint_ip)
+            if not self._worker_is_stale(slot_id, generation, stop_event):
+                self._handle_connection_failure(slot_id, generation, str(error), endpoint_ip)
         finally:
             current = self.store.get_slot(slot_id)
-            if current.state != "ready":
-                self._terminate_process(runtime)
+            owns_generation = current.generation == generation
+            if owns_generation and current.state != "ready":
+                if process is not None:
+                    self._terminate_process(runtime, process)
                 self._release_node(slot_id)
                 self.routing.cleanup(slot)
+            elif not owns_generation and process is not None:
+                with runtime.lock:
+                    owns_process = runtime.process is process
+                if owns_process:
+                    self._terminate_process(runtime, process)
             assert runtime.lock is not None
             with runtime.lock:
                 if runtime.worker is threading.current_thread():
                     runtime.worker = None
 
-    def _health_loop(self, slot_id: str, generation: int) -> None:
-        slot = self.store.get_slot(slot_id)
+    def _health_loop(
+        self,
+        slot_id: str,
+        generation: int,
+        stop_event: threading.Event | None = None,
+    ) -> None:
         runtime = self.runtime(slot_id)
+        if stop_event is None:
+            assert runtime.stop is not None
+            stop_event = runtime.stop
         failures = 0
-        while not self._shutdown.wait(15):
+        while True:
+            if self._shutdown.is_set() or stop_event.wait(60):
+                return
             current = self.store.get_slot(slot_id)
             if not current.enabled or current.generation != generation or runtime.process is None:
                 return
@@ -614,27 +756,29 @@ class ExitManager:
             if not self.routing.is_installed(current):
                 self._handle_connection_failure(slot_id, generation, "policy route disappeared", current.entry_ip)
                 return
-            egress = detect_egress(slot.tunnel_name, self._run)
-            if egress and egress == current.egress_ip:
+            if probe_204(current.tunnel_name, self._run):
                 failures = 0
                 continue
             failures += 1
-            if failures >= 3:
-                self._handle_connection_failure(
+            if failures >= 2:
+                error = "HTTP 204 probe failed twice consecutively"
+                self.store.record_event(
                     slot_id,
-                    generation,
-                    "exit health probe failed three times",
-                    current.entry_ip,
+                    "health_check_failed",
+                    f"{error}, triggering retry",
                 )
+                # This loop runs inside the connection worker, so it must defer
+                # redial through failure handling instead of restarting itself.
+                self._handle_connection_failure(slot_id, generation, error, current.entry_ip)
                 return
 
     def snapshot(self) -> list[dict[str, Any]]:
-        return [slot.as_dict() for slot in self.store.list_slots()]
+        return [slot.as_dict() for slot in self._managed_slots()]
 
     def list_nodes(self, country: str = "ANY") -> list[dict[str, Any]]:
         return self.node_pool.list_nodes(country)
 
     def shutdown(self) -> None:
         self._shutdown.set()
-        for slot in self.store.list_slots():
-            self.stop_slot(slot.id)
+        for slot_id in self._managed_slot_ids:
+            self.stop_slot(slot_id)

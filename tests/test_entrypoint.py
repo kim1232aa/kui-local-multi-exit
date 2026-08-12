@@ -4,7 +4,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from vps.entrypoint import Application, clear_proxy_environment
+from vps.entrypoint import Application, build_application, clear_proxy_environment
+from vps.runtime_profile import RuntimeProfile
 from vps.store import LocalStore
 
 
@@ -74,6 +75,70 @@ class ApplicationTest(unittest.TestCase):
 
         self.assertNotIn("exit-01", enabled_ids)
         self.assertEqual(23, len(enabled_ids))
+
+    def test_build_application_applies_runtime_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            profile = RuntimeProfile(
+                slot_count=2,
+                dial_workers=1,
+                max_connections=32,
+                memory_bytes=1024**3,
+                memory_source="test",
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "KUI_WORKSPACE": str(workspace),
+                    "KUI_MANAGEMENT_PASSWORD": "test-password",
+                    "KUI_MANAGEMENT_PORT": "0",
+                },
+                clear=True,
+            ), patch("vps.entrypoint.resolve_runtime_profile", return_value=profile), patch(
+                "vps.entrypoint.configure_connection_limit"
+            ) as configure_limit:
+                application = build_application()
+            try:
+                self.assertEqual(("exit-01", "exit-02"), application.manager.managed_slot_ids)
+                self.assertEqual(1, application.manager._dial_slots._value)
+                configure_limit.assert_called_once_with(32)
+            finally:
+                application.server.server_close()
+
+    def test_bridge_refresh_uses_runtime_dial_worker_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            profile = RuntimeProfile(
+                slot_count=2,
+                dial_workers=1,
+                max_connections=32,
+                memory_bytes=1024**3,
+                memory_source="test",
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "KUI_WORKSPACE": str(workspace),
+                    "KUI_MANAGEMENT_PASSWORD": "test-password",
+                    "KUI_MANAGEMENT_PORT": "0",
+                    "KUI_BRIDGE_SUB_URLS": "https://example.com/subscription",
+                },
+                clear=True,
+            ), patch("vps.entrypoint.resolve_runtime_profile", return_value=profile), patch(
+                "vps.entrypoint.start_background_refresh"
+            ) as refresh:
+                application = build_application()
+            try:
+                refresh.assert_called_once_with(
+                    interval=300,
+                    manual_urls=[],
+                    subscription_urls=["https://example.com/subscription"],
+                    enable_speed_test=False,
+                    top_n=16,
+                    max_workers=1,
+                )
+            finally:
+                application.server.server_close()
 
     def test_proxy_environment_is_removed_before_network_startup(self):
         variables = {

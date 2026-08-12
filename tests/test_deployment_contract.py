@@ -13,27 +13,56 @@ class DeploymentContractTest(unittest.TestCase):
     def setUp(self):
         self.root = Path(__file__).resolve().parents[1]
 
-    def test_compose_publishes_all_fixed_slots_and_supports_optional_fetch_proxies(self):
+    def test_compose_uses_one_public_reality_port_and_internal_slot_routing(self):
         compose = (self.root / "compose.yaml").read_text(encoding="utf-8")
-        self.assertIn('"127.0.0.1:7920-7943:7920-7943/tcp"', compose)
-        self.assertIn('"127.0.0.1:7920-7943:7920-7943/udp"', compose)
         self.assertIn("KUI_FETCH_PROXY", compose)
         self.assertIn("KUI_OPENVPN_SOCKS_PROXY", compose)
         self.assertIn("KUI_ENABLE_VPNBOOK", compose)
+        self.assertIn("KUI_ALLOW_NON_RESIDENTIAL", compose)
         self.assertIn("KUI_VPN_HISTORY_DAYS", compose)
+        self.assertIn("KUI_SLOT_COUNT", compose)
+        self.assertIn("KUI_DIAL_WORKERS", compose)
+        self.assertIn("PROXY_MAX_CONNECTIONS", compose)
+        self.assertIn("KUI_INTERNAL_PROXY_USER", compose)
+        self.assertIn("KUI_INTERNAL_PROXY_PASSWORD", compose)
         self.assertIn("./providers:/opt/kui-providers:ro", compose)
         self.assertIn("./runtime/reality:/run/kui-reality:ro", compose)
         self.assertIn("KUI_REALITY_NODES_FILE", compose)
         self.assertIn("host.docker.internal:host-gateway", compose)
+        self.assertIn("kui-reality-gateway:", compose)
+        self.assertIn("kui-reality-data:", compose)
+        self.assertIn('"${KUI_REALITY_PORT:-8443}:${KUI_REALITY_PORT:-8443}/tcp"', compose)
+        self.assertNotIn("7920-7943:7920-7943", compose)
+        self.assertNotIn("8443-8466:8443-8466", compose)
+        self.assertIn('command: ["python3", "-m", "vps.reality_gateway"]', compose)
+        self.assertIn("kui-local-data:/opt/kui-local:ro", compose)
+        self.assertIn("./runtime/reality:/run/kui-reality:rw", compose)
+        self.assertIn("healthcheck:", compose)
+        self.assertIn("/proc/net/tcp", compose)
+        self.assertNotIn("socket.create_connection", compose)
+        self.assertIn("service_healthy", compose)
+
+    def test_dockerfile_exposes_only_management_and_default_reality_ports(self):
+        dockerfile = (self.root / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("EXPOSE 8080 8443", dockerfile)
+        self.assertNotIn("7920-7943", dockerfile)
+        self.assertNotIn("8443-8466", dockerfile)
+
+    def test_dockerfile_selects_matching_sing_box_architecture(self):
+        dockerfile = (self.root / "Dockerfile").read_text(encoding="utf-8")
+        self.assertIn("ARG TARGETARCH", dockerfile)
+        self.assertIn("amd64|arm64", dockerfile)
+        self.assertIn("linux-${TARGETARCH}.tar.gz", dockerfile)
+        self.assertNotIn("linux-amd64.tar.gz\"", dockerfile)
 
     def test_gitignore_excludes_runtime_credentials_configs_and_logs(self):
         ignored = (self.root / ".gitignore").read_text(encoding="utf-8")
-        for marker in ("*.ovpn", "*.log", "auth.txt", "socks_auth.txt", "runtime/", ".env"):
+        for marker in ("*.ovpn", "*.log", "auth.txt", "socks_auth.txt", "internal_proxy.json", "runtime/", ".env"):
             self.assertIn(marker, ignored)
 
     def test_dockerignore_excludes_repository_and_local_runtime_data(self):
         ignored = (self.root / ".dockerignore").read_text(encoding="utf-8")
-        for marker in (".git", ".worktrees", ".env", "temp", "runtime", "*.db", "*.log"):
+        for marker in (".git", ".worktrees", ".env", "temp", "runtime", "*.db", "*.log", "internal_proxy.json"):
             self.assertIn(marker, ignored)
 
     def test_reality_gateway_installer_reuses_original_kui_protocol_shape(self):

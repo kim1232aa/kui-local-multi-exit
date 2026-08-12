@@ -340,7 +340,7 @@ def _parse_monosans_json(text: str) -> list[dict[str, Any]] | None:
 
 
 def parse_subscription(text: str) -> list[dict[str, Any]]:
-    """Parse a subscription text (base64 or plain) into node dicts."""
+    """Parse a subscription text (base64, plain links, or monosans JSON)."""
     text = _decode_subscription(text)
     monosans = _parse_monosans_json(text)
     if monosans is not None:
@@ -805,7 +805,7 @@ def load_bridge_nodes(
             key=lambda n: 0 if n.get("_country_hint") in priority_countries else 1,
         )
         test_candidates = ordered[:60]
-        max_workers = 8
+        max_workers = min(max_workers, 8)
 
         def _test_one(node: dict[str, Any]) -> dict[str, Any] | None:
             proxy_url = _node_to_proxy_url(node)
@@ -823,7 +823,7 @@ def load_bridge_nodes(
             return None
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(_test_one, n) for n in candidate_urls]
+            futures = [executor.submit(_test_one, node) for node in test_candidates]
             for future in as_completed(futures):
                 node = future.result()
                 if node is not None:
@@ -900,10 +900,9 @@ def start_background_refresh(
         The started daemon thread.
     """
 
-    def _loop() -> None:
-        # Run an immediate refresh on startup to populate the cache.
+    def refresh(label: str) -> None:
+        started = time.time()
         try:
-            start = time.time()
             loaded = load_bridge_nodes(
                 manual_urls=manual_urls,
                 subscription_urls=subscription_urls,
@@ -913,25 +912,21 @@ def start_background_refresh(
                 enable_speed_test=enable_speed_test,
                 top_n=top_n,
             )
-            print(f"bridge-refresh: initial load {len(loaded)} nodes in {time.time() - start:.0f}s", flush=True)
+            print(
+                f"bridge-refresh: {label} {len(loaded)} nodes in {time.time() - started:.0f}s",
+                flush=True,
+            )
         except Exception as error:
-            print(f"bridge-refresh: initial load failed: {type(error).__name__}: {error}", flush=True)
+            print(
+                f"bridge-refresh: {label} failed: {type(error).__name__}: {error}",
+                flush=True,
+            )
+
+    def _loop() -> None:
+        refresh("initial load")
         while True:
             time.sleep(interval)
-            try:
-                start = time.time()
-                loaded = load_bridge_nodes(
-                    manual_urls=manual_urls,
-                    subscription_urls=subscription_urls,
-                    test_reachability=True,
-                    max_workers=max_workers,
-                    force_refresh=True,
-                    enable_speed_test=enable_speed_test,
-                    top_n=top_n,
-                )
-                print(f"bridge-refresh: refreshed {len(loaded)} nodes in {time.time() - start:.0f}s", flush=True)
-            except Exception as error:
-                print(f"bridge-refresh: cycle failed: {type(error).__name__}: {error}", flush=True)
+            refresh("refreshed")
 
     thread = threading.Thread(target=_loop, daemon=True, name="bridge-refresh")
     thread.start()

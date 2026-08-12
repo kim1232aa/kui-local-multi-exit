@@ -67,6 +67,94 @@ class ExitManagerTest(unittest.TestCase):
     def tearDown(self):
         self.tempdir.cleanup()
 
+    def test_runtime_profile_only_manages_requested_slots(self):
+        manager = ExitManager(
+            self.store,
+            routing=self.routing,
+            listener_factory=FakeListener,
+            workspace=Path(self.tempdir.name),
+            start_workers=False,
+            slot_count=2,
+            dial_workers=1,
+        )
+
+        self.assertEqual(("exit-01", "exit-02"), manager.managed_slot_ids)
+        self.assertEqual(["exit-01", "exit-02"], [slot["id"] for slot in manager.snapshot()])
+        with self.assertRaisesRegex(KeyError, "outside the active runtime profile"):
+            manager.start_slot("exit-03")
+
+    def test_initialize_cleans_legacy_slots_but_starts_only_managed_slots(self):
+        self.store.set_runtime("exit-03", state="ready", entry_ip="198.51.100.3")
+        manager = ExitManager(
+            self.store,
+            routing=self.routing,
+            listener_factory=FakeListener,
+            workspace=Path(self.tempdir.name),
+            start_workers=False,
+            slot_count=2,
+        )
+        started = []
+        manager.start_slot = lambda slot_id: started.append(slot_id)
+        manager.refresh_nodes = lambda: 0
+
+        manager.initialize()
+
+        self.assertEqual(["exit-01", "exit-02"], started)
+        self.assertEqual("idle", self.store.get_slot("exit-03").state)
+        self.assertIn("exit-03", self.routing.cleaned)
+
+    def test_dial_semaphore_releases_before_long_running_health_loop(self):
+        manager = ExitManager(
+            self.store,
+            routing=self.routing,
+            listener_factory=FakeListener,
+            workspace=Path(self.tempdir.name),
+            start_workers=False,
+            slot_count=2,
+            dial_workers=1,
+        )
+        acquired = []
+        released = []
+
+        class TrackingSemaphore:
+            def acquire(self, timeout):
+                acquired.append(timeout)
+                return True
+
+            def release(self):
+                released.append(True)
+
+        manager._dial_slots = TrackingSemaphore()
+        manager._health_loop = lambda *_args: None
+        manager._connect_worker = manager._connect_worker
+        manager.node_pool.replace(
+            [{"ip": "198.51.100.1", "country": "JP", "ping": 1, "score": 100, "config": ""}]
+        )
+        manager.config_dir.mkdir(parents=True, exist_ok=True)
+        manager.auth_file.write_text("vpn\nvpn\n", encoding="utf-8")
+        log_path = manager.workspace / "exit-01.log"
+
+        class InitializedProcess:
+            def poll(self): return None
+            def terminate(self): pass
+            def wait(self, timeout=None): return 0
+
+        def populate_log(*_args, **_kwargs):
+            log_path.write_text("Initialization Sequence Completed", encoding="utf-8")
+            return InitializedProcess()
+
+        manager._popen = populate_log
+        manager.routing.install = lambda *_args: None
+        with patch.object(manager, "_default_route", return_value=("172.18.0.1", "eth0")), patch.object(
+            manager, "_openvpn_command", return_value=["openvpn"]
+        ), patch("vps.exit_manager.detect_egress", return_value="203.0.113.1"), patch(
+            "vps.exit_manager.check_residential", return_value=(True, {"status": "checked", "egress_type": "residential"})
+        ), patch("vps.exit_manager.probe_targets", return_value={"accepted": True}):
+            manager._connect_worker("exit-01", self.store.get_slot("exit-01").generation)
+
+        self.assertEqual([1], acquired)
+        self.assertEqual([True], released)
+
     def test_starting_one_slot_does_not_expose_proxy_before_tunnel_is_ready(self):
         self.manager.start_slot("exit-01")
 
@@ -226,6 +314,29 @@ class ExitManagerTest(unittest.TestCase):
         self.assertFalse(second.process.terminated)
         self.assertGreater(self.store.get_slot("exit-01").generation, generation)
         self.assertEqual(["exit-01"], self.routing.cleaned)
+
+    def test_stop_invalidates_generation_and_restart_clears_the_stop_event(self):
+        generation = self.store.get_slot("exit-01").generation
+
+        self.manager.stop_slot("exit-01")
+        stopped = self.store.get_slot("exit-01")
+        self.assertGreater(stopped.generation, generation)
+        self.assertEqual("idle", stopped.state)
+        self.assertTrue(self.manager.runtime("exit-01").stop.is_set())
+
+        self.manager.start_slot("exit-01")
+
+        self.assertFalse(self.manager.runtime("exit-01").stop.is_set())
+        self.assertFalse(
+            self.manager.commit_ready(
+                "exit-01",
+                generation,
+                entry_ip="198.51.100.1",
+                egress_ip="203.0.113.1",
+                node={"country": "JP"},
+                check_result={"is_residential": True},
+            )
+        )
 
     def test_commit_ready_starts_listener_only_after_route_and_checks_succeed(self):
         generation = self.store.get_slot("exit-01").generation
@@ -552,14 +663,135 @@ class ExitManagerTest(unittest.TestCase):
             (slot_id, failed_generation, error, endpoint_ip)
         )
         waits = iter([False])
-        self.manager._shutdown.wait = lambda _timeout: next(waits, True)
+        runtime.stop.wait = lambda _timeout: next(waits, True)
+        with patch("vps.exit_manager.probe_204") as probe:
+            self.manager._health_loop("exit-01", generation)
 
-        self.manager._health_loop("exit-01", generation)
-
+        probe.assert_not_called()
         self.assertEqual(
             [("exit-01", generation, "policy route disappeared", "198.51.100.1")],
             handled,
         )
+
+    def test_health_loop_records_failure_and_schedules_retry_after_two_consecutive_204_failures(self):
+        generation = self.store.get_slot("exit-01").generation
+        self.manager.commit_ready(
+            "exit-01",
+            generation,
+            entry_ip="198.51.100.1",
+            egress_ip="203.0.113.1",
+            node={"country": "JP"},
+            check_result={"is_residential": True},
+        )
+        runtime = self.manager.runtime("exit-01")
+        runtime.process = type("RunningProcess", (), {"poll": lambda self: None})()
+        self.manager.routing.is_installed = lambda _slot: True
+        self.manager._run = lambda command, capture_output=True, text=True, check=False: type(
+            "CmdResult", (), {"returncode": 0, "stdout": "500"}
+        )()
+
+        scheduled = []
+        self.manager.start_workers = True
+        self.manager._schedule_retry = lambda slot_id, failed_generation, delay: scheduled.append(
+            (slot_id, failed_generation, delay)
+        )
+        self.manager.redial_slot = lambda _slot_id: self.fail("health worker must not redial itself")
+
+        waits = iter([False, False])
+        runtime.stop.wait = lambda _timeout: next(waits, True)
+        self.manager._health_loop("exit-01", generation)
+
+        failed = self.store.get_slot("exit-01")
+        self.assertTrue(failed.enabled)
+        self.assertEqual("failed", failed.state)
+        self.assertEqual(1, failed.failure_streak)
+        self.assertEqual("HTTP 204 probe failed twice consecutively", failed.last_error)
+        self.assertEqual([("exit-01", failed.generation, 5)], scheduled)
+        self.assertTrue(runtime.stop.is_set())
+
+    def test_repeated_health_failures_auto_disable_only_the_failed_slot(self):
+        class RunningProcess:
+            def poll(self):
+                return None
+
+            def terminate(self):
+                return None
+
+            def wait(self, timeout=None):
+                return 0
+
+        self.manager.routing.is_installed = lambda _slot: True
+        self.manager._run = lambda command, capture_output=True, text=True, check=False: type(
+            "CmdResult", (), {"returncode": 0, "stdout": "500"}
+        )()
+        self.manager.start_workers = False
+
+        for attempt in range(3):
+            generation = self.store.get_slot("exit-01").generation
+            runtime = self.manager.runtime("exit-01")
+            runtime.process = RunningProcess()
+            waits = iter([False, False])
+            runtime.stop.wait = lambda _timeout, waits=waits: next(waits, True)
+            self.manager._health_loop("exit-01", generation)
+            current = self.store.get_slot("exit-01")
+            if current.enabled:
+                self.manager.start_slot("exit-01")
+
+        failed = self.store.get_slot("exit-01")
+        self.assertFalse(failed.enabled)
+        self.assertEqual("disabled", failed.state)
+        self.assertEqual(3, failed.failure_streak)
+        self.assertEqual("automatic_failure_limit", failed.disabled_reason)
+        self.assertTrue(self.store.get_slot("exit-02").enabled)
+
+    def test_health_loop_resets_failures_on_successful_204_probe(self):
+        generation = self.store.get_slot("exit-01").generation
+        self.manager.commit_ready(
+            "exit-01",
+            generation,
+            entry_ip="198.51.100.1",
+            egress_ip="203.0.113.1",
+            node={"country": "JP"},
+            check_result={"is_residential": True},
+        )
+        runtime = self.manager.runtime("exit-01")
+        runtime.process = type("RunningProcess", (), {"poll": lambda self: None})()
+        self.manager.routing.is_installed = lambda _slot: True
+
+        # First run fails, second run succeeds (204).
+        probe_responses = iter(["500", "204"])
+        self.manager._run = lambda command, capture_output=True, text=True, check=False: type(
+            "CmdResult", (), {"returncode": 0, "stdout": next(probe_responses)}
+        )()
+        self.manager.redial_slot = lambda _slot_id: self.fail("a successful probe must not redial")
+
+        waits = iter([False, False])
+        runtime.stop.wait = lambda _timeout: next(waits, True)
+        self.manager._health_loop("exit-01", generation)
+
+        self.assertEqual("ready", self.store.get_slot("exit-01").state)
+        self.assertEqual(0, self.store.get_slot("exit-01").failure_streak)
+
+    def test_health_loop_returns_immediately_when_slot_stop_event_is_set(self):
+        generation = self.store.get_slot("exit-01").generation
+        self.manager.commit_ready(
+            "exit-01",
+            generation,
+            entry_ip="198.51.100.1",
+            egress_ip="203.0.113.1",
+            node={"country": "JP"},
+            check_result={"is_residential": True},
+        )
+        runtime = self.manager.runtime("exit-01")
+        runtime.process = type("RunningProcess", (), {"poll": lambda self: None})()
+        runtime.stop.set()
+        with patch.object(self.manager.routing, "is_installed", create=True) as route_check, patch(
+            "vps.exit_manager.probe_204"
+        ) as probe:
+            self.manager._health_loop("exit-01", generation)
+
+        route_check.assert_not_called()
+        probe.assert_not_called()
 
     def test_third_failure_disables_only_failed_slot(self):
         for attempt in range(3):
@@ -568,6 +800,93 @@ class ExitManagerTest(unittest.TestCase):
         self.assertFalse(self.store.get_slot("exit-01").enabled)
         self.assertTrue(self.store.get_slot("exit-02").enabled)
         self.assertEqual("disabled", self.store.get_slot("exit-01").state)
+
+    def test_allow_non_residential_allows_datacenter_when_enabled(self):
+        generation = self.store.get_slot("exit-01").generation
+        datacenter_result = {
+            "status": "checked",
+            "is_residential": False,
+            "egress_type": "datacenter",
+            "egress_type_label": "机房IP",
+        }
+        handled = []
+        self.manager._handle_connection_failure = lambda slot_id, gen, err, endpoint_ip="": handled.append(err)
+
+        class InitializedProcess:
+            def poll(self): return None
+            def terminate(self): pass
+            def wait(self, timeout=None): return 0
+
+        self.manager.node_pool.replace([{"ip": "198.51.100.1", "country": "JP", "ping": 1, "score": 100, "config": ""}])
+        self.manager.config_dir.mkdir(parents=True, exist_ok=True)
+        self.manager.auth_file.write_text("vpn\nvpn\n", encoding="utf-8")
+        log_path = self.manager.workspace / "exit-01.log"
+
+        def populate_log(*_args, **_kwargs):
+            log_path.write_text("Initialization Sequence Completed", encoding="utf-8")
+            return InitializedProcess()
+
+        self.manager._popen = populate_log
+        self.manager.routing.install = lambda *_args, **_kwargs: None
+        self.manager.routing.is_installed = lambda *_args, **_kwargs: True
+        with patch.dict(os.environ, {"KUI_ALLOW_NON_RESIDENTIAL": "1"}), patch.object(
+            self.manager, "_default_route", return_value=("172.18.0.1", "eth0")
+        ), patch.object(
+            self.manager, "_openvpn_command", return_value=["openvpn"]
+        ), patch.object(
+            self.manager, "_health_loop", return_value=None
+        ), patch(
+            "vps.exit_manager.detect_egress", return_value="203.0.113.1"
+        ), patch(
+            "vps.exit_manager.check_residential", return_value=(False, datacenter_result)
+        ), patch(
+            "vps.exit_manager.probe_targets", return_value={"accepted": True}
+        ):
+            self.manager._connect_worker("exit-01", generation)
+
+        self.assertEqual("ready", self.store.get_slot("exit-01").state)
+        self.assertEqual([], handled)
+
+    def test_unknown_testisp_fails_even_if_allow_non_residential_enabled(self):
+        generation = self.store.get_slot("exit-01").generation
+        unknown_result = {
+            "status": "unknown",
+            "is_residential": False,
+            "egress_type": "unknown",
+            "egress_type_label": "未知IP类型",
+        }
+        handled = []
+        self.manager._handle_connection_failure = lambda slot_id, gen, err, endpoint_ip="": handled.append(err)
+
+        class InitializedProcess:
+            def poll(self): return None
+            def terminate(self): pass
+            def wait(self, timeout=None): return 0
+
+        self.manager.node_pool.replace([{"ip": "198.51.100.1", "country": "JP", "ping": 1, "score": 100, "config": ""}])
+        self.manager.config_dir.mkdir(parents=True, exist_ok=True)
+        self.manager.auth_file.write_text("vpn\nvpn\n", encoding="utf-8")
+        log_path = self.manager.workspace / "exit-01.log"
+
+        def populate_log(*_args, **_kwargs):
+            log_path.write_text("Initialization Sequence Completed", encoding="utf-8")
+            return InitializedProcess()
+
+        self.manager._popen = populate_log
+        self.manager.routing.install = lambda *_args, **_kwargs: None
+        with patch.dict(os.environ, {"KUI_ALLOW_NON_RESIDENTIAL": "1"}), patch.object(
+            self.manager, "_default_route", return_value=("172.18.0.1", "eth0")
+        ), patch.object(
+            self.manager, "_openvpn_command", return_value=["openvpn"]
+        ), patch(
+            "vps.exit_manager.detect_egress", return_value="203.0.113.1"
+        ), patch(
+            "vps.exit_manager.check_residential", return_value=(False, unknown_result)
+        ):
+            self.manager._connect_worker("exit-01", generation)
+
+        self.assertEqual(1, len(handled))
+        self.assertIn("TestISP check failed", handled[0])
 
 
 if __name__ == "__main__":

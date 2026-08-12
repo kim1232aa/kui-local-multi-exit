@@ -97,6 +97,19 @@ class ProxyServerTest(unittest.TestCase):
         self.assertEqual(b"secret", proxy_server.PROXY_PASS)
         self.assertEqual("exit-01", first.slot_id)
 
+    def test_internal_and_admin_credentials_can_coexist(self):
+        original = (proxy_server._PROXY_USER, proxy_server._PROXY_PASS, proxy_server._ADDITIONAL_PROXY_CREDENTIALS)
+        try:
+            proxy_server.set_credentials("gateway", "internal-secret")
+            proxy_server.set_additional_credentials([("admin", "panel-password")])
+
+            self.assertTrue(proxy_server.credentials_match(b"gateway", b"internal-secret"))
+            self.assertTrue(proxy_server.credentials_match(b"admin", b"panel-password"))
+            self.assertFalse(proxy_server.credentials_match(b"admin", b"wrong"))
+        finally:
+            proxy_server.set_credentials(original[0], original[1])
+            proxy_server._ADDITIONAL_PROXY_CREDENTIALS = original[2]
+
     def test_start_raises_when_listener_port_cannot_bind(self):
         occupied = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         occupied.bind(("127.0.0.1", 0))
@@ -115,16 +128,27 @@ class ProxyServerTest(unittest.TestCase):
             listener.stop()
             occupied.close()
 
-    def test_listener_connection_limits_are_independent(self):
-        first = proxy_server.ProxyListener("exit-01", "0.0.0.0", 7920, "tun0", 200)
-        second = proxy_server.ProxyListener("exit-02", "0.0.0.0", 7921, "tun1", 201)
+    def test_listener_connection_limit_is_shared_but_client_tracking_is_independent(self):
+        previous_limit = proxy_server.MAX_CONNECTIONS
+        try:
+            proxy_server.configure_connection_limit(2)
+            first = proxy_server.ProxyListener("exit-01", "0.0.0.0", 7920, "tun0", 200)
+            second = proxy_server.ProxyListener("exit-02", "0.0.0.0", 7921, "tun1", 201)
 
-        self.assertTrue(hasattr(first, "_connection_slots"))
-        self.assertTrue(hasattr(second, "_connection_slots"))
-        self.assertIsNot(first._connection_slots, second._connection_slots)
-        self.assertTrue(hasattr(first, "_clients"))
-        self.assertTrue(hasattr(second, "_clients"))
-        self.assertIsNot(first._clients, second._clients)
+            self.assertTrue(proxy_server.CONNECTION_SLOTS.acquire(blocking=False))
+            self.assertTrue(proxy_server.CONNECTION_SLOTS.acquire(blocking=False))
+            self.assertFalse(proxy_server.CONNECTION_SLOTS.acquire(blocking=False))
+            proxy_server.CONNECTION_SLOTS.release()
+            proxy_server.CONNECTION_SLOTS.release()
+            self.assertTrue(hasattr(first, "_clients"))
+            self.assertTrue(hasattr(second, "_clients"))
+            self.assertIsNot(first._clients, second._clients)
+        finally:
+            proxy_server.configure_connection_limit(previous_limit)
+
+    def test_configure_connection_limit_rejects_non_positive_values(self):
+        with self.assertRaisesRegex(ValueError, "positive"):
+            proxy_server.configure_connection_limit(0)
 
     def test_stop_closes_tracked_accepted_clients(self):
         listener = proxy_server.ProxyListener("exit-01", "127.0.0.1", 0, "tun0", 200)

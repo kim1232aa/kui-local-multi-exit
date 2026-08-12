@@ -22,10 +22,10 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .bridge_nodes import _cache_key, _get_cache, load_bridge_nodes, parse_proxy_url
 from .exit_manager import ExitManager
-from .proxy_server import set_credentials
+from .proxy_server import set_additional_credentials
 from .realm_manager import RealmManager, RealmUnavailable
 from .store import LocalStore
-from .subscriptions import parse_subscription
+from .subscriptions import generate_singbox_config, parse_subscription
 from .vpngate import direct_url_opener, fetch_countries
 
 
@@ -364,10 +364,16 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def _send_text(self, status: int, body: str) -> None:
+    def _send_text(
+        self,
+        status: int,
+        body: str,
+        *,
+        content_type: str = "text/plain; charset=utf-8",
+    ) -> None:
         payload = body.encode("utf-8")
         self.send_response(status)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
@@ -387,6 +393,10 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
     def _slot_match(self, suffix: str = ""):
         path = self.path.split("?", 1)[0]
         return re.fullmatch(rf"/api/local/exits/(exit-\d+){suffix}", path)
+
+    def _require_managed_slot(self, slot_id: str) -> None:
+        if not self.server.manager.is_managed_slot(slot_id):
+            raise KeyError(slot_id)
 
     def _query_param(self, name: str) -> str | None:
         from urllib.parse import parse_qs, urlparse
@@ -425,10 +435,13 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 except json.JSONDecodeError:
                     metadata = {}
             metadata.pop("id", None)
+            egress_type, egress_type_label = self._slot_egress_type_info(slot)
             projected.append(
                 {
                     **slot,
                     "listener_ready": listener_ready,
+                    "egress_type": egress_type,
+                    "egress_type_label": egress_type_label,
                     "last_updated": updated_at * 1000,
                     "name": slot["id"],
                     "region": slot["country"],
@@ -498,6 +511,8 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 "port": slot["proxy_port"],
                 "active": slot["state"] == "ready" and self.server.manager.listener_ready(slot["id"]),
                 "listener_ready": self.server.manager.listener_ready(slot["id"]),
+                "egress_type": self._slot_egress_type_info(slot)[0],
+                "egress_type_label": self._slot_egress_type_info(slot)[1],
             }
             for slot in self.server.manager.snapshot()
         ]
@@ -524,40 +539,179 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         return host.split(":", 1)[0] or "127.0.0.1"
 
     @staticmethod
+    def _subscription_extra(node: dict[str, Any]) -> dict[str, Any]:
+        raw = node.get("extra")
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str) and raw.lstrip().startswith("{"):
+            try:
+                value = json.loads(raw)
+                if isinstance(value, dict):
+                    return value
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        return {}
+
+    @classmethod
+    def _subscription_value(cls, node: dict[str, Any], key: str, default: Any = "") -> Any:
+        value = node.get(key)
+        if value not in (None, ""):
+            return value
+        return cls._subscription_extra(node).get(key, default)
+
+    @classmethod
+    def _subscription_bool(cls, node: dict[str, Any], key: str) -> bool:
+        value = cls._subscription_value(node, key, False)
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
     def _subscription_link(node: dict[str, Any]) -> str:
-        address = str(node["address"])
+        try:
+            address = str(node.get("address") or node.get("server") or "").strip()
+            port = int(node.get("port") or node.get("server_port") or 0)
+        except (TypeError, ValueError):
+            return ""
+        if not address or not 1 <= port <= 65535:
+            return ""
         display_address = f"[{address}]" if ":" in address and not address.startswith("[") else address
-        name = quote(str(node.get("name") or f"TP_{node['protocol']}_{node['port']}"), safe="")
-        protocol = str(node["protocol"])
-        if protocol == "VMess" and str(node.get("extra", "")).startswith("vmess://"):
-            return str(node["extra"])
-        if protocol in {"VLESS", "Reality"}:
-            query = ["encryption=none"]
-            if protocol == "Reality":
-                query.extend(("security=reality", f"sni={quote(str(node.get('sni', '')), safe='')}", "fp=chrome"))
-                if node.get("public_key"):
-                    query.append(f"pbk={quote(str(node['public_key']), safe='')}")
+        protocol = str(node.get("protocol") or node.get("type") or "").strip().lower().replace("_", "-")
+        name_text = str(node.get("name") or f"TP_{protocol or 'node'}_{port}")
+        name = quote(name_text, safe="")
+        raw_extra = str(node.get("extra") or "").strip()
+
+        def parameter(key: str, value: Any) -> str:
+            return f"{quote(key, safe='')}={quote(str(value), safe='')}"
+
+        if protocol == "vmess":
+            if raw_extra.lower().startswith("vmess://"):
+                return raw_extra
+            uuid = str(node.get("uuid") or "")
+            if not uuid:
+                return ""
+            vmess = {
+                "v": "2",
+                "ps": name_text,
+                "add": address,
+                "port": str(port),
+                "id": uuid,
+                "aid": "0",
+                "scy": "auto",
+                "net": str(node.get("network") or "tcp"),
+            }
+            security = str(LocalAPIHandler._subscription_value(node, "security", "") or "").lower()
+            if security in {"tls", "xtls"} or LocalAPIHandler._subscription_bool(node, "tls"):
+                vmess["tls"] = "tls"
+                vmess["sni"] = str(node.get("sni") or address)
+            if node.get("host"):
+                vmess["host"] = str(node["host"])
+            if node.get("path"):
+                vmess["path"] = str(node["path"])
+            encoded = base64.b64encode(json.dumps(vmess, ensure_ascii=False, separators=(",", ":")).encode()).decode().rstrip("=")
+            return f"vmess://{encoded}"
+
+        if protocol in {"vless", "reality", "xtls-reality", "h2-reality", "grpc-reality"}:
+            uuid = str(node.get("uuid") or "")
+            if not uuid:
+                return ""
+            public_key = str(node.get("public_key") or "")
+            security = str(LocalAPIHandler._subscription_value(node, "security", "none") or "none").lower()
+            is_reality = protocol != "vless" or bool(public_key) or security == "reality"
+            if is_reality and not public_key:
+                return ""
+            query = [parameter("encryption", "none")]
+            if is_reality:
+                query.extend((
+                    parameter("security", "reality"),
+                    parameter("sni", node.get("sni") or address),
+                    parameter("fp", node.get("client-fingerprint") or LocalAPIHandler._subscription_value(node, "fingerprint", "chrome") or "chrome"),
+                ))
+                if public_key:
+                    query.append(parameter("pbk", public_key))
                 if node.get("short_id"):
-                    query.append(f"sid={quote(str(node['short_id']), safe='')}")
-                if node.get("flow"):
-                    query.append(f"flow={quote(str(node['flow']), safe='')}")
+                    query.append(parameter("sid", node["short_id"]))
             else:
-                query.append("security=none")
-            query.append(f"type={quote(str(node.get('network') or 'tcp'), safe='')}")
-            return f"vless://{quote(str(node.get('uuid', '')), safe='')}@{display_address}:{node['port']}?{'&'.join(query)}#{name}"
-        if protocol == "Trojan":
-            return f"trojan://{quote(str(node.get('password', '')), safe='')}@{display_address}:{node['port']}?security=tls&sni={quote(str(node.get('sni', '')), safe='')}#{name}"
-        if protocol == "Hysteria2":
-            return f"hysteria2://{quote(str(node.get('password') or node.get('uuid', '')), safe='')}@{display_address}:{node['port']}?insecure=1&sni={quote(str(node.get('sni', '')), safe='')}#{name}"
-        if protocol == "TUIC":
-            return f"tuic://{quote(str(node.get('uuid', '')), safe='')}:{quote(str(node.get('password', '')), safe='')}@{display_address}:{node['port']}?sni={quote(str(node.get('sni', '')), safe='')}#{name}"
-        if protocol == "Naive":
-            return f"naive+https://{quote(str(node.get('uuid', '')), safe='')}:{quote(str(node.get('password', '')), safe='')}@{display_address}:{node['port']}?sni={quote(str(node.get('sni', '')), safe='')}#{name}"
-        if protocol == "AnyTLS":
-            return f"anytls://{quote(str(node.get('password', '')), safe='')}@{display_address}:{node['port']}?sni={quote(str(node.get('sni', '')), safe='')}#{name}"
-        if protocol == "SS":
-            credentials = base64.urlsafe_b64encode(f"{node.get('uuid', '')}:{node.get('password', '')}".encode()).decode().rstrip("=")
-            return f"ss://{credentials}@{display_address}:{node['port']}#{name}"
+                tls = security in {"tls", "xtls"} or LocalAPIHandler._subscription_bool(node, "tls")
+                query.append(parameter("security", "tls" if tls else "none"))
+                if tls:
+                    query.append(parameter("sni", node.get("sni") or address))
+                    fingerprint = LocalAPIHandler._subscription_value(node, "fingerprint", "")
+                    if fingerprint:
+                        query.append(parameter("fp", fingerprint))
+            if node.get("flow"):
+                query.append(parameter("flow", node["flow"]))
+            network = str(node.get("network") or ("http" if protocol == "h2-reality" else "grpc" if protocol == "grpc-reality" else "tcp"))
+            query.append(parameter("type", network))
+            if node.get("host"):
+                query.append(parameter("host", node["host"]))
+            if node.get("path"):
+                query.append(parameter("path", node["path"]))
+            service_name = LocalAPIHandler._subscription_value(node, "service_name", "")
+            if service_name:
+                query.append(parameter("serviceName", service_name))
+            return f"vless://{quote(uuid, safe='')}@{display_address}:{port}?{'&'.join(query)}#{name}"
+
+        if protocol == "trojan":
+            password = str(node.get("password") or node.get("private_key") or "")
+            if not password:
+                return ""
+            query = [parameter("security", "tls"), parameter("sni", node.get("sni") or address)]
+            if LocalAPIHandler._subscription_bool(node, "insecure"):
+                query.append(parameter("allowInsecure", "1"))
+            return f"trojan://{quote(password, safe='')}@{display_address}:{port}?{'&'.join(query)}#{name}"
+
+        if protocol in {"hysteria2", "hy2", "hysteria"}:
+            password = str(node.get("password") or node.get("uuid") or node.get("private_key") or "")
+            if not password:
+                return ""
+            query = [parameter("insecure", "1"), parameter("sni", node.get("sni") or address)]
+            return f"hysteria2://{quote(password, safe='')}@{display_address}:{port}?{'&'.join(query)}#{name}"
+
+        if protocol == "tuic":
+            uuid = str(node.get("uuid") or "")
+            password = str(node.get("password") or node.get("private_key") or "")
+            if not uuid or not password:
+                return ""
+            query = [parameter("sni", node.get("sni") or address)]
+            if LocalAPIHandler._subscription_bool(node, "insecure"):
+                query.append(parameter("allow_insecure", "1"))
+            return f"tuic://{quote(uuid, safe='')}:{quote(password, safe='')}@{display_address}:{port}?{'&'.join(query)}#{name}"
+
+        if protocol == "naive":
+            username = str(node.get("uuid") or node.get("username") or "")
+            password = str(node.get("password") or node.get("private_key") or "")
+            if not username or not password:
+                return ""
+            return f"naive+https://{quote(username, safe='')}:{quote(password, safe='')}@{display_address}:{port}?{parameter('sni', node.get('sni') or address)}#{name}"
+
+        if protocol == "anytls":
+            password = str(node.get("password") or node.get("private_key") or "")
+            if not password:
+                return ""
+            query = [parameter("sni", node.get("sni") or address)]
+            if LocalAPIHandler._subscription_bool(node, "insecure"):
+                query.append(parameter("insecure", "1"))
+            return f"anytls://{quote(password, safe='')}@{display_address}:{port}?{'&'.join(query)}#{name}"
+
+        if protocol in {"socks", "socks5", "socks-5"}:
+            extra = LocalAPIHandler._subscription_extra(node)
+            username = str(node.get("username") or extra.get("username") or node.get("uuid") or "")
+            password = str(node.get("password") or "")
+            credentials = f"{quote(username, safe='')}:{quote(password, safe='')}@" if username or password else ""
+            return f"socks5://{credentials}{display_address}:{port}#{name}"
+
+        if protocol in {"ss", "shadowsocks"}:
+            extra = LocalAPIHandler._subscription_extra(node)
+            method = str(node.get("cipher") or node.get("uuid") or extra.get("method") or "")
+            password = str(node.get("password") or "")
+            if not method or not password:
+                return ""
+            credentials = base64.urlsafe_b64encode(f"{method}:{password}".encode()).decode().rstrip("=")
+            return f"ss://{credentials}@{display_address}:{port}#{name}"
+
+        if protocol == "ssr" and raw_extra.lower().startswith("ssr://"):
+            return raw_extra
         return ""
 
     @staticmethod
@@ -569,88 +723,155 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
     def _ws_host(node: dict[str, Any]) -> str:
         ws_opts = node.get("ws-opts") if isinstance(node.get("ws-opts"), dict) else {}
         headers = ws_opts.get("headers") if isinstance(ws_opts.get("headers"), dict) else {}
-        return str(headers.get("Host") or node.get("host") or node.get("sni") or node["address"])
+        return str(
+            headers.get("Host")
+            or node.get("host")
+            or node.get("sni")
+            or node.get("address")
+            or node.get("server")
+            or ""
+        )
 
-    @staticmethod
-    def _clash_proxy(node: dict[str, Any]) -> tuple[str, str] | None:
-        name = str(node.get("name") or f"TP_{node['protocol']}_{node['port']}")
+    @classmethod
+    def _clash_proxy(cls, node: dict[str, Any]) -> tuple[str, str] | None:
+        try:
+            address_value = str(node.get("address") or node.get("server") or "").strip()
+            port = int(node.get("port") or node.get("server_port") or 0)
+        except (TypeError, ValueError):
+            return None
+        if not address_value or not 1 <= port <= 65535:
+            return None
+        protocol = str(node.get("protocol") or node.get("type") or "").strip().lower().replace("_", "-")
+        name = str(node.get("name") or f"TP_{protocol or 'node'}_{port}")
         quoted_name = json.dumps(name, ensure_ascii=False)
-        address = json.dumps(str(node["address"]), ensure_ascii=False)
-        protocol = str(node["protocol"]).upper()
+        address = json.dumps(address_value, ensure_ascii=False)
         lines = [
             f"  - name: {quoted_name}",
-            f"    type: {protocol.lower()}",
+            f"    type: {protocol}",
             f"    server: {address}",
-            f"    port: {int(node['port'])}",
+            f"    port: {port}",
         ]
-        if protocol in {"VLESS", "REALITY"}:
+        extra = cls._subscription_extra(node)
+
+        if protocol in {"vless", "reality", "xtls-reality", "h2-reality", "grpc-reality"}:
+            uuid = str(node.get("uuid") or "")
+            if not uuid:
+                return None
             lines[1] = "    type: vless"
-            lines.extend((f"    uuid: {json.dumps(str(node.get('uuid', '')))}", "    udp: true"))
-            network = str(node.get("network") or "tcp")
-            lines.append(f"    network: {json.dumps(network)}")
-            if protocol == "REALITY":
+            lines.extend((f"    uuid: {json.dumps(uuid)}", "    udp: true"))
+            network = str(node.get("network") or "tcp").lower()
+            if protocol == "h2-reality" or network == "http":
+                network = "h2"
+            elif protocol == "grpc-reality":
+                network = "grpc"
+            if network != "h2":
+                lines.append(f"    network: {json.dumps(network)}")
+            public_key = str(node.get("public_key") or "")
+            security = str(cls._subscription_value(node, "security", "none") or "none").lower()
+            is_reality = protocol != "vless" or bool(public_key) or security == "reality"
+            if is_reality:
+                if not public_key:
+                    return None
                 lines.extend((
                     "    tls: true",
-                    f"    servername: {json.dumps(str(node.get('sni', '')))}",
-                    "    client-fingerprint: chrome",
+                    f"    servername: {json.dumps(str(node.get('sni') or address_value))}",
+                    f"    client-fingerprint: {json.dumps(str(node.get('client-fingerprint') or extra.get('fingerprint') or 'chrome'))}",
                     "    reality-opts:",
-                    f"      public-key: {json.dumps(str(node.get('public_key', '')))}",
-                    f"      short-id: {json.dumps(str(node.get('short_id', '')))}",
+                    f"      public-key: {json.dumps(public_key)}",
+                    f"      short-id: {json.dumps(str(node.get('short_id') or ''))}",
                 ))
-                if node.get("flow"):
-                    lines.append(f"    flow: {json.dumps(str(node['flow']))}")
-            elif node.get("tls"):
+                flow = str(node.get("flow") or "")
+                if flow:
+                    lines.append(f"    flow: {json.dumps(flow)}")
+            elif security in {"tls", "xtls"} or cls._subscription_bool(node, "tls"):
                 lines.extend((
                     "    tls: true",
-                    f"    servername: {json.dumps(str(node.get('servername') or node.get('sni', '')))}",
+                    f"    servername: {json.dumps(str(node.get('servername') or node.get('sni') or address_value))}",
+                    f"    client-fingerprint: {json.dumps(str(node.get('client-fingerprint') or extra.get('fingerprint') or 'chrome'))}",
                 ))
-                fp = str(node.get("client-fingerprint", "chrome"))
-                lines.append(f"    client-fingerprint: {json.dumps(fp)}")
-            if network == "ws":
+            if network in {"ws", "websocket"}:
                 lines.extend((
                     "    ws-opts:",
-                    f"      path: {json.dumps(LocalAPIHandler._ws_path(node))}",
+                    f"      path: {json.dumps(cls._ws_path(node))}",
                     "      headers:",
-                    f"        Host: {json.dumps(LocalAPIHandler._ws_host(node))}",
+                    f"        Host: {json.dumps(cls._ws_host(node))}",
                 ))
             elif network == "grpc":
-                lines.extend(("    grpc-opts:", f"      grpc-service-name: {json.dumps(str(node.get('path', '')).lstrip('/'))}"))
-        elif protocol == "TROJAN":
+                service_name = str(node.get("service_name") or extra.get("service_name") or node.get("path") or "grpc").lstrip("/")
+                lines.extend(("    grpc-opts:", f"      grpc-service-name: {json.dumps(service_name or 'grpc')}"))
+            elif network in {"http", "h2"}:
+                lines.extend((
+                    "    network: h2",
+                    "    h2-opts:",
+                    "      host:",
+                    f"        - {json.dumps(str(node.get('host') or node.get('sni') or address_value))}",
+                    f"      path: {json.dumps(str(node.get('path') or '/'))}",
+                ))
+        elif protocol == "http":
+            lines[1] = "    type: http"
+            username = str(node.get("username") or extra.get("username") or "")
+            password = str(node.get("password") or "")
+            if username:
+                lines.append(f"    username: {json.dumps(username)}")
+                lines.append(f"    password: {json.dumps(password)}")
+        elif protocol in {"socks", "socks5", "socks-5"}:
+            lines[1] = "    type: socks5"
+            username = str(node.get("username") or extra.get("username") or node.get("uuid") or "")
+            password = str(node.get("password") or "")
+            if username:
+                lines.append(f"    username: {json.dumps(username)}")
+                lines.append(f"    password: {json.dumps(password)}")
+            lines.append("    udp: true")
+        elif protocol == "trojan":
+            password = str(node.get("password") or node.get("private_key") or "")
+            if not password:
+                return None
             lines.extend((
-                f"    password: {json.dumps(str(node.get('password', '')))}",
-                f"    sni: {json.dumps(str(node.get('sni', '')))}",
+                f"    password: {json.dumps(password)}",
+                f"    sni: {json.dumps(str(node.get('sni') or address_value))}",
                 "    udp: true",
             ))
-        elif protocol == "HYSTERIA2":
+        elif protocol in {"hysteria2", "hy2", "hysteria"}:
+            password = str(node.get("password") or node.get("uuid") or node.get("private_key") or "")
+            if not password:
+                return None
             lines[1] = "    type: hysteria2"
             lines.extend((
-                f"    password: {json.dumps(str(node.get('password') or node.get('uuid', '')))}",
-                f"    sni: {json.dumps(str(node.get('sni', '')))}",
+                f"    password: {json.dumps(password)}",
+                f"    sni: {json.dumps(str(node.get('sni') or address_value))}",
                 "    skip-cert-verify: true",
             ))
-        elif protocol == "TUIC":
+        elif protocol == "tuic":
+            uuid = str(node.get("uuid") or "")
+            password = str(node.get("password") or node.get("private_key") or "")
+            if not uuid or not password:
+                return None
             lines.extend((
-                f"    uuid: {json.dumps(str(node.get('uuid', '')))}",
-                f"    password: {json.dumps(str(node.get('password', '')))}",
-                f"    sni: {json.dumps(str(node.get('sni', '')))}",
+                f"    uuid: {json.dumps(uuid)}",
+                f"    password: {json.dumps(password)}",
+                f"    sni: {json.dumps(str(node.get('sni') or address_value))}",
                 "    skip-cert-verify: true",
                 "    udp-relay-mode: native",
             ))
-        elif protocol == "SS":
+        elif protocol in {"ss", "shadowsocks"}:
+            method = str(node.get("cipher") or node.get("uuid") or extra.get("method") or "")
+            password = str(node.get("password") or "")
+            if not method or not password:
+                return None
             lines[1] = "    type: ss"
             lines.extend((
-                f"    cipher: {json.dumps(str(node.get('cipher') or node.get('uuid', '')))}",
-                f"    password: {json.dumps(str(node.get('password', '')))}",
+                f"    cipher: {json.dumps(method)}",
+                f"    password: {json.dumps(password)}",
                 "    udp: true",
             ))
-        elif protocol == "HTTP":
+        elif protocol in {"HTTP", "http"}:
             lines[1] = "    type: http"
             if node.get("username"):
                 lines.extend((
                     f"    username: {json.dumps(str(node['username']))}",
                     f"    password: {json.dumps(str(node.get('password', '')))}",
                 ))
-        elif protocol == "SOCKS5":
+        elif protocol in {"SOCKS5", "socks5"}:
             lines[1] = "    type: socks5"
             lines.append("    udp: true")
             if node.get("username"):
@@ -658,22 +879,36 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     f"    username: {json.dumps(str(node['username']))}",
                     f"    password: {json.dumps(str(node.get('password', '')))}",
                 ))
-        elif protocol == "VMESS":
+        elif protocol in {"VMESS", "vmess"}:
+            uuid = str(node.get("uuid") or "")
+            if not uuid:
+                return None
             lines[1] = "    type: vmess"
+            network = str(node.get("network") or "tcp").lower()
             lines.extend((
-                f"    uuid: {json.dumps(str(node.get('uuid', '')))}",
+                f"    uuid: {json.dumps(uuid)}",
                 "    alterId: 0",
                 "    cipher: auto",
                 "    udp: true",
-                f"    network: {json.dumps(str(node.get('network') or 'tcp'))}",
+                f"    network: {json.dumps(network)}",
             ))
-            if str(node.get("network") or "") == "ws":
+            if network in {"ws", "websocket"}:
                 lines.extend((
                     "    ws-opts:",
-                    f"      path: {json.dumps(LocalAPIHandler._ws_path(node))}",
+                    f"      path: {json.dumps(cls._ws_path(node))}",
                     "      headers:",
-                    f"        Host: {json.dumps(LocalAPIHandler._ws_host(node))}",
+                    f"        Host: {json.dumps(cls._ws_host(node))}",
                 ))
+        elif protocol == "anytls":
+            password = str(node.get("password") or node.get("private_key") or "")
+            if not password:
+                return None
+            lines[1] = "    type: anytls"
+            lines.extend((
+                f"    password: {json.dumps(password)}",
+                f"    sni: {json.dumps(str(node.get('sni') or address_value))}",
+                "    skip-cert-verify: true",
+            ))
         else:
             return None
         if node.get("dialer-proxy"):
@@ -778,6 +1013,52 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         return raw.get("isp") if isinstance(raw.get("isp"), dict) else {}
 
     @classmethod
+    def _slot_egress_type_info(cls, slot: dict[str, Any]) -> tuple[str, str]:
+        check_result = slot.get("check_result") if isinstance(slot.get("check_result"), dict) else {}
+        residential = check_result.get("residential") if isinstance(check_result.get("residential"), dict) else {}
+        egress_type = residential.get("egress_type")
+        egress_type_label = residential.get("egress_type_label")
+        if egress_type and egress_type_label:
+            return str(egress_type), str(egress_type_label)
+
+        raw_isp = residential.get("raw", {}).get("isp", {}) if isinstance(residential.get("raw"), dict) else {}
+        flag = str(raw_isp.get("flag", "")).strip().lower()
+        isp_type = str(raw_isp.get("type", "")).strip().lower()
+        warning = str(raw_isp.get("warning", "")).strip().lower()
+        is_res = residential.get("is_residential") if "is_residential" in residential else check_result.get("is_residential")
+        explicit_non_residential_flags = {
+            "datacenter",
+            "hosting",
+            "business",
+            "corporate",
+            "enterprise",
+            "government",
+            "education",
+        }
+        non_residential_markers = (
+            "datacenter",
+            "data center",
+            "hosting",
+            "business",
+            "corporate",
+            "enterprise",
+            "government",
+            "education",
+            "vpn",
+            "proxy",
+        )
+        explicitly_non_residential = (
+            flag in explicit_non_residential_flags
+            or any(marker in value for value in (isp_type, warning) for marker in non_residential_markers)
+        )
+
+        if is_res is True or flag == "residential":
+            return "residential", "住宅IP"
+        if explicitly_non_residential:
+            return "datacenter", "机房IP"
+        return "unknown", "未知IP类型"
+
+    @classmethod
     def _slot_country_code(cls, slot: dict[str, Any]) -> str:
         current_node = slot.get("current_node") if isinstance(slot.get("current_node"), dict) else {}
         geo_code = cls._useful_label(cls._slot_geo(slot).get("country_code")).upper()
@@ -800,6 +1081,9 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             location = f"{location}-{city}"
 
         parts = [location]
+        egress_type, egress_type_label = cls._slot_egress_type_info(slot)
+        if egress_type_label:
+            parts.append(egress_type_label)
         provider = cls._short_isp_name(isp.get("org"))
         if provider:
             parts.append(provider)
@@ -841,6 +1125,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 nodes.append({
                     **node,
                     "name": self._friendly_slot_name(publishable[slot_id]),
+                    "country": self._slot_country_code(publishable[slot_id]),
                     "_subscription_group": "direct",
                 })
             elif slot_id.startswith("tr-"):
@@ -850,17 +1135,38 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 chained = {
                     **node,
                     "name": f"{base_name} | 链式",
+                    "country": str(node.get("country") or "TR"),
                     "_subscription_group": "chain",
                 }
                 if include_dialer_proxy:
                     chained["dialer-proxy"] = _FRONT_GROUP
                 nodes.append(chained)
+        if self.server.reality_nodes_file:
+            return nodes
+        if not nodes:
+            host = self._request_proxy_host()
+            for slot in publishable.values():
+                # Local-only deployments without a configured Reality manifest
+                # may still consume the loopback SOCKS subscription.
+                nodes.append({
+                    "name": self._friendly_slot_name(slot),
+                    "country": self._slot_country_code(slot),
+                    "protocol": "socks",
+                    "address": host,
+                    "port": slot["proxy_port"],
+                    "username": self.server.username,
+                    "password": self.server.password,
+                    "_subscription_group": "direct",
+                })
         return nodes
 
     def _local_subscription_links(self) -> list[str]:
-        reality_nodes = self._local_reality_nodes()
         if self.server.reality_nodes_file:
-            return [self._subscription_link(node) for node in self._local_subscription_nodes()]
+            return [
+                link
+                for node in self._local_subscription_nodes()
+                if (link := self._subscription_link(node))
+            ]
         host = self._request_proxy_host()
         username = quote(self.server.username, safe="")
         password = quote(self.server.password, safe="")
@@ -870,12 +1176,66 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             links.append(f"socks5://{username}:{password}@{host}:{slot['proxy_port']}#{name}")
         return links
 
-    def _local_clash_proxies(self) -> dict[str, list[tuple[str, str]] | list[str]]:
-        reality_nodes = self._local_reality_nodes()
+    @classmethod
+    def _subscription_country_code(cls, node: dict[str, Any]) -> str:
+        known = set(COUNTRY_PRESETS)
+        for key in ("country_code", "country", "_country_hint"):
+            value = str(node.get(key) or "").upper().strip()
+            if value in known:
+                return value
+        name = str(node.get("name") or "")
+        flag = re.search(r"[\U0001F1E6-\U0001F1FF]{2}", name)
+        if flag:
+            code = "".join(chr(ord(char) - 0x1F1E6 + ord("A")) for char in flag.group(0))
+            if code in known:
+                return code
+        for match in re.finditer(r"(?<![A-Za-z])([A-Za-z]{2})(?![A-Za-z])", name):
+            code = match.group(1).upper()
+            if code in known:
+                return code
+        return "OTHER"
+
+    @staticmethod
+    def _unique_clash_node(node: dict[str, Any], used_names: set[str]) -> dict[str, Any]:
+        protocol = str(node.get("protocol") or node.get("type") or "node")
+        port = node.get("port") or node.get("server_port") or 0
+        base = str(node.get("name") or f"TP_{protocol}_{port}").strip() or f"TP_{protocol}_{port}"
+        candidate = base
+        suffix = 2
+        while candidate in used_names:
+            candidate = f"{base} ({suffix})"
+            suffix += 1
+        used_names.add(candidate)
+        return {**node, "name": candidate}
+
+    def _local_clash_proxies(self) -> dict[str, Any]:
         bridges: list[tuple[str, str]] = []
         direct: list[tuple[str, str]] = []
         chain: list[tuple[str, str]] = []
         front: list[str] = []
+        country_by_name: dict[str, str] = {}
+        used_names = {
+            _FRONT_GROUP,
+            _DIRECT_GROUP,
+            _CHAIN_GROUP,
+            _PROXY_GROUP,
+            "⚡ 自动选择",
+            "🔵 Google / Gemini",
+            "🤖 ChatGPT",
+            "🧠 Claude",
+            "🌐 其他流量",
+            "🇨🇳 中国流量",
+            "DIRECT",
+        }
+
+        def add_entry(target: list[tuple[str, str]], node: dict[str, Any]) -> tuple[str, str] | None:
+            normalized = self._unique_clash_node(node, used_names)
+            entry = self._clash_proxy(normalized)
+            if entry:
+                target.append(entry)
+                country_by_name[entry[0]] = self._subscription_country_code(normalized)
+            return entry
+
         if self.server.reality_nodes_file:
             all_bridge_nodes = self._bridge_nodes()
             # Only explicitly configured bridge URLs are first-hop candidates.
@@ -883,42 +1243,42 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             for bridge in all_bridge_nodes:
                 if bridge.get("_source_kind", "manual") != "manual":
                     continue
-                entry = self._clash_proxy(bridge)
-                if entry:
-                    bridges.append(entry)
+                add_entry(bridges, bridge)
             local_nodes = self._local_subscription_nodes(include_dialer_proxy=False)
             for node in local_nodes:
-                entry = self._clash_proxy(node)
-                if not entry:
-                    continue
                 if node.get("_subscription_group") == "chain":
                     node = {**node, "dialer-proxy": _FRONT_GROUP}
-                    entry = self._clash_proxy(node)
-                    chain.append(entry)
-                else:
-                    direct.append(entry)
+                    add_entry(chain, node)
+                elif entry := add_entry(direct, node):
                     front.append(entry[0])
             # Public subscription nodes are additional final exits. They use
             # the selected first-hop node from the front group.
             for node in all_bridge_nodes:
                 if node.get("_source_kind") != "subscription":
                     continue
-                raw_name = str(node.get("name", "订阅节点"))
-                hint = str(node.get("_country_hint") or "")
+                raw_name = str(node.get("name") or "订阅节点")
+                country_hint = str(node.get("_country_hint") or "")
                 node = {
                     **node,
                     "name": (
-                        f"自动链式 | {hint} | {raw_name}"
-                        if hint in {"TR", "VN", "TH", "PH"} and not raw_name.startswith(hint + "-")
+                        f"自动链式 | {country_hint} | {raw_name}"
+                        if country_hint in {"TR", "VN", "TH", "PH"}
+                        and not raw_name.startswith(country_hint + "-")
                         else f"自动链式 | {raw_name}"
                     ),
+                    "country": country_hint or node.get("country", ""),
                     "dialer-proxy": _FRONT_GROUP,
                     "_subscription_group": "chain",
                 }
-                if entry := self._clash_proxy(node):
-                    chain.append(entry)
+                add_entry(chain, node)
             front.extend(name for name, _ in bridges)
-            return {"bridges": bridges, "direct": direct, "chain": chain, "front": front}
+            return {
+                "bridges": bridges,
+                "direct": direct,
+                "chain": chain,
+                "front": front,
+                "country_by_name": country_by_name,
+            }
 
         host = self._request_proxy_host()
         for slot in self._publishable_slots():
@@ -933,7 +1293,14 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 "    udp: true",
             ))
             direct.append((name, proxy))
-        return {"bridges": bridges, "direct": direct, "chain": chain, "front": front}
+            country_by_name[name] = self._slot_country_code(slot)
+        return {
+            "bridges": bridges,
+            "direct": direct,
+            "chain": chain,
+            "front": front,
+            "country_by_name": country_by_name,
+        }
 
     def _ensure_admin_subscription_token(self) -> str:
         admin_user = self.server.store.get_user(self.server.username)
@@ -951,7 +1318,12 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             return
         if self.path.split("?", 1)[0] == "/api/local/status":
             slots = [
-                {**slot, "listener_ready": bool(self.server.manager.listener_ready(slot["id"]))}
+                {
+                    **slot,
+                    "listener_ready": bool(self.server.manager.listener_ready(slot["id"])),
+                    "egress_type": self._slot_egress_type_info(slot)[0],
+                    "egress_type_label": self._slot_egress_type_info(slot)[1],
+                }
                 for slot in self.server.manager.snapshot()
             ]
             self._send_json(
@@ -967,7 +1339,12 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             return
         if self.path.split("?", 1)[0] == "/api/local/exits":
             slots = [
-                {**slot, "listener_ready": bool(self.server.manager.listener_ready(slot["id"]))}
+                {
+                    **slot,
+                    "listener_ready": bool(self.server.manager.listener_ready(slot["id"])),
+                    "egress_type": self._slot_egress_type_info(slot)[0],
+                    "egress_type_label": self._slot_egress_type_info(slot)[1],
+                }
                 for slot in self.server.manager.snapshot()
             ]
             self._send_json(HTTPStatus.OK, {"exits": slots})
@@ -977,12 +1354,12 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"events": self.server.store.list_events(limit=200)})
             return
         if path == "/api/data":
+            my_sub_token = self._ensure_admin_subscription_token()
             servers = self.server.store.list_vps()
             nodes = self.server.store.list_nodes()
             users = self.server.store.list_users()
             safe_users = [{**u, "password": ""} for u in users]
             site_title = self.server.store.get_setting("site_title", "")
-            my_sub_token = self._ensure_admin_subscription_token()
             self._send_json(HTTPStatus.OK, {
                 "mode": "local",
                 "servers": servers,
@@ -990,6 +1367,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 "users": safe_users,
                 "exits": self.server.manager.snapshot(),
                 "siteTitle": site_title,
+                "mySubUser": self.server.username,
                 "mySubToken": my_sub_token,
                 "realtimeUrl": "",
             })
@@ -1088,16 +1466,53 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             if not user or not user.get("enable") or not token or not hmac.compare_digest(token, str(user.get("sub_token", ""))):
                 self._send_json(HTTPStatus.NOT_FOUND, {"code": "not_found", "error": "subscription not found"})
                 return
-            links = self._local_subscription_links()
+            links = [link for link in self._local_subscription_links() if link]
             thirdparty_nodes = self.server.store.list_enabled_thirdparty_nodes()
-            links.extend(link for node in thirdparty_nodes if (link := self._subscription_link(node)))
-            if self._query_param("format") == "clash":
+            links.extend(
+                link
+                for node in thirdparty_nodes
+                if (link := self._subscription_link(node))
+            )
+            fmt = (self._query_param("format") or "").strip().lower()
+            if fmt == "sing-box":
+                singbox_nodes = list(self._local_subscription_nodes())
+                singbox_nodes.extend(thirdparty_nodes)
+                self._send_text(
+                    HTTPStatus.OK,
+                    generate_singbox_config(singbox_nodes),
+                    content_type="application/json; charset=utf-8",
+                )
+                return
+            if fmt in {"v2ray", "shadowrocket"}:
+                encoded = base64.b64encode("\n".join(links).encode("utf-8")).decode("ascii")
+                self._send_text(HTTPStatus.OK, encoded)
+                return
+            if fmt in {"clash", "clash-meta"}:
                 groups = self._local_clash_proxies()
-                thirdparty_entries: list[tuple[str, str]] = []
+                used_names = {
+                    _FRONT_GROUP,
+                    _DIRECT_GROUP,
+                    _CHAIN_GROUP,
+                    _PROXY_GROUP,
+                    "⚡ 自动选择",
+                    "🔵 Google / Gemini",
+                    "🤖 ChatGPT",
+                    "🧠 Claude",
+                    "🌐 其他流量",
+                    "🇨🇳 中国流量",
+                    "DIRECT",
+                }
+                used_names.update(
+                    name
+                    for group_name in ("bridges", "direct", "chain")
+                    for name, _ in groups[group_name]
+                )
+                country_by_name = groups.setdefault("country_by_name", {})
                 for node in thirdparty_nodes:
-                    if entry := self._clash_proxy(node):
-                        thirdparty_entries.append(entry)
+                    normalized = self._unique_clash_node(node, used_names)
+                    if entry := self._clash_proxy(normalized):
                         groups["direct"].append(entry)
+                        country_by_name[entry[0]] = self._subscription_country_code(normalized)
 
                 all_entries = groups["bridges"] + groups["direct"] + groups["chain"]
                 proxy_lines = [entry for _, entry in all_entries]
@@ -1107,13 +1522,63 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
 
                 direct_names = [name for name, _ in groups["direct"]]
                 chain_names = [name for name, _ in groups["chain"]]
-                front_names = list(groups.get("front", []))
+                front_names = list(dict.fromkeys(groups.get("front", [])))
+
+                country_group_names: list[str] = []
+                country_group_lines: list[str] = []
+                if fmt == "clash-meta":
+                    country_buckets: dict[str, list[str]] = {}
+                    for name, _ in all_entries:
+                        cc = str(country_by_name.get(name, "OTHER") or "OTHER").upper()
+                        if cc not in set(COUNTRY_PRESETS):
+                            cc = "OTHER"
+                        country_buckets.setdefault(cc, []).append(name)
+
+                    for cc in sorted(country_buckets):
+                        node_list = list(dict.fromkeys(country_buckets[cc]))
+                        if not node_list:
+                            continue
+                        if cc != "OTHER":
+                            flag = "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in cc)
+                            g_name = f"{flag} {cc}"
+                        else:
+                            g_name = "🌐 其他节点"
+                        while g_name in used_names or g_name in country_group_names:
+                            g_name = f"{g_name} 组"
+                        country_group_names.append(g_name)
+                        country_group_lines.extend([
+                            f"  - name: {json.dumps(g_name, ensure_ascii=False)}",
+                            "    type: url-test",
+                            "    url: https://www.gstatic.com/generate_204",
+                            "    interval: 300",
+                            "    tolerance: 50",
+                            "    lazy: true",
+                            "    proxies:",
+                            _list_yaml(node_list),
+                        ])
+
                 direct_yaml = _list_yaml(direct_names) if direct_names else "      - DIRECT"
                 chain_yaml = _list_yaml(chain_names) if chain_names else "      - DIRECT"
                 front_yaml = _list_yaml(front_names) if front_names else "      - DIRECT"
                 # The site groups expose PROXY plus the leaf nodes for manual
                 # selection, while PROXY itself stays as the two-level entry.
-                site_items = [_PROXY_GROUP, "⚡ 自动选择"] + direct_names + chain_names + ["DIRECT"]
+                site_candidates = [_PROXY_GROUP, "⚡ 自动选择"] + direct_names + chain_names + country_group_names + ["DIRECT"]
+                defined_names = {
+                    _PROXY_GROUP,
+                    _DIRECT_GROUP,
+                    _CHAIN_GROUP,
+                    _FRONT_GROUP,
+                    "⚡ 自动选择",
+                    "🔵 Google / Gemini",
+                    "🤖 ChatGPT",
+                    "🧠 Claude",
+                    "🌐 其他流量",
+                    "🇨🇳 中国流量",
+                    "DIRECT",
+                    *{name for name, _ in all_entries},
+                    *country_group_names,
+                }
+                site_items = list(dict.fromkeys(item for item in site_candidates if item in defined_names))
                 site_yaml = _list_yaml(site_items)
                 group_lines = [
                     "  - name: " + _PROXY_GROUP,
@@ -1134,46 +1599,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     "    proxies:",
                     front_yaml,
                 ]
-                # Per-country url-test groups: generated dynamically for every
-                # country present in the chain/direct nodes. The client probes
-                # the full chain from its own network every 300s and skips
-                # dead nodes automatically, so stale proxies never need cleanup.
-                def _node_country(name: str) -> str:
-                    rest = name.removeprefix("自动链式 | ")
-                    match = re.match(r"([A-Z]{2})(?:-|\s*\|)", rest)
-                    return match.group(1) if match else ""
-
-                country_members: dict[str, list[str]] = {}
-                for node_name in chain_names + direct_names:
-                    code = _node_country(node_name)
-                    if code:
-                        country_members.setdefault(code, [])
-                        if node_name not in country_members[code]:
-                            country_members[code].append(node_name)
-                for node_name in chain_names:
-                    if "| tr-" in node_name and node_name not in country_members.get("TR", []):
-                        country_members.setdefault("TR", []).append(node_name)
-
-                def _country_flag(code: str) -> str:
-                    if len(code) != 2 or not code.isalpha():
-                        return "🌐"
-                    return "".join(chr(0x1F1E6 + ord(ch) - ord("A")) for ch in code)
-
-                priority_order = ["TR", "VN", "TH", "PH", "US", "JP"]
-                ordered_codes = [c for c in priority_order if c in country_members]
-                ordered_codes += sorted(c for c in country_members if c not in priority_order)
-                for code in ordered_codes:
-                    zh_name = COUNTRY_NAMES_ZH.get(code) or code
-                    group_lines.extend([
-                        f"  - name: {_country_flag(code)} {zh_name}",
-                        "    type: url-test",
-                        "    url: https://www.gstatic.com/generate_204",
-                        "    interval: 300",
-                        "    tolerance: 50",
-                        "    lazy: true",
-                        "    proxies:",
-                        _list_yaml(country_members[code]),
-                    ])
+                group_lines.extend(country_group_lines)
                 group_lines.extend([
                     "  - name: ⚡ 自动选择",
                     "    type: url-test",
@@ -1217,17 +1643,17 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     "  - MATCH,🌐 其他流量",
                 ))
                 body = (
-                    "port: 7890\nsocks-port: 7891\nallow-lan: true\nmode: rule\nproxies:\n"
-                    + "\n".join(proxy_lines)
+                    "port: 7890\nsocks-port: 7891\nallow-lan: true\nmode: rule\n"
+                    + ("proxies:\n" + "\n".join(proxy_lines) if proxy_lines else "proxies: []")
                     + "\nproxy-groups:\n"
                     + "\n".join(group_lines)
                     + "\nrules:\n"
                     + "\n".join(rule_lines)
                     + "\n"
                 )
-                self._send_text(HTTPStatus.OK, body)
+                self._send_text(HTTPStatus.OK, body, content_type="text/yaml; charset=utf-8")
                 return
-            encoded = base64.b64encode("\n".join(links).encode()).decode()
+            encoded = base64.b64encode("\n".join(links).encode("utf-8")).decode("ascii")
             self._send_text(HTTPStatus.OK, encoded)
             return
         if path == "/api/vps":
@@ -1283,6 +1709,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         if match:
             slot_id = match.group(1)
             try:
+                self._require_managed_slot(slot_id)
                 payload = self._read_json()
                 allowed = {"country", "proxy_port", "enabled"}
                 if set(payload) - allowed:
@@ -1389,7 +1816,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 else:
                     self.server.store.add_user(self.server.username, password_hash)
                 self.server.password = new_password
-                set_credentials(self.server.username, new_password)
+                set_additional_credentials([(self.server.username, new_password)])
                 self._send_json(HTTPStatus.OK, {"success": True})
                 return
             if path == "/api/user/sub_token":
@@ -1405,6 +1832,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             if path == "/api/probe/admin/server":
                 server_id = str(payload.get("id", "")).strip()
                 try:
+                    self._require_managed_slot(server_id)
                     self.server.store.get_slot(server_id)
                 except KeyError:
                     self._send_json(HTTPStatus.NOT_FOUND, {"code": "not_found", "error": "probe server not found"})
@@ -1457,6 +1885,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         connect_match = self._slot_match(re.escape("/connect"))
         if connect_match:
             try:
+                self._require_managed_slot(connect_match.group(1))
                 payload = self._read_json()
                 node_ip = str(payload.get("node_ip", "")).strip()
                 if not node_ip:
@@ -1478,6 +1907,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             if not match:
                 continue
             try:
+                self._require_managed_slot(match.group(1))
                 self._read_json()
                 slot = action(match.group(1))
                 self._send_json(HTTPStatus.ACCEPTED, {"accepted": True, "exit": slot.as_dict()})
@@ -1730,6 +2160,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/probe/admin/server":
                 server_id = self._query_param("id") or ""
+                self._require_managed_slot(server_id)
                 self.server.store.get_slot(server_id)
                 self.server.store.delete_setting(f"probe_server_{server_id}")
                 self._send_json(HTTPStatus.OK, {"success": True})

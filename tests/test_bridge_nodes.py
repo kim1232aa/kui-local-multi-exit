@@ -106,6 +106,32 @@ class BridgeNodeParseTest(unittest.TestCase):
         self.assertEqual(nodes[0]["name"], "A")
         self.assertEqual(nodes[1]["name"], "B")
 
+    def test_parse_monosans_json_keeps_geo_and_drops_transparent_nodes(self):
+        payload = json.dumps([
+            {
+                "protocol": "socks5",
+                "host": "198.51.100.1",
+                "port": 1080,
+                "exit_ip": "198.51.100.1",
+                "geolocation": {"country": {"iso_code": "TH"}},
+            },
+            {
+                "protocol": "http",
+                "host": "198.51.100.2",
+                "port": 8080,
+                "exit_ip": "203.0.113.2",
+                "geolocation": {"country": {"iso_code": "VN"}},
+            },
+            {"protocol": "socks4", "host": "198.51.100.3", "port": 1080},
+        ])
+
+        nodes = parse_subscription(payload)
+
+        self.assertEqual(1, len(nodes))
+        self.assertEqual("SOCKS5", nodes[0]["protocol"])
+        self.assertEqual("TH", nodes[0]["_country_hint"])
+        self.assertEqual("198.51.100.1", nodes[0]["address"])
+
 
 class BridgeNodeCheckTest(unittest.TestCase):
     def test_check_proxy_url_returns_empty_for_unsupported_protocol(self):

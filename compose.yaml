@@ -13,6 +13,7 @@ services:
       KUI_FETCH_PROXY: ${KUI_FETCH_PROXY:-}
       KUI_OPENVPN_SOCKS_PROXY: ${KUI_OPENVPN_SOCKS_PROXY:-}
       KUI_ENABLE_VPNBOOK: ${KUI_ENABLE_VPNBOOK:-1}
+      KUI_ALLOW_NON_RESIDENTIAL: ${KUI_ALLOW_NON_RESIDENTIAL:-1}
       KUI_VPN_HISTORY_DAYS: ${KUI_VPN_HISTORY_DAYS:-30}
       KUI_OPENVPN_PROVIDER_DIR: /opt/kui-providers
       KUI_REALITY_NODES_FILE: /run/kui-reality/public-nodes.json
@@ -21,16 +22,60 @@ services:
       KUI_BRIDGE_REFRESH_INTERVAL: ${KUI_BRIDGE_REFRESH_INTERVAL:-300}
       KUI_BRIDGE_SPEED_TEST: ${KUI_BRIDGE_SPEED_TEST:-0}
       KUI_BRIDGE_TOP_N: ${KUI_BRIDGE_TOP_N:-16}
+      KUI_SLOT_COUNT: ${KUI_SLOT_COUNT:-auto}
+      KUI_DIAL_WORKERS: ${KUI_DIAL_WORKERS:-}
+      PROXY_MAX_CONNECTIONS: ${PROXY_MAX_CONNECTIONS:-}
+      KUI_INTERNAL_PROXY_USER: ${KUI_INTERNAL_PROXY_USER:-}
+      KUI_INTERNAL_PROXY_PASSWORD: ${KUI_INTERNAL_PROXY_PASSWORD:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
       - "${KUI_MANAGEMENT_PORT:-8080}:8080"
-      - "127.0.0.1:7920-7943:7920-7943/tcp"
-      - "127.0.0.1:7920-7943:7920-7943/udp"
     volumes:
       - kui-local-data:/opt/kui-local
       - ./providers:/opt/kui-providers:ro
       - ./runtime/reality:/run/kui-reality:ro
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  kui-reality-gateway:
+    build: .
+    container_name: kui-reality-gateway
+    restart: unless-stopped
+    command: ["python3", "-m", "vps.reality_gateway"]
+    depends_on:
+      kui-local-multi-exit:
+        condition: service_healthy
+    ports:
+      - "${KUI_REALITY_PORT:-8443}:${KUI_REALITY_PORT:-8443}/tcp"
+    environment:
+      KUI_PUBLIC_HOST: ${KUI_PUBLIC_HOST:-}
+      KUI_REALITY_NODES_FILE: /run/kui-reality/public-nodes.json
+      KUI_REALITY_DATA_DIR: /var/lib/kui-reality
+      KUI_REALITY_SOCKS_HOST: kui-local-multi-exit
+      KUI_REALITY_SOCKS_BASE_PORT: "7920"
+      KUI_REALITY_PORT: ${KUI_REALITY_PORT:-8443}
+      KUI_SLOT_COUNT: ${KUI_SLOT_COUNT:-auto}
+      KUI_REALITY_SNI: ${KUI_REALITY_SNI:-addons.mozilla.org}
+      KUI_SING_BOX_BIN: /usr/local/bin/sing-box
+      KUI_INTERNAL_PROXY_USER: ${KUI_INTERNAL_PROXY_USER:-}
+      KUI_INTERNAL_PROXY_PASSWORD: ${KUI_INTERNAL_PROXY_PASSWORD:-}
+      KUI_INTERNAL_PROXY_WORKSPACE: /opt/kui-local
+    volumes:
+      - kui-local-data:/opt/kui-local:ro
+      - kui-reality-data:/var/lib/kui-reality
+      - ./runtime/reality:/run/kui-reality:rw
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import os; from pathlib import Path; port = format(int(os.environ.get('KUI_REALITY_PORT', '8443')), '04X'); listening = {line.split()[1].split(':')[1] for path in ('/proc/net/tcp', '/proc/net/tcp6') for line in Path(path).read_text().splitlines()[1:] if line.split()[3] == '0A'}; assert port in listening\" && test -s /run/kui-reality/public-nodes.json"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
 volumes:
   kui-local-data:
+  kui-reality-data:

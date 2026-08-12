@@ -12,6 +12,7 @@ __pycache__/
 *.log
 auth.txt
 socks_auth.txt
+internal_proxy.json
 runtime/
 backups/
 temp/

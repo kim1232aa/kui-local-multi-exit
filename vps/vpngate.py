@@ -345,17 +345,75 @@ def check_residential(ip: str, timeout: int = 10) -> tuple[bool, dict[str, Any]]
         with direct_url_opener().open(request, timeout=timeout) as response:
             data = json.loads(response.read().decode("utf-8"))
     except Exception as error:
-        return False, {"status": "unknown", "error": str(error)[:500]}
+        return False, {
+            "status": "unknown",
+            "error": str(error)[:500],
+            "is_residential": False,
+            "egress_type": "unknown",
+            "egress_type_label": "未知IP类型",
+        }
     isp = data.get("isp", {})
     geo = data.get("geo", {})
-    flag = str(isp.get("flag", "")).lower()
-    isp_type = str(isp.get("type", "")).lower()
-    warning = str(isp.get("warning", "")).lower()
+    flag = str(isp.get("flag", "")).strip().lower()
+    isp_type = str(isp.get("type", "")).strip().lower()
+    warning = str(isp.get("warning", "")).strip().lower()
     residential = flag == "residential"
-    return residential, {"status": "checked", "raw": data, "is_residential": residential}
+    explicit_non_residential_flags = {
+        "datacenter",
+        "hosting",
+        "business",
+        "corporate",
+        "enterprise",
+        "government",
+        "education",
+    }
+    non_residential_markers = (
+        "datacenter",
+        "data center",
+        "hosting",
+        "business",
+        "corporate",
+        "enterprise",
+        "government",
+        "education",
+        "vpn",
+        "proxy",
+    )
+    explicitly_non_residential = (
+        flag in explicit_non_residential_flags
+        or any(marker in value for value in (isp_type, warning) for marker in non_residential_markers)
+    )
+    if residential:
+        egress_type, egress_type_label = "residential", "住宅IP"
+    elif explicitly_non_residential:
+        egress_type, egress_type_label = "datacenter", "机房IP"
+    else:
+        egress_type, egress_type_label = "unknown", "未知IP类型"
+    return residential, {
+        "status": "checked",
+        "raw": data,
+        "is_residential": residential,
+        "egress_type": egress_type,
+        "egress_type_label": egress_type_label,
+    }
 
 
 DEFAULT_STREAM_URL = "https://www.gstatic.com/generate_204"
+
+
+def probe_204(interface: str, run: Callable[..., Any] = subprocess.run) -> bool:
+    url = DEFAULT_STREAM_URL
+    command = [
+        "curl", "-o", "/dev/null", "-s", "-w", "%{http_code}",
+        "-A", "Mozilla/5.0", "-m", "10", "--location", "--max-redirs", "20",
+        "--interface", interface,
+        "--doh-url", "https://cloudflare-dns.com/dns-query",
+        "--resolve", "cloudflare-dns.com:443:1.1.1.1",
+        url,
+    ]
+    result = run(command, capture_output=True, text=True, check=False)
+    code = (getattr(result, "stdout", "") or "").strip()
+    return getattr(result, "returncode", -1) == 0 and _probe_accepts(url, code)
 
 
 def _probe_accepts(url: str, code: str) -> bool:
