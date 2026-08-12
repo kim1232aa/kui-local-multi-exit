@@ -585,7 +585,7 @@ class ExitManager:
             "10",
             "--connect-retry-max",
             "1",
-            "--verb",
+            "--tun-mtu", "1400", "--mssfix", "1300", "--verb",
             "3",
             *cipher_args,
         ]
@@ -675,6 +675,24 @@ class ExitManager:
                 self.routing.install(slot, endpoint_ip, gateway, external_interface)
                 if self._worker_is_stale(slot_id, generation, stop_event):
                     return
+                # PATCH: source-based rule so tunnel traffic from this slot uses the tunnel table
+                try:
+                    import time as _time
+                    import re as _re
+                    _pref = str(slot.route_table + 5000)
+                    for _ in range(10):
+                        _d = self._run(["ip", "rule", "del", "pref", _pref], capture_output=True, text=True, check=False)
+                        if _d.returncode != 0:
+                            break
+                    for _attempt in range(5):
+                        _r = self._run(["ip", "-4", "addr", "show", slot.tunnel_name], capture_output=True, text=True, check=False)
+                        _m = _re.search(r"inet (\d+\.\d+\.\d+\.\d+)", _r.stdout)
+                        if _m:
+                            self._run(["ip", "rule", "add", "from", _m.group(1), "lookup", str(slot.route_table), "pref", _pref], capture_output=True, text=True, check=False)
+                            break
+                        _time.sleep(1)
+                except Exception:
+                    pass
                 egress_ip = detect_egress(slot.tunnel_name, self._run)
                 if self._worker_is_stale(slot_id, generation, stop_event):
                     return
