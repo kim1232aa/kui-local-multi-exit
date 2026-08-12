@@ -336,6 +336,46 @@ def detect_egress(interface: str, run: Callable[..., Any] = subprocess.run) -> s
     return ""
 
 
+
+def _check_residential_fallback(ip: str, timeout: int = 10):
+    """Secondary classifier via ip-api.com when TestISP has no data for the IP."""
+    try:
+        req = urllib.request.Request(
+            f"http://ip-api.com/json/{ip}?fields=status,country,isp,org,as,asname,hosting,proxy,mobile,query",
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+        )
+        with direct_url_opener().open(req, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return None
+    if data.get("status") != "success":
+        return None
+    text = " ".join(str(data.get(k, "")) for k in ("isp", "org", "as", "asname")).lower()
+    dc_keywords = (
+        "softether", "vpngate", "amazon", "aws", "google", "microsoft", "azure",
+        "oracle", "alibaba", "tencent", "ovh", "hetzner", "digitalocean", "vultr",
+        "linode", "akamai", "cloudflare", "datacenter", "data center", "hosting",
+        "choopa", "contabo", "m247", "leaseweb", "idc",
+    )
+    if data.get("hosting") or any(k in text for k in dc_keywords):
+        return False, {
+            "status": "checked",
+            "raw": data,
+            "is_residential": False,
+            "egress_type": "datacenter",
+            "egress_type_label": "机房IP",
+            "source": "ip-api",
+        }
+    return True, {
+        "status": "checked",
+        "raw": data,
+        "is_residential": True,
+        "egress_type": "residential",
+        "egress_type_label": "住宅IP",
+        "source": "ip-api",
+    }
+
+
 def check_residential(ip: str, timeout: int = 10) -> tuple[bool, dict[str, Any]]:
     request = urllib.request.Request(
         f"https://testisp.info/api/check?ip={ip}",
@@ -345,6 +385,9 @@ def check_residential(ip: str, timeout: int = 10) -> tuple[bool, dict[str, Any]]
         with direct_url_opener().open(request, timeout=timeout) as response:
             data = json.loads(response.read().decode("utf-8"))
     except Exception as error:
+        fallback = _check_residential_fallback(ip, timeout=timeout)
+        if fallback is not None:
+            return fallback
         return False, {
             "status": "unknown",
             "error": str(error)[:500],
@@ -389,6 +432,10 @@ def check_residential(ip: str, timeout: int = 10) -> tuple[bool, dict[str, Any]]
         egress_type, egress_type_label = "datacenter", "机房IP"
     else:
         egress_type, egress_type_label = "unknown", "未知IP类型"
+    if egress_type == "unknown":
+        fallback = _check_residential_fallback(ip, timeout=timeout)
+        if fallback is not None:
+            return fallback
     return residential, {
         "status": "checked",
         "raw": data,
