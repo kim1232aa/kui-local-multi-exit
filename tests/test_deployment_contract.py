@@ -65,23 +65,9 @@ class DeploymentContractTest(unittest.TestCase):
         for marker in (".git", ".worktrees", ".env", "temp", "runtime", "*.db", "*.log", "internal_proxy.json"):
             self.assertIn(marker, ignored)
 
-    def test_reality_gateway_installer_reuses_original_kui_protocol_shape(self):
+    def test_no_host_reality_gateway_installer(self):
         installer = self.root / "scripts" / "install-reality-gateway.sh"
-        content = installer.read_text(encoding="utf-8")
-        self.assertTrue(installer.stat().st_mode & stat.S_IXUSR)
-        for marker in (
-            'SING_BOX_VERSION="1.13.14"',
-            '"type": "vless"',
-            '"flow": "xtls-rprx-vision"',
-            '"reality": {',
-            '"type": "socks"',
-            '"server": "127.0.0.1"',
-            'generate", "reality-keypair',
-            'NODE_COUNT=24',
-            'PUBLIC_NODES_PATH',
-            'systemctl enable --now kui-reality-gateway.service',
-        ):
-            self.assertIn(marker, content)
+        self.assertFalse(installer.exists(), "Reality gateway must run inside Docker, not as a host systemd service")
 
     def test_runtime_openvpn_config_and_log_are_owner_only(self):
         with tempfile.TemporaryDirectory() as tmp:
