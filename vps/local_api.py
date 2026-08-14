@@ -446,6 +446,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     "name": slot["id"],
                     "region": slot["country"],
                     "country_code": slot["country"],
+                    "detected_country": self._slot_country_code(slot),
                     "ping_ct": "0",
                     "ping_cu": "0",
                     "ping_cm": "0",
@@ -1070,6 +1071,16 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         )
 
     @classmethod
+    def _slot_label_country(cls, slot: dict[str, Any]) -> str:
+        """Slot label country: keep an explicit target (VN/TH/...), but show the
+        detected egress country when the target is ANY so names never render as
+        ANY/XX."""
+        target = str(slot.get("country") or "").upper()
+        if target and target not in {"ANY", "XX"}:
+            return target
+        return cls._slot_country_code(slot)
+
+    @classmethod
     def _friendly_slot_name(cls, slot: dict[str, Any]) -> str:
         geo = cls._slot_geo(slot)
         isp = cls._slot_isp(slot)
@@ -1166,7 +1177,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         password = quote(self.server.password, safe="")
         links = []
         for slot in self._publishable_slots():
-            name = quote(f"{slot['country']}_{slot['id']}_{slot['state']}", safe="")
+            name = quote(f"{self._slot_label_country(slot)}_{slot['id']}_{slot['state']}", safe="")
             links.append(f"socks5://{username}:{password}@{host}:{slot['proxy_port']}#{name}")
         return links
 
@@ -1285,7 +1296,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
 
         host = self._request_proxy_host()
         for slot in self._publishable_slots():
-            name = f"{slot['country']}_{slot['id']}_{slot['state']}"
+            name = f"{self._slot_label_country(slot)}_{slot['id']}_{slot['state']}"
             proxy = "\n".join((
                 f"  - name: {json.dumps(name, ensure_ascii=False)}",
                 "    type: socks5",
@@ -1326,6 +1337,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     "listener_ready": bool(self.server.manager.listener_ready(slot["id"])),
                     "egress_type": self._slot_egress_type_info(slot)[0],
                     "egress_type_label": self._slot_egress_type_info(slot)[1],
+                    "detected_country": self._slot_country_code(slot),
                 }
                 for slot in self.server.manager.snapshot()
             ]
@@ -1347,6 +1359,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     "listener_ready": bool(self.server.manager.listener_ready(slot["id"])),
                     "egress_type": self._slot_egress_type_info(slot)[0],
                     "egress_type_label": self._slot_egress_type_info(slot)[1],
+                    "detected_country": self._slot_country_code(slot),
                 }
                 for slot in self.server.manager.snapshot()
             ]
@@ -1368,7 +1381,10 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 "servers": servers,
                 "nodes": nodes,
                 "users": safe_users,
-                "exits": self.server.manager.snapshot(),
+                "exits": [
+                    {**slot, "detected_country": self._slot_country_code(slot)}
+                    for slot in self.server.manager.snapshot()
+                ],
                 "siteTitle": site_title,
                 "mySubUser": self.server.username,
                 "mySubToken": my_sub_token,
@@ -1454,7 +1470,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             password = quote(self.server.password, safe="")
             host = self._request_proxy_host()
             lines = [
-                f"socks5://{username}:{password}@{host}:{slot['proxy_port']}#{slot['country']}_{slot['id']}_{slot['state']}"
+                f"socks5://{username}:{password}@{host}:{slot['proxy_port']}#{self._slot_label_country(slot)}_{slot['id']}_{slot['state']}"
                 for slot in self._publishable_slots()
             ]
             self._send_text(HTTPStatus.OK, "\n".join(lines) + ("\n" if lines else ""))

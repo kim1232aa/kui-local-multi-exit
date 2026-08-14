@@ -376,6 +376,27 @@ def _check_residential_fallback(ip: str, timeout: int = 10):
     }
 
 
+def _check_geo_fallback(ip: str, timeout: int = 10) -> dict[str, Any] | None:
+    """Fetch geo (country/city/timezone) from ip-api when TestISP geo is missing."""
+    try:
+        req = urllib.request.Request(
+            f"http://ip-api.com/json/{ip}?fields=status,country,countryCode,city,timezone,query",
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+        )
+        with direct_url_opener().open(req, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return None
+    if data.get("status") != "success":
+        return None
+    return {
+        "country": data.get("country"),
+        "country_code": data.get("countryCode"),
+        "city": data.get("city"),
+        "timezone": data.get("timezone"),
+    }
+
+
 def check_residential(ip: str, timeout: int = 10) -> tuple[bool, dict[str, Any]]:
     request = urllib.request.Request(
         f"https://testisp.info/api/check?ip={ip}",
@@ -397,6 +418,20 @@ def check_residential(ip: str, timeout: int = 10) -> tuple[bool, dict[str, Any]]
         }
     isp = data.get("isp", {})
     geo = data.get("geo", {})
+    if not isinstance(geo, dict):
+        geo = {}
+    geo_code = str(geo.get("country_code", "")).strip()
+    if not geo_code or geo_code.lower() in {"unknown", "none", "null", "xx", "-"}:
+        # TestISP 的地区引擎偶尔返回 Unknown；此时用 ip-api 补齐地理信息。
+        geo_fallback = _check_geo_fallback(ip, timeout=timeout)
+        if geo_fallback:
+            data = dict(data)
+            data["geo"] = {
+                **geo,
+                **{key: value for key, value in geo_fallback.items() if value},
+                "geo_source": "ip-api",
+            }
+            geo = data["geo"]
     flag = str(isp.get("flag", "")).strip().lower()
     isp_type = str(isp.get("type", "")).strip().lower()
     warning = str(isp.get("warning", "")).strip().lower()
