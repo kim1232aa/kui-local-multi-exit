@@ -768,6 +768,51 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual("", base64.b64decode(encoded).decode())
 
+    def test_subscription_socks5_format_ignores_reality_manifest(self):
+        self.manager.set_slot_ready("exit-01")
+        self.server.reality_nodes_file = Path(self.tempdir.name) / "missing-public-nodes.json"
+        status, data = self.request("/api/data")
+        token = data["mySubToken"]
+
+        status, encoded = self.request(
+            f"/api/sub?user={data['mySubUser']}&token={token}&format=socks5",
+            expect_json=False,
+        )
+
+        self.assertEqual(200, status)
+        links = base64.b64decode(encoded).decode().splitlines()
+        self.assertEqual(1, len(links))
+        self.assertTrue(links[0].startswith("socks5://admin:secret@127.0.0.1:7920#JP_exit-01_"))
+
+    def test_subscription_socks5_format_excludes_non_socks_thirdparty_nodes(self):
+        self.manager.set_slot_ready("exit-01")
+        content = (
+            "vless://11111111-1111-1111-1111-111111111111@vpn.example.com:443#Tokyo\n"
+            "socks5://tpuser:tppass@relay.example.com:15080#TP-Relay"
+        )
+        with patch("vps.local_api.fetch_subscription_text", return_value=content):
+            status, _ = self.request(
+                "/api/thirdparty",
+                method="POST",
+                body={"name": "sub1", "url": "https://subscription.example.com/profile"},
+            )
+            self.assertEqual(200, status)
+        status, data = self.request("/api/data")
+        token = data["mySubToken"]
+
+        status, encoded = self.request(
+            f"/api/sub?user={data['mySubUser']}&token={token}&format=socks5",
+            expect_json=False,
+        )
+
+        self.assertEqual(200, status)
+        links = base64.b64decode(encoded).decode().splitlines()
+        self.assertEqual(2, len(links))
+        self.assertTrue(all(link.startswith("socks5://") for link in links))
+        joined = "\n".join(links)
+        self.assertNotIn("vpn.example.com", joined)
+        self.assertIn("socks5://tpuser:tppass@relay.example.com:15080#TP-Relay", joined)
+
     def test_subscription_excludes_store_ready_slot_without_listener(self):
         self.manager.set_slot_ready("exit-01", listener_ready=False)
         status, data = self.request("/api/data")

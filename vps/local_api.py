@@ -1160,13 +1160,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 })
         return nodes
 
-    def _local_subscription_links(self) -> list[str]:
-        if self.server.reality_nodes_file:
-            return [
-                link
-                for node in self._local_subscription_nodes()
-                if (link := self._subscription_link(node))
-            ]
+    def _local_socks5_links(self) -> list[str]:
         host = self._request_proxy_host()
         username = quote(self.server.username, safe="")
         password = quote(self.server.password, safe="")
@@ -1175,6 +1169,15 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             name = quote(f"{slot['country']}_{slot['id']}_{slot['state']}", safe="")
             links.append(f"socks5://{username}:{password}@{host}:{slot['proxy_port']}#{name}")
         return links
+
+    def _local_subscription_links(self) -> list[str]:
+        if self.server.reality_nodes_file:
+            return [
+                link
+                for node in self._local_subscription_nodes()
+                if (link := self._subscription_link(node))
+            ]
+        return self._local_socks5_links()
 
     @classmethod
     def _subscription_country_code(cls, node: dict[str, Any]) -> str:
@@ -1474,16 +1477,6 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 if (link := self._subscription_link(node))
             )
             fmt = (self._query_param("format") or "").strip().lower()
-            if fmt == "socks5":
-                host = self._request_proxy_host()
-                socks_links = [
-                    f"socks5://{quote(self.server.username, safe='')}:{quote(self.server.password, safe='')}"
-                    f"@{host}:{slot['proxy_port']}#{quote(slot['country'] + '_' + slot['id'] + '_' + slot['state'], safe='')}"
-                    for slot in self._publishable_slots()
-                ]
-                encoded = base64.b64encode("\n".join(socks_links).encode("utf-8")).decode("ascii")
-                self._send_text(HTTPStatus.OK, encoded)
-                return
             if fmt == "sing-box":
                 singbox_nodes = list(self._local_subscription_nodes())
                 singbox_nodes.extend(thirdparty_nodes)
@@ -1495,6 +1488,18 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 return
             if fmt in {"v2ray", "shadowrocket"}:
                 encoded = base64.b64encode("\n".join(links).encode("utf-8")).decode("ascii")
+                self._send_text(HTTPStatus.OK, encoded)
+                return
+            if fmt == "socks5":
+                # Per-slot SOCKS5 links stay available even when the Reality
+                # gateway shapes the default subscription as VLESS.
+                socks_links = self._local_socks5_links()
+                socks_links.extend(
+                    link
+                    for node in thirdparty_nodes
+                    if (link := self._subscription_link(node)) and link.startswith("socks5://")
+                )
+                encoded = base64.b64encode("\n".join(socks_links).encode("utf-8")).decode("ascii")
                 self._send_text(HTTPStatus.OK, encoded)
                 return
             if fmt in {"clash", "clash-meta"}:
