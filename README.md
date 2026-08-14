@@ -96,6 +96,22 @@ TCP 8443（或 KUI_REALITY_PORT）     唯一 XTLS-Reality 入口
 
 内部 SOCKS5 `7920+` 仅在 `kui-local-multi-exit` 容器和 Compose 网络可达。不能把 `socks5://...@VPS_IP:7920` 当成公网地址。
 
+## 纯 SOCKS5 订阅（可选）
+
+启用 Reality 网关后，默认订阅只发布 VLESS 节点。需要纯 SOCKS5 链接时（例如只认标准节点的客户端），使用：
+
+```text
+/api/sub?user=<用户>&token=<token>&format=socks5
+```
+
+返回 base64 编码的链接列表：每个 ready 槽位一条 `socks5://`，第三方节点中仅保留 SOCKS5 条目。链接凭据与面板管理用户一致，端口为槽位内部端口（`7920+`）。这些端口默认不发布到宿主机；需要外部可达时运行桥接 sidecar：
+
+```bash
+vps/socks5-bridge.sh            # 管理密码取自 .env，也可作为第一个参数传入
+```
+
+脚本在 Compose 网络上运行一个 sing-box 容器，把每个 ready 槽位以管理凭据认证发布到宿主机同名端口，另发布一个自动选路入口（默认 `1080`，可用 `AUTO_PORT` 覆盖）。注意：发布后任何可达者都能触达这些端口，SOCKS5 认证为明文握手，且主动探测可能导致端口被封；请按需用防火墙限制来源。
+
 所有订阅节点共享同一个 Reality 地址和端口，但 UUID 各不相同：
 
 ```text
@@ -165,6 +181,8 @@ docker stats kui-local-multi-exit kui-reality-gateway
 docker compose up -d --build
 docker compose ps
 ```
+
+修改 `.env`（例如 `KUI_SLOT_COUNT`）后同样执行 `docker compose up -d`，Compose 会按配置变化重建对应容器；仅 `restart` 不会应用新的环境变量。
 
 ## 开发验证
 
