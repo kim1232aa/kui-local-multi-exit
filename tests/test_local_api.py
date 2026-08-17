@@ -840,6 +840,49 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual(body, base64.b64decode(encoded).decode())
 
+    def test_socks5_json_route_exports_current_proxies(self):
+        self.manager.set_slot_ready("exit-01")
+        content = (
+            "socks5://198.51.100.20:1080#good%20jp\n"
+            "socks5://proxy-user:proxy-pass@198.51.100.21:1081#Singapore"
+        )
+        with patch("vps.local_api.fetch_subscription_text", return_value=content):
+            status, _ = self.request(
+                "/api/thirdparty",
+                method="POST",
+                body={"name": "json-export", "url": "https://subscription.example.com/socks"},
+            )
+            self.assertEqual(200, status)
+        status, data = self.request("/api/data")
+        token = data["mySubToken"]
+
+        status, denied = self.request("/socks5.json", authenticated=False)
+        self.assertEqual(404, status)
+        self.assertEqual("not_found", denied["code"])
+
+        status, exported = self.request(
+            f"/socks5.json?user={data['mySubUser']}&token={token}",
+        )
+        self.assertEqual(200, status)
+        self.assertRegex(exported["exported_at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+        self.assertEqual([], exported["accounts"])
+        self.assertEqual(3, len(exported["proxies"]))
+
+        by_key = {proxy["proxy_key"]: proxy for proxy in exported["proxies"]}
+        local = by_key["socks5|127.0.0.1|7920|admin|secret"]
+        self.assertEqual("JP_exit-01_ready", local["name"])
+        self.assertEqual("active", local["status"])
+        self.assertEqual("none", local["fallback_mode"])
+
+        anonymous = by_key["socks5|198.51.100.20|1080||"]
+        self.assertEqual("good jp", anonymous["name"])
+        self.assertNotIn("username", anonymous)
+        self.assertNotIn("password", anonymous)
+
+        authenticated = by_key["socks5|198.51.100.21|1081|proxy-user|proxy-pass"]
+        self.assertEqual("proxy-user", authenticated["username"])
+        self.assertEqual("proxy-pass", authenticated["password"])
+
     def test_subscription_socks5_format_excludes_non_socks_thirdparty_nodes(self):
         self.manager.set_slot_ready("exit-01")
         content = (

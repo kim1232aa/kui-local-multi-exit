@@ -17,7 +17,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urljoin, urlsplit
+from urllib.parse import quote, unquote, urljoin, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from .bridge_nodes import _cache_key, _get_cache, load_bridge_nodes, parse_proxy_url
@@ -1221,6 +1221,43 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         )
         return links
 
+    def _socks5_json_export(self) -> dict[str, Any]:
+        proxies = []
+        seen = set()
+        for link in self._socks5_subscription_links():
+            try:
+                parsed = urlsplit(link)
+                if parsed.scheme.lower() not in {"socks", "socks5"} or not parsed.hostname:
+                    continue
+                host = parsed.hostname
+                port = parsed.port or 1080
+                username = unquote(parsed.username or "")
+                password = unquote(parsed.password or "")
+            except (TypeError, ValueError):
+                continue
+            proxy_key = f"socks5|{host}|{port}|{username}|{password}"
+            if proxy_key in seen:
+                continue
+            seen.add(proxy_key)
+            proxy = {
+                "proxy_key": proxy_key,
+                "name": unquote(parsed.fragment) or f"{host}:{port}",
+                "protocol": "socks5",
+                "host": host,
+                "port": port,
+            }
+            if username:
+                proxy["username"] = username
+            if password:
+                proxy["password"] = password
+            proxy.update({"status": "active", "fallback_mode": "none"})
+            proxies.append(proxy)
+        return {
+            "exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "proxies": proxies,
+            "accounts": [],
+        }
+
     def _local_subscription_links(self) -> list[str]:
         if self.server.reality_nodes_file:
             return [
@@ -1515,12 +1552,15 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             ]
             self._send_text(HTTPStatus.OK, "\n".join(lines) + ("\n" if lines else ""))
             return
-        if path in {"/socks5.txt", "/socks5-b64.txt"}:
+        if path in {"/socks5.txt", "/socks5-b64.txt", "/socks5.json"}:
             if self.server.store.get_setting("probe_subscription_protection") == "true":
                 self._send_text(HTTPStatus.OK, "K-UI Local Multi-Exit")
                 return
             if not self._subscription_user():
                 self._send_json(HTTPStatus.NOT_FOUND, {"code": "not_found", "error": "subscription not found"})
+                return
+            if path == "/socks5.json":
+                self._send_json(HTTPStatus.OK, self._socks5_json_export())
                 return
             payload = "\n".join(self._socks5_subscription_links())
             payload = payload + ("\n" if payload else "")

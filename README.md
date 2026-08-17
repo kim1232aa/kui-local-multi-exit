@@ -112,9 +112,10 @@ TCP 8443（或 KUI_REALITY_PORT）     唯一 XTLS-Reality 入口
 ```text
 https://YOUR_DOMAIN/socks5.txt?user=<用户>&token=<token>
 https://YOUR_DOMAIN/socks5-b64.txt?user=<用户>&token=<token>
+https://YOUR_DOMAIN/socks5.json?user=<用户>&token=<token>
 ```
 
-未携带 `user`/`token` 时返回 404，这是为了避免把带认证信息的 SOCKS5 地址公开。SOCKS5 链接主机优先使用 `KUI_SOCKS5_PUBLIC_HOST`，未设置时从 Reality 节点清单取公网地址；因此不要把经过 Cloudflare 代理的订阅下载域名当作 SOCKS5 端口主机。
+未携带 `user`/`token` 时返回 404，这是为了避免把带认证信息的 SOCKS5 地址公开。`socks5.json` 输出 `exported_at`、实时 `proxies` 和空的 `accounts`；代理项包含 `proxy_key`、名称、协议、地址、端口、可选认证信息、状态与回退模式。SOCKS5 链接主机优先使用 `KUI_SOCKS5_PUBLIC_HOST`，未设置时从 Reality 节点清单取公网地址；因此不要把经过 Cloudflare 代理的订阅下载域名当作 SOCKS5 端口主机。
 
 ```bash
 vps/socks5-bridge.sh            # 管理密码取自 .env，也可作为第一个参数传入
