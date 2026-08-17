@@ -76,6 +76,7 @@ docker compose ps
 | `KUI_MANAGEMENT_PORT` | `8080` | 宿主机管理 API 映射端口。 |
 | `KUI_REALITY_PORT` | `8443` | 唯一发布到宿主机的 Reality TCP 端口。 |
 | `KUI_PUBLIC_HOST` | 自动发现 | VLESS 链接使用的公网地址。 |
+| `KUI_SOCKS5_PUBLIC_HOST` | Reality 清单地址 | 纯 SOCKS5 链接使用的公网地址；若 DNS 下载域名经过 Cloudflare 代理，建议显式设置为直连 IP/域名。 |
 | `KUI_REALITY_SNI` | `addons.mozilla.org` | Reality 回落握手域名。 |
 | `KUI_FETCH_PROXY` | 空 | 拉取 VPN 数据时使用的显式 HTTP/HTTPS/SOCKS5 代理。 |
 | `KUI_OPENVPN_SOCKS_PROXY` | 空 | OpenVPN TCP 握手使用的 SOCKS5 上游代理。 |
@@ -105,6 +106,15 @@ TCP 8443（或 KUI_REALITY_PORT）     唯一 XTLS-Reality 入口
 ```
 
 返回 base64 编码的链接列表：每个 ready 槽位一条 `socks5://`，第三方节点中仅保留 SOCKS5 条目。链接凭据与面板管理用户一致，端口为槽位内部端口（`7920+`）。这些端口默认不发布到宿主机；需要外部可达时运行桥接 sidecar：
+
+也可以直接使用域名路径（同样需要用户和 token）：
+
+```text
+https://YOUR_DOMAIN/socks5.txt?user=<用户>&token=<token>
+https://YOUR_DOMAIN/socks5-b64.txt?user=<用户>&token=<token>
+```
+
+未携带 `user`/`token` 时返回 404，这是为了避免把带认证信息的 SOCKS5 地址公开。SOCKS5 链接主机优先使用 `KUI_SOCKS5_PUBLIC_HOST`，未设置时从 Reality 节点清单取公网地址；因此不要把经过 Cloudflare 代理的订阅下载域名当作 SOCKS5 端口主机。
 
 ```bash
 vps/socks5-bridge.sh            # 管理密码取自 .env，也可作为第一个参数传入

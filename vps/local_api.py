@@ -539,6 +539,28 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             return host[1:].split("]", 1)[0]
         return host.split(":", 1)[0] or "127.0.0.1"
 
+    def _socks5_public_host(self) -> str:
+        configured = os.environ.get("KUI_SOCKS5_PUBLIC_HOST", "").strip()
+        if configured:
+            if configured.startswith("[") and "]" in configured:
+                return configured[1:configured.index("]")]
+            return configured
+        for node in self._local_reality_nodes().values():
+            address = str(node.get("address") or "").strip()
+            if address and address not in {"127.0.0.1", "0.0.0.0", "::1", "::"}:
+                return address.strip("[]")
+        return self._request_proxy_host()
+
+    @staticmethod
+    def _socks5_uri_host(host: str) -> str:
+        host = str(host).strip().strip("[]")
+        try:
+            if ipaddress.ip_address(host).version == 6:
+                return f"[{host}]"
+        except ValueError:
+            pass
+        return host
+
     @staticmethod
     def _subscription_extra(node: dict[str, Any]) -> dict[str, Any]:
         raw = node.get("extra")
@@ -1155,7 +1177,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         if self.server.reality_nodes_file:
             return nodes
         if not nodes:
-            host = self._request_proxy_host()
+            host = self._socks5_public_host()
             for slot in publishable.values():
                 # Local-only deployments without a configured Reality manifest
                 # may still consume the loopback SOCKS subscription.
@@ -1172,13 +1194,31 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         return nodes
 
     def _local_socks5_links(self) -> list[str]:
-        host = self._request_proxy_host()
+        host = self._socks5_uri_host(self._socks5_public_host())
         username = quote(self.server.username, safe="")
         password = quote(self.server.password, safe="")
         links = []
         for slot in self._publishable_slots():
             name = quote(f"{self._slot_label_country(slot)}_{slot['id']}_{slot['state']}", safe="")
             links.append(f"socks5://{username}:{password}@{host}:{slot['proxy_port']}#{name}")
+        return links
+
+    def _subscription_user(self) -> dict[str, Any] | None:
+        username = self._query_param("user") or ""
+        token = self._query_param("token") or ""
+        user = self.server.store.get_user(username)
+        if not user or not user.get("enable") or not token or not hmac.compare_digest(token, str(user.get("sub_token", ""))):
+            return None
+        return user
+
+    def _socks5_subscription_links(self) -> list[str]:
+        links = self._local_socks5_links()
+        thirdparty_nodes = self.server.store.list_enabled_thirdparty_nodes()
+        links.extend(
+            link
+            for node in thirdparty_nodes
+            if (link := self._subscription_link(node)) and link.startswith("socks5://")
+        )
         return links
 
     def _local_subscription_links(self) -> list[str]:
@@ -1294,7 +1334,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 "country_by_name": country_by_name,
             }
 
-        host = self._request_proxy_host()
+        host = self._socks5_public_host()
         for slot in self._publishable_slots():
             name = f"{self._slot_label_country(slot)}_{slot['id']}_{slot['state']}"
             proxy = "\n".join((
@@ -1468,21 +1508,34 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         if path == "/api/proxy/proxies":
             username = quote(self.server.username, safe="")
             password = quote(self.server.password, safe="")
-            host = self._request_proxy_host()
+            host = self._socks5_uri_host(self._socks5_public_host())
             lines = [
                 f"socks5://{username}:{password}@{host}:{slot['proxy_port']}#{self._slot_label_country(slot)}_{slot['id']}_{slot['state']}"
                 for slot in self._publishable_slots()
             ]
             self._send_text(HTTPStatus.OK, "\n".join(lines) + ("\n" if lines else ""))
             return
+        if path in {"/socks5.txt", "/socks5-b64.txt"}:
+            if self.server.store.get_setting("probe_subscription_protection") == "true":
+                self._send_text(HTTPStatus.OK, "K-UI Local Multi-Exit")
+                return
+            if not self._subscription_user():
+                self._send_json(HTTPStatus.NOT_FOUND, {"code": "not_found", "error": "subscription not found"})
+                return
+            payload = "\n".join(self._socks5_subscription_links())
+            payload = payload + ("\n" if payload else "")
+            if path == "/socks5.txt":
+                self._send_text(HTTPStatus.OK, payload)
+            else:
+                encoded = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+                self._send_text(HTTPStatus.OK, encoded)
+            return
         if path == "/api/sub":
             if self.server.store.get_setting("probe_subscription_protection") == "true":
                 self._send_text(HTTPStatus.OK, "K-UI Local Multi-Exit")
                 return
-            username = self._query_param("user") or ""
-            token = self._query_param("token") or ""
-            user = self.server.store.get_user(username)
-            if not user or not user.get("enable") or not token or not hmac.compare_digest(token, str(user.get("sub_token", ""))):
+            user = self._subscription_user()
+            if not user:
                 self._send_json(HTTPStatus.NOT_FOUND, {"code": "not_found", "error": "subscription not found"})
                 return
             links = [link for link in self._local_subscription_links() if link]
@@ -1509,12 +1562,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             if fmt == "socks5":
                 # Per-slot SOCKS5 links stay available even when the Reality
                 # gateway shapes the default subscription as VLESS.
-                socks_links = self._local_socks5_links()
-                socks_links.extend(
-                    link
-                    for node in thirdparty_nodes
-                    if (link := self._subscription_link(node)) and link.startswith("socks5://")
-                )
+                socks_links = self._socks5_subscription_links()
                 encoded = base64.b64encode("\n".join(socks_links).encode("utf-8")).decode("ascii")
                 self._send_text(HTTPStatus.OK, encoded)
                 return

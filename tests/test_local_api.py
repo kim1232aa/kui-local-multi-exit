@@ -784,6 +784,62 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(1, len(links))
         self.assertTrue(links[0].startswith("socks5://admin:secret@127.0.0.1:7920#JP_exit-01_"))
 
+    def test_subscription_socks5_format_uses_reality_public_address_not_request_host(self):
+        self.manager.set_slot_ready("exit-01")
+        manifest = Path(self.tempdir.name) / "public-nodes.json"
+        manifest.write_text(
+            json.dumps({
+                "version": 1,
+                "nodes": [{
+                    "slot_id": "exit-01",
+                    "address": "153.121.38.245",
+                    "port": 8443,
+                    "uuid": "11111111-1111-1111-1111-111111111111",
+                    "sni": "addons.mozilla.org",
+                    "public_key": "abcdefghijklmnopqrstuvwxyzABCDEFGH1234567_",
+                    "short_id": "aabbccddeeff0011",
+                }],
+            }),
+            encoding="utf-8",
+        )
+        self.server.reality_nodes_file = manifest
+        status, data = self.request("/api/data")
+        token = data["mySubToken"]
+
+        request = urllib.request.Request(
+            f"{self.base}/api/sub?user={data['mySubUser']}&token={token}&format=socks5",
+            headers={"Host": "vp.alibb123.ccwu.cc"},
+        )
+        with urllib.request.urlopen(request, timeout=3) as response:
+            links = base64.b64decode(response.read()).decode().splitlines()
+
+        self.assertEqual(1, len(links))
+        self.assertIn("@153.121.38.245:7920#JP_exit-01_", links[0])
+        self.assertNotIn("@vp.alibb123.ccwu.cc:7920", links[0])
+
+    def test_socks5_text_routes_require_subscription_token(self):
+        self.manager.set_slot_ready("exit-01")
+        status, data = self.request("/api/data")
+        token = data["mySubToken"]
+
+        status, body = self.request("/socks5.txt", authenticated=False, expect_json=False)
+        self.assertEqual(404, status)
+        self.assertIn("subscription not found", body)
+
+        status, body = self.request(
+            f"/socks5.txt?user={data['mySubUser']}&token={token}",
+            expect_json=False,
+        )
+        self.assertEqual(200, status)
+        self.assertIn("socks5://admin:secret@127.0.0.1:7920#JP_exit-01_", body)
+
+        status, encoded = self.request(
+            f"/socks5-b64.txt?user={data['mySubUser']}&token={token}",
+            expect_json=False,
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(body, base64.b64decode(encoded).decode())
+
     def test_subscription_socks5_format_excludes_non_socks_thirdparty_nodes(self):
         self.manager.set_slot_ready("exit-01")
         content = (

@@ -27,6 +27,7 @@ services:
       PROXY_MAX_CONNECTIONS: ${PROXY_MAX_CONNECTIONS:-}
       KUI_INTERNAL_PROXY_USER: ${KUI_INTERNAL_PROXY_USER:-}
       KUI_INTERNAL_PROXY_PASSWORD: ${KUI_INTERNAL_PROXY_PASSWORD:-}
+      KUI_SOCKS5_PUBLIC_HOST: ${KUI_SOCKS5_PUBLIC_HOST:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
