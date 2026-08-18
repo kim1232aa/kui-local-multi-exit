@@ -932,7 +932,7 @@ class LocalAPITest(unittest.TestCase):
 
         self.assertEqual(200, status)
         self.assertIn("type: socks5", body)
-        self.assertIn("server: 127.0.0.1", body)
+        self.assertIn('server: "127.0.0.1"', body)
         self.assertIn("port: 7920", body)
         self.assertIn("exit-01", body)
 
@@ -981,18 +981,22 @@ class LocalAPITest(unittest.TestCase):
             self.assertEqual(1, len(links))
             self.assertTrue(links[0].startswith("socks5://admin:secret@127.0.0.1:7920#"))
 
-        # clash-meta groups use actual egress country and only reference known targets.
+        # clash-meta follows the cs-pa layout: fixed groups, no country buckets.
         status, content_type, body = self.request_text_with_content_type(
             f"/api/sub?user={user}&token={token}&format=clash-meta"
         )
         self.assertEqual(200, status)
         self.assertEqual("text/yaml", content_type)
-        self.assertIn('  - name: "🇨🇦 CA"', body)
-        self.assertNotIn('  - name: "🇯🇵 JP"', body)
-        country_start = body.index('  - name: "🇨🇦 CA"')
-        country_end = body.find("\n  - name:", country_start + 1)
-        country_block = body[country_start:] if country_end < 0 else body[country_start:country_end]
-        self.assertIn('      - "JP_exit-01_ready"', country_block)
+        self.assertIn("mixed-port: 7890", body)
+        self.assertIn('  - name: "🚀 节点选择"', body)
+        self.assertIn('  - name: "⚡ 自动选择"', body)
+        self.assertIn('  - name: "🏠 住宅自动"', body)
+        self.assertIn('  - name: "🧠 Claude"', body)
+        self.assertIn('  - name: "🇨🇳 中国流量"', body)
+        self.assertNotIn('  - name: "🇨🇦 CA"', body)
+        rocket_start = body.index('  - name: "🚀 节点选择"')
+        rocket_end = body.index("\n  - name:", rocket_start + 1)
+        self.assertIn('      - "CA未知·RESI·exit-01"', body[rocket_start:rocket_end])
         self.assertIn("proxies:", body)
 
         proxy_section, group_section = body.split("\nproxy-groups:\n", 1)
@@ -1141,7 +1145,7 @@ class LocalAPITest(unittest.TestCase):
         status, body = self.request(f"/api/sub?user={data['mySubUser']}&token={token}&format=clash", expect_json=False)
 
         self.assertEqual(200, status)
-        self.assertIn('name: "JP-日本 | 住宅IP | KDDI | 203.0.113.30 | exit-03"', body)
+        self.assertIn('name: "JP住宅·KDDI·exit-03"', body)
         self.assertIn("type: vless", body)
         self.assertIn('server: "153.121.38.245"', body)
         self.assertIn("port: 8445", body)
@@ -1149,6 +1153,7 @@ class LocalAPITest(unittest.TestCase):
         self.assertIn("reality-opts:", body)
         self.assertNotIn("type: socks5", body)
         self.assertNotIn("ANY_exit-03_ready", body)
+        self.assertIn('  - name: "🏠 住宅自动"\n    type: url-test', body)
 
         status, encoded = self.request(f"/api/sub?user={data['mySubUser']}&token={token}", expect_json=False)
         links = base64.b64decode(encoded).decode()
@@ -1204,24 +1209,21 @@ class LocalAPITest(unittest.TestCase):
             )
 
         self.assertEqual(200, status)
-        direct_name = "JP-日本 | 未知IP类型 | 203.0.113.1 | exit-01"
+        direct_name = "JP未知·RESI·exit-01"
         chain_name = "TR-土耳其 | ProxyScrape | tr-01 | 链式"
         direct_start = body.index(f'  - name: "{direct_name}"')
         chain_start = body.index(f'  - name: "{chain_name}"')
         direct_block = body[direct_start:chain_start]
         chain_block = body[chain_start:body.index("\nproxy-groups:", chain_start)]
         self.assertNotIn("dialer-proxy:", direct_block)
-        self.assertIn('dialer-proxy: "🔗链式前置"', chain_block)
+        self.assertIn('dialer-proxy: "⚡ 自动选择"', chain_block)
         self.assertEqual(1, body.count("dialer-proxy:"))
-        self.assertIn(
-            '  - name: PROXY\n    type: select\n    proxies:\n'
-            '      - "直连节点"\n      - "链式节点"',
-            body,
-        )
-        self.assertIn(
-            f'  - name: 链式节点\n    type: select\n    proxies:\n      - "{chain_name}"',
-            body,
-        )
+        self.assertNotIn("链式节点", body)
+        self.assertNotIn('  - name: PROXY', body)
+        rocket_start = body.index('  - name: "🚀 节点选择"')
+        rocket_block = body[rocket_start:body.index("\n  - name:", rocket_start + 1)]
+        self.assertIn(f'      - "{direct_name}"', rocket_block)
+        self.assertIn(f'      - "{chain_name}"', rocket_block)
 
     def test_subscription_excludes_disabled_local_exit_socks5_nodes(self):
         self.request("/api/local/exits/exit-01/disable", method="POST", body={})

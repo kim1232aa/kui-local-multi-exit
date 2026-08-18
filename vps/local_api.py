@@ -192,13 +192,6 @@ class LocalAPIServer(ThreadingHTTPServer):
         super().__init__(address, LocalAPIHandler)
 
 
-# Name of the proxy group used only by the explicitly chained nodes.
-_FRONT_GROUP = "🔗链式前置"
-_DIRECT_GROUP = "直连节点"
-_CHAIN_GROUP = "链式节点"
-_PROXY_GROUP = "PROXY"
-
-
 # Traffic-splitting rules following the user's Clash Verge template
 # (OpenAI/ChatGPT, Claude, Google/Gemini groups, local + CN direct).
 # Group names are resolved at render time in do_GET.
@@ -1150,7 +1143,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             return cached
         return load_bridge_nodes(manual_urls=manual, test_reachability=False)
 
-    def _local_subscription_nodes(self, *, include_dialer_proxy: bool = False) -> list[dict[str, Any]]:
+    def _local_subscription_nodes(self) -> list[dict[str, Any]]:
         reality_nodes = self._local_reality_nodes()
         publishable = {slot["id"]: slot for slot in self._publishable_slots()}
         nodes = []
@@ -1162,21 +1155,18 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     **node,
                     "name": self._friendly_slot_name(publishable[slot_id]),
                     "country": self._slot_country_code(publishable[slot_id]),
-                    "_subscription_group": "direct",
+                    "_slot_id": slot_id,
                 })
             elif slot_id.startswith("tr-"):
                 # tr-01 already exits through the Turkish upstream proxy on
                 # the VPS, so it is the single chained exit.
                 base_name = str(node.get("name") or f"TR-土耳其 | ProxyScrape | {slot_id}")
-                chained = {
+                nodes.append({
                     **node,
                     "name": f"{base_name} | 链式",
                     "country": str(node.get("country") or "TR"),
-                    "_subscription_group": "chain",
-                }
-                if include_dialer_proxy:
-                    chained["dialer-proxy"] = _FRONT_GROUP
-                nodes.append(chained)
+                    "_slot_id": slot_id,
+                })
         if self.server.reality_nodes_file:
             return nodes
         if not nodes:
@@ -1192,7 +1182,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     "port": slot["proxy_port"],
                     "username": self.server.username,
                     "password": self.server.password,
-                    "_subscription_group": "direct",
+                    "_slot_id": slot["id"],
                 })
         return nodes
 
@@ -1273,25 +1263,6 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             ]
         return self._local_socks5_links()
 
-    @classmethod
-    def _subscription_country_code(cls, node: dict[str, Any]) -> str:
-        known = set(COUNTRY_PRESETS)
-        for key in ("country_code", "country", "_country_hint"):
-            value = str(node.get(key) or "").upper().strip()
-            if value in known:
-                return value
-        name = str(node.get("name") or "")
-        flag = re.search(r"[\U0001F1E6-\U0001F1FF]{2}", name)
-        if flag:
-            code = "".join(chr(ord(char) - 0x1F1E6 + ord("A")) for char in flag.group(0))
-            if code in known:
-                return code
-        for match in re.finditer(r"(?<![A-Za-z])([A-Za-z]{2})(?![A-Za-z])", name):
-            code = match.group(1).upper()
-            if code in known:
-                return code
-        return "OTHER"
-
     @staticmethod
     def _unique_clash_node(node: dict[str, Any], used_names: set[str]) -> dict[str, Any]:
         protocol = str(node.get("protocol") or node.get("type") or "node")
@@ -1305,99 +1276,108 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         used_names.add(candidate)
         return {**node, "name": candidate}
 
-    def _local_clash_proxies(self) -> dict[str, Any]:
-        bridges: list[tuple[str, str]] = []
-        direct: list[tuple[str, str]] = []
-        chain: list[tuple[str, str]] = []
-        front: list[str] = []
-        country_by_name: dict[str, str] = {}
-        used_names = {
-            _FRONT_GROUP,
-            _DIRECT_GROUP,
-            _CHAIN_GROUP,
-            _PROXY_GROUP,
-            "⚡ 自动选择",
-            "🔵 Google / Gemini",
-            "🤖 ChatGPT",
-            "🧠 Claude",
-            "🌐 其他流量",
-            "🇨🇳 中国流量",
-            "DIRECT",
-        }
+    def _exit_clash_name(self, slot: dict[str, Any]) -> str:
+        """cs-pa style node name: JP住宅·KDDI·exit-03 (country + type + ISP + slot)."""
+        country = self._slot_country_code(slot)
+        egress_type, _ = self._slot_egress_type_info(slot)
+        kind = {"residential": "住宅", "datacenter": "机房"}.get(egress_type, "未知")
+        isp = self._short_isp_name(self._slot_isp(slot).get("org")) or "RESI"
+        return f"{country}{kind}·{isp}·{slot['id']}"
 
-        def add_entry(target: list[tuple[str, str]], node: dict[str, Any]) -> tuple[str, str] | None:
+    def _clash_subscription_yaml(self, thirdparty_nodes: list[dict[str, Any]]) -> str:
+        """Clash/Mihomo subscription in the cs-pa (Cloud Shell) layout:
+        🚀 节点选择 / ⚡ 自动选择 / 🏠 住宅自动 + AI site groups + CN direct."""
+        used_names = {
+            "🚀 节点选择", "⚡ 自动选择", "🏠 住宅自动",
+            "🧠 Claude", "🤖 ChatGPT", "🔵 Google·Gemini",
+            "🌐 其他流量", "🇨🇳 中国流量", "DIRECT",
+        }
+        proxies: list[str] = []
+        direct_names: list[str] = []
+        pure_names: list[str] = []
+        extra_names: list[str] = []
+
+        def add(node: dict[str, Any], bucket: list[str]) -> str | None:
             normalized = self._unique_clash_node(node, used_names)
             entry = self._clash_proxy(normalized)
-            if entry:
-                target.append(entry)
-                country_by_name[entry[0]] = self._subscription_country_code(normalized)
-            return entry
+            if not entry:
+                return None
+            proxies.append(entry[1])
+            bucket.append(entry[0])
+            return entry[0]
 
-        if self.server.reality_nodes_file:
-            all_bridge_nodes = self._bridge_nodes()
-            # Only explicitly configured bridge URLs are first-hop candidates.
-            # Subscription-fed nodes are final exits and are handled below.
-            for bridge in all_bridge_nodes:
-                if bridge.get("_source_kind", "manual") != "manual":
-                    continue
-                add_entry(bridges, bridge)
-            local_nodes = self._local_subscription_nodes(include_dialer_proxy=False)
-            for node in local_nodes:
-                if node.get("_subscription_group") == "chain":
-                    node = {**node, "dialer-proxy": _FRONT_GROUP}
-                    add_entry(chain, node)
-                elif entry := add_entry(direct, node):
-                    front.append(entry[0])
-            # Public subscription nodes are additional final exits. They use
-            # the selected first-hop node from the front group.
-            for node in all_bridge_nodes:
-                if node.get("_source_kind") != "subscription":
-                    continue
-                raw_name = str(node.get("name") or "订阅节点")
-                country_hint = str(node.get("_country_hint") or "")
-                node = {
-                    **node,
-                    "name": (
-                        f"自动链式 | {country_hint} | {raw_name}"
-                        if country_hint in {"TR", "VN", "TH", "PH"}
-                        and not raw_name.startswith(country_hint + "-")
-                        else f"自动链式 | {raw_name}"
-                    ),
-                    "country": country_hint or node.get("country", ""),
-                    "dialer-proxy": _FRONT_GROUP,
-                    "_subscription_group": "chain",
-                }
-                add_entry(chain, node)
-            front.extend(name for name, _ in bridges)
-            return {
-                "bridges": bridges,
-                "direct": direct,
-                "chain": chain,
-                "front": front,
-                "country_by_name": country_by_name,
-            }
+        publishable = {slot["id"]: slot for slot in self._publishable_slots()}
+        for node in self._local_subscription_nodes():
+            slot = publishable.get(str(node.get("_slot_id") or ""))
+            if slot is not None:
+                added = add({**node, "name": self._exit_clash_name(slot)}, direct_names)
+                if added and self._slot_egress_type_info(slot)[0] == "residential":
+                    pure_names.append(added)
+            else:
+                # tr-* slots are chained exits: first hop via the auto group.
+                add({**node, "dialer-proxy": "⚡ 自动选择"}, extra_names)
 
-        host = self._socks5_public_host()
-        for slot in self._publishable_slots():
-            name = f"{self._slot_label_country(slot)}_{slot['id']}_{slot['state']}"
-            proxy = "\n".join((
-                f"  - name: {json.dumps(name, ensure_ascii=False)}",
-                "    type: socks5",
-                f"    server: {host}",
-                f"    port: {slot['proxy_port']}",
-                f"    username: {json.dumps(self.server.username)}",
-                f"    password: {json.dumps(self.server.password)}",
-                "    udp: true",
-            ))
-            direct.append((name, proxy))
-            country_by_name[name] = self._slot_country_code(slot)
-        return {
-            "bridges": bridges,
-            "direct": direct,
-            "chain": chain,
-            "front": front,
-            "country_by_name": country_by_name,
-        }
+        for bridge in self._bridge_nodes():
+            if bridge.get("_source_kind", "manual") == "manual":
+                add(bridge, extra_names)
+                continue
+            raw_name = str(bridge.get("name") or "订阅节点")
+            hint = str(bridge.get("_country_hint") or "")
+            name = (
+                f"自动链式 | {hint} | {raw_name}"
+                if hint in {"TR", "VN", "TH", "PH"} and not raw_name.startswith(hint + "-")
+                else f"自动链式 | {raw_name}"
+            )
+            add({**bridge, "name": name, "dialer-proxy": "⚡ 自动选择"}, extra_names)
+
+        for node in thirdparty_nodes:
+            add(node, extra_names)
+
+        def q(value: str) -> str:
+            return json.dumps(value, ensure_ascii=False)
+
+        def lst(items: list[str]) -> str:
+            return "\n".join(f"      - {q(item)}" for item in items) if items else "      - DIRECT"
+
+        all_names = direct_names + extra_names
+        now = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+        lines = [
+            f"# K-UI Local Multi-Exit subscription — generated {now} (dynamic)",
+            f"# {len(direct_names)} exit nodes ({len(pure_names)} verified residential) + {len(extra_names)} chained/third-party nodes",
+            "mixed-port: 7890",
+            "allow-lan: false",
+            "mode: rule",
+            "log-level: warning",
+        ]
+        if proxies:
+            lines.append("proxies:")
+            lines.extend(proxies)
+        else:
+            lines.append("proxies: []")
+
+        groups = ["proxy-groups:"]
+        groups.append('  - name: "🚀 节点选择"\n    type: select\n    proxies:\n' + lst(["⚡ 自动选择", "🏠 住宅自动", *all_names, "DIRECT"]))
+        groups.append('  - name: "⚡ 自动选择"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 300\n    tolerance: 100\n    proxies:\n' + lst(direct_names))
+        if pure_names:
+            groups.append('  - name: "🏠 住宅自动"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 300\n    tolerance: 150\n    proxies:\n' + lst(pure_names))
+        else:
+            groups.append('  - name: "🏠 住宅自动"\n    type: select\n    proxies:\n      - "🚀 节点选择"')
+        for grp in ("🧠 Claude", "🤖 ChatGPT", "🔵 Google·Gemini"):
+            groups.append(f'  - name: "{grp}"\n    type: select\n    proxies:\n' + lst(["🏠 住宅自动", "🚀 节点选择", "⚡ 自动选择", *pure_names]))
+        groups.append('  - name: "🌐 其他流量"\n    type: select\n    proxies:\n' + lst(["🚀 节点选择", "⚡ 自动选择", "🏠 住宅自动", "DIRECT"]))
+        groups.append('  - name: "🇨🇳 中国流量"\n    type: select\n    proxies:\n' + lst(["DIRECT", "🚀 节点选择"]))
+
+        rules = ["rules:"]
+        rules.extend(f"  - {rule},🤖 ChatGPT" for rule in _CHATGPT_RULES)
+        rules.extend(f"  - {rule},🧠 Claude" for rule in _CLAUDE_RULES)
+        rules.extend(f"  - {rule},🔵 Google·Gemini" for rule in _GEMINI_RULES)
+        rules.extend(f"  - {rule}" for rule in _LOCAL_DIRECT_RULES)
+        rules.extend((
+            "  - GEOSITE,CN,🇨🇳 中国流量",
+            "  - GEOIP,CN,🇨🇳 中国流量,no-resolve",
+            "  - MATCH,🌐 其他流量",
+        ))
+        return "\n".join(lines + groups + rules) + "\n"
 
     def _ensure_admin_subscription_token(self) -> str:
         admin_user = self.server.store.get_user(self.server.username)
@@ -1613,170 +1593,11 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 self._send_text(HTTPStatus.OK, encoded)
                 return
             if fmt in {"clash", "clash-meta"}:
-                groups = self._local_clash_proxies()
-                used_names = {
-                    _FRONT_GROUP,
-                    _DIRECT_GROUP,
-                    _CHAIN_GROUP,
-                    _PROXY_GROUP,
-                    "⚡ 自动选择",
-                    "🔵 Google / Gemini",
-                    "🤖 ChatGPT",
-                    "🧠 Claude",
-                    "🌐 其他流量",
-                    "🇨🇳 中国流量",
-                    "DIRECT",
-                }
-                used_names.update(
-                    name
-                    for group_name in ("bridges", "direct", "chain")
-                    for name, _ in groups[group_name]
+                self._send_text(
+                    HTTPStatus.OK,
+                    self._clash_subscription_yaml(thirdparty_nodes),
+                    content_type="text/yaml; charset=utf-8",
                 )
-                country_by_name = groups.setdefault("country_by_name", {})
-                for node in thirdparty_nodes:
-                    normalized = self._unique_clash_node(node, used_names)
-                    if entry := self._clash_proxy(normalized):
-                        groups["direct"].append(entry)
-                        country_by_name[entry[0]] = self._subscription_country_code(normalized)
-
-                all_entries = groups["bridges"] + groups["direct"] + groups["chain"]
-                proxy_lines = [entry for _, entry in all_entries]
-
-                def _list_yaml(items: list[str]) -> str:
-                    return "\n".join(f"      - {json.dumps(n, ensure_ascii=False)}" for n in items)
-
-                direct_names = [name for name, _ in groups["direct"]]
-                chain_names = [name for name, _ in groups["chain"]]
-                front_names = list(dict.fromkeys(groups.get("front", [])))
-
-                country_group_names: list[str] = []
-                country_group_lines: list[str] = []
-                if fmt == "clash-meta":
-                    country_buckets: dict[str, list[str]] = {}
-                    for name, _ in all_entries:
-                        cc = str(country_by_name.get(name, "OTHER") or "OTHER").upper()
-                        if cc not in set(COUNTRY_PRESETS):
-                            cc = "OTHER"
-                        country_buckets.setdefault(cc, []).append(name)
-
-                    for cc in sorted(country_buckets):
-                        node_list = list(dict.fromkeys(country_buckets[cc]))
-                        if not node_list:
-                            continue
-                        if cc != "OTHER":
-                            flag = "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in cc)
-                            g_name = f"{flag} {cc}"
-                        else:
-                            g_name = "🌐 其他节点"
-                        while g_name in used_names or g_name in country_group_names:
-                            g_name = f"{g_name} 组"
-                        country_group_names.append(g_name)
-                        country_group_lines.extend([
-                            f"  - name: {json.dumps(g_name, ensure_ascii=False)}",
-                            "    type: url-test",
-                            "    url: https://www.gstatic.com/generate_204",
-                            "    interval: 300",
-                            "    tolerance: 50",
-                            "    lazy: true",
-                            "    proxies:",
-                            _list_yaml(node_list),
-                        ])
-
-                direct_yaml = _list_yaml(direct_names) if direct_names else "      - DIRECT"
-                chain_yaml = _list_yaml(chain_names) if chain_names else "      - DIRECT"
-                front_yaml = _list_yaml(front_names) if front_names else "      - DIRECT"
-                # The site groups expose PROXY plus the leaf nodes for manual
-                # selection, while PROXY itself stays as the two-level entry.
-                site_candidates = [_PROXY_GROUP, "⚡ 自动选择"] + direct_names + chain_names + country_group_names + ["DIRECT"]
-                defined_names = {
-                    _PROXY_GROUP,
-                    _DIRECT_GROUP,
-                    _CHAIN_GROUP,
-                    _FRONT_GROUP,
-                    "⚡ 自动选择",
-                    "🔵 Google / Gemini",
-                    "🤖 ChatGPT",
-                    "🧠 Claude",
-                    "🌐 其他流量",
-                    "🇨🇳 中国流量",
-                    "DIRECT",
-                    *{name for name, _ in all_entries},
-                    *country_group_names,
-                }
-                site_items = list(dict.fromkeys(item for item in site_candidates if item in defined_names))
-                site_yaml = _list_yaml(site_items)
-                group_lines = [
-                    "  - name: " + _PROXY_GROUP,
-                    "    type: select",
-                    "    proxies:",
-                    "      - " + json.dumps(_DIRECT_GROUP, ensure_ascii=False),
-                    "      - " + json.dumps(_CHAIN_GROUP, ensure_ascii=False),
-                    "  - name: " + _DIRECT_GROUP,
-                    "    type: select",
-                    "    proxies:",
-                    direct_yaml,
-                    "  - name: " + _CHAIN_GROUP,
-                    "    type: select",
-                    "    proxies:",
-                    chain_yaml,
-                    f"  - name: {_FRONT_GROUP}",
-                    "    type: select",
-                    "    proxies:",
-                    front_yaml,
-                ]
-                group_lines.extend(country_group_lines)
-                group_lines.extend([
-                    "  - name: ⚡ 自动选择",
-                    "    type: url-test",
-                    "    hidden: true",
-                    "    url: https://www.gstatic.com/generate_204",
-                    "    interval: 300",
-                    "    tolerance: 50",
-                    "    lazy: true",
-                    "    proxies:",
-                    direct_yaml,
-                    "  - name: 🔵 Google / Gemini",
-                    "    type: select",
-                    "    proxies:",
-                    site_yaml,
-                    "  - name: 🤖 ChatGPT",
-                    "    type: select",
-                    "    proxies:",
-                    site_yaml,
-                    "  - name: 🧠 Claude",
-                    "    type: select",
-                    "    proxies:",
-                    site_yaml,
-                    "  - name: 🌐 其他流量",
-                    "    type: select",
-                    "    proxies:",
-                    site_yaml,
-                    "  - name: 🇨🇳 中国流量",
-                    "    type: select",
-                    "    proxies:",
-                    "      - DIRECT",
-                    "      - 🌐 其他流量",
-                ])
-                rule_lines = ["  - DOMAIN-SUFFIX,alibb123.ccwu.cc,DIRECT"]
-                rule_lines.extend(f"  - {rule},🤖 ChatGPT" for rule in _CHATGPT_RULES)
-                rule_lines.extend(f"  - {rule},🧠 Claude" for rule in _CLAUDE_RULES)
-                rule_lines.extend(f"  - {rule},🔵 Google / Gemini" for rule in _GEMINI_RULES)
-                rule_lines.extend(f"  - {rule}" for rule in _LOCAL_DIRECT_RULES)
-                rule_lines.extend((
-                    "  - GEOSITE,CN,🇨🇳 中国流量",
-                    "  - GEOIP,CN,🇨🇳 中国流量,no-resolve",
-                    "  - MATCH,🌐 其他流量",
-                ))
-                body = (
-                    "port: 7890\nsocks-port: 7891\nallow-lan: true\nmode: rule\n"
-                    + ("proxies:\n" + "\n".join(proxy_lines) if proxy_lines else "proxies: []")
-                    + "\nproxy-groups:\n"
-                    + "\n".join(group_lines)
-                    + "\nrules:\n"
-                    + "\n".join(rule_lines)
-                    + "\n"
-                )
-                self._send_text(HTTPStatus.OK, body, content_type="text/yaml; charset=utf-8")
                 return
             encoded = base64.b64encode("\n".join(links).encode("utf-8")).decode("ascii")
             self._send_text(HTTPStatus.OK, encoded)
