@@ -1,5 +1,6 @@
 import base64
 import json
+import os
 import re
 import tempfile
 import threading
@@ -1226,6 +1227,45 @@ class LocalAPITest(unittest.TestCase):
         rocket_block = body[rocket_start:body.index("\n  - name:", rocket_start + 1)]
         self.assertIn(f'      - "{direct_name}"', rocket_block)
         self.assertIn(f'      - "{chain_name}"', rocket_block)
+
+    def test_clash_subscription_includes_cf_front_nodes_when_secrets_mounted(self):
+        self.manager.set_slot_ready("exit-01")
+        secrets = Path(self.tempdir.name) / "cs-secrets"
+        secrets.mkdir()
+        (secrets / "sub-front.yaml").write_text(
+            '  - name: "Ubisoft·store.ubi.com"\n'
+            "    type: vless\n"
+            "    server: store.ubi.com\n"
+            "    port: 443\n"
+            '  - name: "Visa·www.visa.cn"\n'
+            "    type: vless\n"
+            "    server: www.visa.cn\n"
+            "    port: 443\n",
+            encoding="utf-8",
+        )
+        status, data = self.request("/api/data")
+        token = data["mySubToken"]
+
+        with patch.dict(os.environ, {"KUI_CLOUDSHELL_SECRETS": str(secrets)}):
+            status, body = self.request(
+                f"/api/sub?user={data['mySubUser']}&token={token}&format=clash",
+                expect_json=False,
+            )
+
+        self.assertEqual(200, status)
+        self.assertIn('  - name: "Ubisoft·store.ubi.com"', body)
+        # CF fronts are the fast auto-test pool, like the reference profile.
+        auto_start = body.index('  - name: "⚡ 自动选择"')
+        auto_block = body[auto_start:body.index("\n  - name:", auto_start + 1)]
+        self.assertIn('      - "Ubisoft·store.ubi.com"', auto_block)
+        self.assertIn('      - "Visa·www.visa.cn"', auto_block)
+        # 🚀 节点选择 lists fronts before the residential exits.
+        rocket_start = body.index('  - name: "🚀 节点选择"')
+        rocket_block = body[rocket_start:body.index("\n  - name:", rocket_start + 1)]
+        self.assertLess(
+            rocket_block.index('"Ubisoft·store.ubi.com"'),
+            rocket_block.index('"JP未知·RESI·exit-01"'),
+        )
 
     def test_subscription_excludes_disabled_local_exit_socks5_nodes(self):
         self.request("/api/local/exits/exit-01/disable", method="POST", body={})

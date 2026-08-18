@@ -36,6 +36,9 @@ services:
       - kui-local-data:/opt/kui-local
       - ./providers:/opt/kui-providers:ro
       - ./runtime/reality:/run/kui-reality:ro
+      # Front nodes (CF 前置) for the Clash subscription; optional content —
+      # missing files simply mean no front nodes in the output.
+      - kui-cloudshell-secrets:/run/cloudshell-secrets:ro
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2)\""]
       interval: 10s
