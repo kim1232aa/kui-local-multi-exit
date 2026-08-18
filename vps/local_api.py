@@ -1339,7 +1339,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         """Clash/Mihomo subscription in the cs-pa (Cloud Shell) layout:
         🚀 节点选择 / ⚡ 自动选择 / 🏠 住宅自动 + AI site groups + CN direct."""
         used_names = {
-            "🚀 节点选择", "⚡ 自动选择", "🏠 住宅自动",
+            "🚀 节点选择", "⚡ 自动选择", "🏠 住宅自动", "VLESS-REALITY-链式",
             "🧠 Claude", "🤖 ChatGPT", "🔵 Google·Gemini",
             "🌐 其他流量", "🇨🇳 中国流量", "DIRECT",
         }
@@ -1410,11 +1410,17 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         else:
             lines.append("proxies: []")
 
+        # One dynamic chain entry: first hop = the current ⚡ 自动选择 pick,
+        # exit = the current 🏠 住宅自动 pick. Only emitted when residential
+        # exits exist — with the fallback 🏠 (-> 🚀) the relay would loop.
+        relay_name = "VLESS-REALITY-链式" if pure_names else ""
+
         groups = ["proxy-groups:"]
-        groups.append('  - name: "🚀 节点选择"\n    type: select\n    proxies:\n' + lst(["⚡ 自动选择", "🏠 住宅自动", *front_names, *all_names, "DIRECT"]))
+        groups.append('  - name: "🚀 节点选择"\n    type: select\n    proxies:\n' + lst(["⚡ 自动选择", "🏠 住宅自动", *([relay_name] if relay_name else []), *front_names, *all_names, "DIRECT"]))
         groups.append('  - name: "⚡ 自动选择"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 300\n    tolerance: 100\n    proxies:\n' + lst(front_names or direct_names))
         if pure_names:
             groups.append('  - name: "🏠 住宅自动"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 300\n    tolerance: 150\n    proxies:\n' + lst(pure_names))
+            groups.append(f'  - name: "{relay_name}"\n    type: relay\n    proxies:\n      - "⚡ 自动选择"\n      - "🏠 住宅自动"')
         else:
             groups.append('  - name: "🏠 住宅自动"\n    type: select\n    proxies:\n      - "🚀 节点选择"')
         for grp in ("🧠 Claude", "🤖 ChatGPT", "🔵 Google·Gemini"):

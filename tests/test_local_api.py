@@ -1157,6 +1157,15 @@ class LocalAPITest(unittest.TestCase):
         self.assertNotIn("type: socks5", body)
         self.assertNotIn("ANY_exit-03_ready", body)
         self.assertIn('  - name: "🏠 住宅自动"\n    type: url-test', body)
+        # dynamic chain: current ⚡ front pick -> current 🏠 residential pick
+        self.assertIn(
+            '  - name: "VLESS-REALITY-链式"\n    type: relay\n'
+            '    proxies:\n      - "⚡ 自动选择"\n      - "🏠 住宅自动"',
+            body,
+        )
+        rocket_start = body.index('  - name: "🚀 节点选择"')
+        rocket_block = body[rocket_start:body.index("\n  - name:", rocket_start + 1)]
+        self.assertIn('      - "VLESS-REALITY-链式"', rocket_block)
 
         status, encoded = self.request(f"/api/sub?user={data['mySubUser']}&token={token}", expect_json=False)
         links = base64.b64decode(encoded).decode()
