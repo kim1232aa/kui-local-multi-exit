@@ -86,10 +86,16 @@ docker compose exec -T kui-reality-gateway \
 
 ## 桥接节点
 
-可选桥接节点会作为客户端侧第一跳，路径为：
+可选桥接节点会作为客户端侧第一跳。Reality 订阅中的每个 ready 槽位会生成两份客户端入口：
+
+- 直连节点：客户端直接连接 VPS Reality 入口。
+- Cloudflare 优选节点：同一 VPS Reality 节点带 `dialer-proxy: 🔗链式前置`，客户端从前置组选择 Cloudflare/桥接节点。
+
+路径为：
 
 ```text
-客户端 -> bridge node -> Reality gateway -> OpenVPN exit -> 目标站
+直连：客户端 -> Reality gateway -> OpenVPN exit -> 目标站
+链式：客户端 -> Cloudflare/bridge node -> Reality gateway -> OpenVPN exit -> 目标站
 ```
 
 ```env
@@ -101,6 +107,25 @@ KUI_BRIDGE_TOP_N=16
 ```
 
 手工节点直接加入订阅。订阅节点会先做连通性测试；后台刷新并发受 `KUI_DIAL_WORKERS` 限制，避免 1–2 GiB VPS 产生过多子进程。
+
+## CloudShell 兼容入口（Docker）
+
+可选服务 `kui-cloudshell-origin` + `kui-cloudflared` 把旧 CloudShell 的 VLESS/WS 入口在本机 Docker 内重建，不安装宿主机程序，也不占用宿主机端口：
+
+```text
+client -> Cloudflare Tunnel -> kui-cloudflared -> kui-cloudshell-origin
+  /vless      -> VPS direct
+  /res-01..24 -> kui-local-multi-exit:7920..7943
+  /<secret>   -> 动态 Clash YAML（旧版格式）
+```
+
+前提是外部 Docker volume `kui-cloudshell-secrets` 已包含：`cf-tunnel-creds.json`、`cf-hostname`、`uuid`、`sub-path`、`sub-front.yaml`、`res-domains.txt`。这些文件不入仓；`kui-cloudshell-origin` volume 存放运行时配置。启动：
+
+```bash
+docker compose up -d kui-cloudshell-origin kui-cloudflared
+```
+
+`/vless` 探针返回 400 属于预期；通过 VLESS 客户端访问时正常。旧版订阅仍从 Cloudflare 域名的 secret path 动态生成，包含域名前置节点、每个 ready 住宅出口的主入口/保底入口和原有分组，不生成地区分组。
 
 ## 低配排查
 
