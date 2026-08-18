@@ -97,8 +97,8 @@ def load_runtime_inputs() -> dict[str, Any]:
 
 
 def res_domains() -> list[tuple[str, str]]:
-    # Only the FIRST entry is used — one slot = one node, no fallback variants
-    # (same cut as cs-pa subserver.py: fallback copies doubled the node count).
+    # Every active line is used: first entry = primary (joins url-test groups),
+    # the rest = manual fallback variants (e.g. the tunnel hostname as 保底).
     path = SECRETS_DIR / "res-domains.txt"
     entries: list[tuple[str, str]] = []
     if path.exists():
@@ -108,7 +108,7 @@ def res_domains() -> list[tuple[str, str]]:
                 entries.append((parts[0], parts[1] if len(parts) > 1 else ""))
     if not entries:
         raise RuntimeError("res-domains.txt has no active entry")
-    return entries[:1]
+    return entries
 
 
 def slot_count(environ: dict[str, str] | None = None) -> int:
