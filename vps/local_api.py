@@ -1156,14 +1156,21 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         nodes = []
         for slot_id, node in reality_nodes.items():
             if slot_id in publishable:
-                # The 24 OpenVPN slots are direct exits and never use a
-                # client-side dialer proxy.
-                nodes.append({
+                slot = publishable[slot_id]
+                direct = {
                     **node,
-                    "name": self._friendly_slot_name(publishable[slot_id]),
-                    "country": self._slot_country_code(publishable[slot_id]),
+                    "name": self._friendly_slot_name(slot),
+                    "country": self._slot_country_code(slot),
                     "_subscription_group": "direct",
-                })
+                }
+                nodes.append(direct)
+                if include_dialer_proxy:
+                    nodes.append({
+                        **direct,
+                        "name": f"{direct['name']} | Cloudflare优选",
+                        "dialer-proxy": _FRONT_GROUP,
+                        "_subscription_group": "chain",
+                    })
             elif slot_id.startswith("tr-"):
                 # tr-01 already exits through the Turkish upstream proxy on
                 # the VPS, so it is the single chained exit.
@@ -1305,11 +1312,19 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         used_names.add(candidate)
         return {**node, "name": candidate}
 
+    @staticmethod
+    def _subscription_group_names(username: str) -> tuple[str, str]:
+        label = re.sub(r"[\r\n\t]", " ", str(username or "用户")).strip() or "用户"
+        label = label[:48]
+        return f"{label}-vps-住宅", f"{label}-cloudflare-vps-住宅"
+
     def _local_clash_proxies(self) -> dict[str, Any]:
         bridges: list[tuple[str, str]] = []
         direct: list[tuple[str, str]] = []
         chain: list[tuple[str, str]] = []
         front: list[str] = []
+        vps_direct: list[str] = []
+        vps_chain: list[str] = []
         country_by_name: dict[str, str] = {}
         used_names = {
             _FRONT_GROUP,
@@ -1341,13 +1356,16 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 if bridge.get("_source_kind", "manual") != "manual":
                     continue
                 add_entry(bridges, bridge)
-            local_nodes = self._local_subscription_nodes(include_dialer_proxy=False)
+            local_nodes = self._local_subscription_nodes(include_dialer_proxy=True)
             for node in local_nodes:
                 if node.get("_subscription_group") == "chain":
-                    node = {**node, "dialer-proxy": _FRONT_GROUP}
-                    add_entry(chain, node)
-                elif entry := add_entry(direct, node):
-                    front.append(entry[0])
+                    entry = add_entry(chain, node)
+                    if entry:
+                        vps_chain.append(entry[0])
+                else:
+                    entry = add_entry(direct, node)
+                    if entry:
+                        vps_direct.append(entry[0])
             # Public subscription nodes are additional final exits. They use
             # the selected first-hop node from the front group.
             for node in all_bridge_nodes:
@@ -1374,6 +1392,8 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 "direct": direct,
                 "chain": chain,
                 "front": front,
+                "vps_direct": vps_direct,
+                "vps_chain": vps_chain,
                 "country_by_name": country_by_name,
             }
 
@@ -1390,12 +1410,15 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 "    udp: true",
             ))
             direct.append((name, proxy))
+            vps_direct.append(name)
             country_by_name[name] = self._slot_country_code(slot)
         return {
             "bridges": bridges,
             "direct": direct,
             "chain": chain,
             "front": front,
+            "vps_direct": vps_direct,
+            "vps_chain": vps_chain,
             "country_by_name": country_by_name,
         }
 
@@ -1584,6 +1607,9 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             if not user:
                 self._send_json(HTTPStatus.NOT_FOUND, {"code": "not_found", "error": "subscription not found"})
                 return
+            direct_group_name, chain_group_name = self._subscription_group_names(
+                str(user.get("username") or self.server.username)
+            )
             links = [link for link in self._local_subscription_links() if link]
             thirdparty_nodes = self.server.store.list_enabled_thirdparty_nodes()
             links.extend(
@@ -1618,6 +1644,8 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     _FRONT_GROUP,
                     _DIRECT_GROUP,
                     _CHAIN_GROUP,
+                    direct_group_name,
+                    chain_group_name,
                     _PROXY_GROUP,
                     "⚡ 自动选择",
                     "🔵 Google / Gemini",
@@ -1647,52 +1675,30 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
 
                 direct_names = [name for name, _ in groups["direct"]]
                 chain_names = [name for name, _ in groups["chain"]]
+                local_direct_names = list(groups.get("vps_direct", []))
+                local_chain_names = list(groups.get("vps_chain", []))
                 front_names = list(dict.fromkeys(groups.get("front", [])))
-
-                country_group_names: list[str] = []
-                country_group_lines: list[str] = []
-                if fmt == "clash-meta":
-                    country_buckets: dict[str, list[str]] = {}
-                    for name, _ in all_entries:
-                        cc = str(country_by_name.get(name, "OTHER") or "OTHER").upper()
-                        if cc not in set(COUNTRY_PRESETS):
-                            cc = "OTHER"
-                        country_buckets.setdefault(cc, []).append(name)
-
-                    for cc in sorted(country_buckets):
-                        node_list = list(dict.fromkeys(country_buckets[cc]))
-                        if not node_list:
-                            continue
-                        if cc != "OTHER":
-                            flag = "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in cc)
-                            g_name = f"{flag} {cc}"
-                        else:
-                            g_name = "🌐 其他节点"
-                        while g_name in used_names or g_name in country_group_names:
-                            g_name = f"{g_name} 组"
-                        country_group_names.append(g_name)
-                        country_group_lines.extend([
-                            f"  - name: {json.dumps(g_name, ensure_ascii=False)}",
-                            "    type: url-test",
-                            "    url: https://www.gstatic.com/generate_204",
-                            "    interval: 300",
-                            "    tolerance: 50",
-                            "    lazy: true",
-                            "    proxies:",
-                            _list_yaml(node_list),
-                        ])
 
                 direct_yaml = _list_yaml(direct_names) if direct_names else "      - DIRECT"
                 chain_yaml = _list_yaml(chain_names) if chain_names else "      - DIRECT"
-                front_yaml = _list_yaml(front_names) if front_names else "      - DIRECT"
-                # The site groups expose PROXY plus the leaf nodes for manual
-                # selection, while PROXY itself stays as the two-level entry.
-                site_candidates = [_PROXY_GROUP, "⚡ 自动选择"] + direct_names + chain_names + country_group_names + ["DIRECT"]
+                front_items = list(dict.fromkeys(front_names + ["DIRECT"]))
+                front_yaml = _list_yaml(front_items)
+                # PROXY exposes exactly two user-selectable Reality paths:
+                # direct VPS access and the same exits via the selected bridge.
+                site_candidates = [
+                    _PROXY_GROUP,
+                    "⚡ 自动选择",
+                    direct_group_name,
+                    chain_group_name,
+                    *direct_names,
+                    *chain_names,
+                    "DIRECT",
+                ]
                 defined_names = {
                     _PROXY_GROUP,
-                    _DIRECT_GROUP,
-                    _CHAIN_GROUP,
                     _FRONT_GROUP,
+                    direct_group_name,
+                    chain_group_name,
                     "⚡ 自动选择",
                     "🔵 Google / Gemini",
                     "🤖 ChatGPT",
@@ -1701,30 +1707,30 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     "🇨🇳 中国流量",
                     "DIRECT",
                     *{name for name, _ in all_entries},
-                    *country_group_names,
                 }
                 site_items = list(dict.fromkeys(item for item in site_candidates if item in defined_names))
                 site_yaml = _list_yaml(site_items)
+                proxy_paths_yaml = _list_yaml([direct_group_name, chain_group_name])
+                vps_direct_yaml = _list_yaml(local_direct_names) if local_direct_names else "      - DIRECT"
+                vps_chain_yaml = _list_yaml(local_chain_names) if local_chain_names else "      - DIRECT"
                 group_lines = [
                     "  - name: " + _PROXY_GROUP,
                     "    type: select",
                     "    proxies:",
-                    "      - " + json.dumps(_DIRECT_GROUP, ensure_ascii=False),
-                    "      - " + json.dumps(_CHAIN_GROUP, ensure_ascii=False),
-                    "  - name: " + _DIRECT_GROUP,
+                    proxy_paths_yaml,
+                    f"  - name: {json.dumps(direct_group_name, ensure_ascii=False)}",
                     "    type: select",
                     "    proxies:",
-                    direct_yaml,
-                    "  - name: " + _CHAIN_GROUP,
+                    vps_direct_yaml,
+                    f"  - name: {json.dumps(chain_group_name, ensure_ascii=False)}",
                     "    type: select",
                     "    proxies:",
-                    chain_yaml,
+                    vps_chain_yaml,
                     f"  - name: {_FRONT_GROUP}",
                     "    type: select",
                     "    proxies:",
                     front_yaml,
                 ]
-                group_lines.extend(country_group_lines)
                 group_lines.extend([
                     "  - name: ⚡ 自动选择",
                     "    type: url-test",

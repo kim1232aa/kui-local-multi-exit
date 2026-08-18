@@ -981,18 +981,18 @@ class LocalAPITest(unittest.TestCase):
             self.assertEqual(1, len(links))
             self.assertTrue(links[0].startswith("socks5://admin:secret@127.0.0.1:7920#"))
 
-        # clash-meta groups use actual egress country and only reference known targets.
+        # clash-meta keeps the original compact groups; it does not add
+        # per-country groups such as CA/JP/KR.
         status, content_type, body = self.request_text_with_content_type(
             f"/api/sub?user={user}&token={token}&format=clash-meta"
         )
         self.assertEqual(200, status)
         self.assertEqual("text/yaml", content_type)
-        self.assertIn('  - name: "🇨🇦 CA"', body)
+        self.assertNotIn('  - name: "🇨🇦 CA"', body)
         self.assertNotIn('  - name: "🇯🇵 JP"', body)
-        country_start = body.index('  - name: "🇨🇦 CA"')
-        country_end = body.find("\n  - name:", country_start + 1)
-        country_block = body[country_start:] if country_end < 0 else body[country_start:country_end]
-        self.assertIn('      - "JP_exit-01_ready"', country_block)
+        self.assertNotIn('  - name: "🇰🇷 KR"', body)
+        self.assertIn('  - name: "admin-vps-住宅"', body)
+        self.assertIn('  - name: "admin-cloudflare-vps-住宅"', body)
         self.assertIn("proxies:", body)
 
         proxy_section, group_section = body.split("\nproxy-groups:\n", 1)
@@ -1156,7 +1156,7 @@ class LocalAPITest(unittest.TestCase):
         self.assertIn("JP-%E6%97%A5%E6%9C%AC%20%7C%20%E4%BD%8F%E5%AE%85IP%20%7C%20KDDI%20%7C%20203.0.113.30%20%7C%20exit-03", links)
         self.assertNotIn("socks5://", links)
 
-    def test_reality_clash_subscription_separates_direct_and_chained_exits(self):
+    def test_reality_clash_subscription_exposes_direct_and_cloudflare_entries(self):
         self.manager.set_slot_ready("exit-01")
         manifest = Path(self.tempdir.name) / "public-nodes.json"
         manifest.write_text(
@@ -1205,21 +1205,36 @@ class LocalAPITest(unittest.TestCase):
 
         self.assertEqual(200, status)
         direct_name = "JP-日本 | 未知IP类型 | 203.0.113.1 | exit-01"
+        cloudflare_name = f"{direct_name} | Cloudflare优选"
         chain_name = "TR-土耳其 | ProxyScrape | tr-01 | 链式"
         direct_start = body.index(f'  - name: "{direct_name}"')
+        cloudflare_start = body.index(f'  - name: "{cloudflare_name}"')
         chain_start = body.index(f'  - name: "{chain_name}"')
-        direct_block = body[direct_start:chain_start]
-        chain_block = body[chain_start:body.index("\nproxy-groups:", chain_start)]
+        direct_block = body[direct_start:cloudflare_start]
+        cloudflare_block = body[cloudflare_start:chain_start]
         self.assertNotIn("dialer-proxy:", direct_block)
-        self.assertIn('dialer-proxy: "🔗链式前置"', chain_block)
-        self.assertEqual(1, body.count("dialer-proxy:"))
+        self.assertIn('dialer-proxy: "🔗链式前置"', cloudflare_block)
+        self.assertIn('dialer-proxy: "🔗链式前置"', body[chain_start:body.index("\nproxy-groups:", chain_start)])
+        self.assertEqual(2, body.count("dialer-proxy:"))
+        self.assertEqual(body.count('uuid: "11111111-1111-1111-1111-111111111111"'), 2)
         self.assertIn(
             '  - name: PROXY\n    type: select\n    proxies:\n'
-            '      - "直连节点"\n      - "链式节点"',
+            '      - "admin-vps-住宅"\n      - "admin-cloudflare-vps-住宅"',
             body,
         )
         self.assertIn(
-            f'  - name: 链式节点\n    type: select\n    proxies:\n      - "{chain_name}"',
+            '  - name: "admin-vps-住宅"\n    type: select\n    proxies:\n'
+            f'      - "{direct_name}"',
+            body,
+        )
+        self.assertIn(
+            '  - name: "admin-cloudflare-vps-住宅"\n    type: select\n    proxies:\n'
+            f'      - "{cloudflare_name}"',
+            body,
+        )
+        self.assertIn(
+            '  - name: 🔗链式前置\n    type: select\n    proxies:\n'
+            '      - "bridge-01"\n      - "DIRECT"',
             body,
         )
 
