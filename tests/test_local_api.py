@@ -994,6 +994,8 @@ class LocalAPITest(unittest.TestCase):
         self.assertIn('  - name: "🧠 Claude"', body)
         self.assertIn('  - name: "🇨🇳 中国流量"', body)
         self.assertNotIn('  - name: "🇨🇦 CA"', body)
+        self.assertNotIn('  - name: "🇯🇵 JP"', body)
+        self.assertNotIn('  - name: "🇰🇷 KR"', body)
         rocket_start = body.index('  - name: "🚀 节点选择"')
         rocket_end = body.index("\n  - name:", rocket_start + 1)
         self.assertIn('      - "CA未知·RESI·exit-01"', body[rocket_start:rocket_end])
@@ -1161,7 +1163,7 @@ class LocalAPITest(unittest.TestCase):
         self.assertIn("JP-%E6%97%A5%E6%9C%AC%20%7C%20%E4%BD%8F%E5%AE%85IP%20%7C%20KDDI%20%7C%20203.0.113.30%20%7C%20exit-03", links)
         self.assertNotIn("socks5://", links)
 
-    def test_reality_clash_subscription_separates_direct_and_chained_exits(self):
+    def test_reality_clash_subscription_exposes_direct_and_cloudflare_entries(self):
         self.manager.set_slot_ready("exit-01")
         manifest = Path(self.tempdir.name) / "public-nodes.json"
         manifest.write_text(
