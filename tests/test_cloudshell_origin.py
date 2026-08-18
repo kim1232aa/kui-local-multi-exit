@@ -110,7 +110,7 @@ class CloudShellOriginTest(unittest.TestCase):
 
         self.assertIn('"Front·a.example"', body)
         self.assertIn("JP住宅·SonyNURO·exit-01", body)
-        self.assertIn("JP住宅·SonyNURO·exit-01·保底", body)
+        self.assertNotIn("·保底", body)
         self.assertIn("FR机房·OVH·exit-02", body)
         self.assertIn('  - name: "🚀 节点选择"', body)
         self.assertIn('  - name: "⚡ 自动选择"', body)
@@ -121,7 +121,7 @@ class CloudShellOriginTest(unittest.TestCase):
         self.assertIn("  - MATCH,🌐 其他流量", body)
         for forbidden in ("🇯🇵 JP", "🇰🇷 KR", "🇨🇦 CA", "直连节点", "链式节点", "admin-vps-住宅"):
             self.assertNotIn(forbidden, body)
-        self.assertEqual(body.count("uuid: \"e799e3d5-6f8b-46cd-bb68-6dd38a20f2d0\""), 4)
+        self.assertEqual(body.count("uuid: \"e799e3d5-6f8b-46cd-bb68-6dd38a20f2d0\""), 2)
 
 
 if __name__ == "__main__":
