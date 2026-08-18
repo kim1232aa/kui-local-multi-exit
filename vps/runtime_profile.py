@@ -5,9 +5,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
+from .slot_config import MAX_SLOT_COUNT
+
 
 GIB = 1024**3
-MAX_SLOT_COUNT = 24
 MAX_PROXY_CONNECTIONS = 4096
 _UNLIMITED_CGROUP_LIMIT = 1 << 60
 
@@ -83,7 +84,7 @@ def _auto_profile(memory_bytes: int | None) -> tuple[int, int, int]:
         return 4, 2, 64
     if memory_bytes <= 4 * GIB:
         return 8, 2, 128
-    return 24, 4, 256
+    return MAX_SLOT_COUNT, 4, 256
 
 
 def _parse_override(

@@ -16,9 +16,7 @@ from typing import Any, Mapping, Sequence
 
 from .internal_proxy import load_internal_proxy_credentials
 from .runtime_profile import resolve_runtime_profile
-
-
-MAX_SLOT_COUNT = 24
+from .slot_config import MAX_SLOT_COUNT, slot_number
 
 
 def generate_x25519_keypair(sing_box_bin: str = "sing-box") -> tuple[str, str]:
@@ -63,8 +61,7 @@ def get_public_ip(timeout: int = 3) -> str:
 
 
 def _slot_number(slot_id: str) -> int:
-    match = re.fullmatch(r"exit-(\d+)", slot_id)
-    return int(match.group(1)) if match else MAX_SLOT_COUNT + 1
+    return slot_number(slot_id) or MAX_SLOT_COUNT + 1
 
 
 def _load_identity_payload(path: Path) -> dict[str, dict[str, Any]]:

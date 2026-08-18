@@ -938,6 +938,64 @@ class ExitManagerTest(unittest.TestCase):
         self.assertEqual("ready", self.store.get_slot("exit-01").state)
         self.assertEqual([], handled)
 
+    def test_connectivity_only_slot_skips_residential_lookup_but_requires_target_probe(self):
+        self.store.initialize(slot_count=34)
+        self.manager = ExitManager(
+            self.store,
+            routing=self.routing,
+            listener_factory=FakeListener,
+            workspace=Path(self.tempdir.name),
+            start_workers=False,
+            slot_count=34,
+        )
+        generation = self.store.get_slot("exit-25").generation
+        handled = []
+        self.manager._handle_connection_failure = lambda slot_id, gen, err, endpoint_ip="": handled.append(err)
+
+        class InitializedProcess:
+            def poll(self): return None
+            def terminate(self): pass
+            def wait(self, timeout=None): return 0
+
+        self.manager.node_pool.replace([
+            {"ip": "198.51.100.25", "country": "JP", "ping": 1, "score": 100, "config": ""}
+        ])
+        self.manager.config_dir.mkdir(parents=True, exist_ok=True)
+        self.manager.auth_file.write_text("vpn\nvpn\n", encoding="utf-8")
+        log_path = self.manager.workspace / "exit-25.log"
+
+        def populate_log(*_args, **_kwargs):
+            log_path.write_text("Initialization Sequence Completed", encoding="utf-8")
+            return InitializedProcess()
+
+        self.manager._popen = populate_log
+        self.manager.routing.install = lambda *_args, **_kwargs: None
+        self.manager.routing.is_installed = lambda *_args, **_kwargs: True
+        with patch.object(
+            self.manager, "_default_route", return_value=("172.18.0.1", "eth0")
+        ), patch.object(
+            self.manager, "_openvpn_command", return_value=["openvpn"]
+        ), patch.object(
+            self.manager, "_health_loop", return_value=None
+        ), patch(
+            "vps.exit_manager.detect_egress", return_value="203.0.113.25"
+        ), patch(
+            "vps.exit_manager.check_residential"
+        ) as residential, patch(
+            "vps.exit_manager.probe_targets", return_value={"accepted": True}
+        ) as targets:
+            self.manager._connect_worker("exit-25", generation)
+
+        slot = self.store.get_slot("exit-25")
+        self.assertEqual("ready", slot.state)
+        self.assertEqual([], handled)
+        residential.assert_not_called()
+        targets.assert_called_once()
+        self.assertEqual("skipped", slot.check_result["residential"]["status"])
+        self.assertEqual("connectivity_only", slot.check_result["residential"]["validation_mode"])
+        self.assertEqual("unverified", slot.check_result["residential"]["egress_type"])
+        self.assertEqual("未验证IP", slot.check_result["residential"]["egress_type_label"])
+
     def test_unknown_testisp_fails_even_if_allow_non_residential_enabled(self):
         generation = self.store.get_slot("exit-01").generation
         unknown_result = {

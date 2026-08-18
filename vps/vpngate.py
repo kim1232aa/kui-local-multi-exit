@@ -21,6 +21,7 @@ from typing import Any
 
 
 API_URL = "https://www.vpngate.net/api/iphone/"
+IPPURE_URL = "https://ippure.cc/api/api.php"
 STREAM_URLS = (
     "https://www.google.com/",
     "https://chatgpt.com",
@@ -337,6 +338,53 @@ def detect_egress(interface: str, run: Callable[..., Any] = subprocess.run) -> s
 
 
 
+def check_ippure(ip: str, timeout: int = 10) -> dict[str, Any]:
+    normalized = str(ipaddress.ip_address(ip))
+    request = urllib.request.Request(
+        f"{IPPURE_URL}?ip={urllib.parse.quote(normalized, safe='')}",
+        headers={"User-Agent": "Mozilla/5.0", "Accept": "text/plain"},
+    )
+    try:
+        with direct_url_opener().open(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+    except Exception as error:
+        return {
+            "status": "unknown",
+            "error": str(error)[:500],
+            "is_residential": False,
+            "egress_type": "unknown",
+            "egress_type_label": "未知IP类型",
+            "source": "ippure",
+        }
+
+    text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", raw)
+    fields = {}
+    for label, value in re.findall(r"^\s*(目标 IP|地理位置|自治系统|运营商/归属|网络类型):\s*(.*?)\s*$", text, re.MULTILINE):
+        fields[label] = value.strip()
+    network_type = fields.get("网络类型", "")
+    if "家庭宽带" in network_type or "住宅纯净" in network_type:
+        egress_type, egress_type_label, residential = "residential", "住宅IP", True
+    elif "IDC" in network_type or "机房" in network_type or "数据中心" in network_type:
+        egress_type, egress_type_label, residential = "datacenter", "机房IP", False
+    elif "企业专线" in network_type or "混合网络" in network_type:
+        egress_type, egress_type_label, residential = "enterprise", "企业/混合网络IP", False
+    else:
+        egress_type, egress_type_label, residential = "unknown", "未知IP类型", False
+    return {
+        "status": "checked" if egress_type != "unknown" else "unknown",
+        "raw": text,
+        "ip": fields.get("目标 IP", normalized),
+        "location": fields.get("地理位置", ""),
+        "asn": fields.get("自治系统", ""),
+        "organization": fields.get("运营商/归属", ""),
+        "network_type": network_type,
+        "is_residential": residential,
+        "egress_type": egress_type,
+        "egress_type_label": egress_type_label,
+        "source": "ippure",
+    }
+
+
 def _check_residential_fallback(ip: str, timeout: int = 10):
     """Secondary classifier via ip-api.com when TestISP has no data for the IP."""
     try:
@@ -408,14 +456,21 @@ def check_residential(ip: str, timeout: int = 10) -> tuple[bool, dict[str, Any]]
     except Exception as error:
         fallback = _check_residential_fallback(ip, timeout=timeout)
         if fallback is not None:
-            return fallback
-        return False, {
+            residential, detail = fallback
+            detail["ippure"] = check_ippure(ip, timeout=timeout)
+            return residential, detail
+        detail = {
             "status": "unknown",
             "error": str(error)[:500],
             "is_residential": False,
             "egress_type": "unknown",
             "egress_type_label": "未知IP类型",
         }
+        ippure = check_ippure(ip, timeout=timeout)
+        detail["ippure"] = ippure
+        if ippure.get("egress_type") in {"residential", "datacenter"}:
+            return bool(ippure["is_residential"]), ippure
+        return False, detail
     isp = data.get("isp", {})
     geo = data.get("geo", {})
     if not isinstance(geo, dict):
@@ -467,17 +522,24 @@ def check_residential(ip: str, timeout: int = 10) -> tuple[bool, dict[str, Any]]
         egress_type, egress_type_label = "datacenter", "机房IP"
     else:
         egress_type, egress_type_label = "unknown", "未知IP类型"
-    if egress_type == "unknown":
-        fallback = _check_residential_fallback(ip, timeout=timeout)
-        if fallback is not None:
-            return fallback
-    return residential, {
+    detail = {
         "status": "checked",
         "raw": data,
         "is_residential": residential,
         "egress_type": egress_type,
         "egress_type_label": egress_type_label,
+        "ippure": check_ippure(ip, timeout=timeout),
     }
+    if egress_type == "unknown":
+        fallback = _check_residential_fallback(ip, timeout=timeout)
+        if fallback is not None:
+            fallback_residential, fallback_detail = fallback
+            fallback_detail["ippure"] = detail["ippure"]
+            return fallback_residential, fallback_detail
+        if detail["ippure"].get("egress_type") in {"residential", "datacenter"}:
+            ippure = detail["ippure"]
+            return bool(ippure["is_residential"]), ippure
+    return residential, detail
 
 
 DEFAULT_STREAM_URL = "https://www.gstatic.com/generate_204"

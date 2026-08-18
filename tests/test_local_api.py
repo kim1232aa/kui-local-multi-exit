@@ -1177,6 +1177,81 @@ class LocalAPITest(unittest.TestCase):
         self.assertIn("JP-%E6%97%A5%E6%9C%AC%20%7C%20%E4%BD%8F%E5%AE%85IP%20%7C%20KDDI%20%7C%20203.0.113.30%20%7C%20exit-03", links)
         self.assertNotIn("socks5://", links)
 
+    def test_connectivity_only_exit_34_is_publishable_but_not_residential(self):
+        self.store.initialize(slot_count=34)
+        self.manager.set_slot_ready("exit-34")
+        self.store.set_runtime(
+            "exit-34",
+            state="ready",
+            entry_ip="198.51.100.34",
+            egress_ip="203.0.113.34",
+            current_node={"ip": "198.51.100.34", "country": "US", "source": "vpngate"},
+            check_result={
+                "residential": {
+                    "status": "skipped",
+                    "validation_mode": "connectivity_only",
+                    "egress_type": "unverified",
+                    "egress_type_label": "未验证IP",
+                    "is_residential": False,
+                },
+                "targets": {"accepted": True},
+            },
+        )
+        manifest = Path(self.tempdir.name) / "public-nodes.json"
+        manifest.write_text(
+            json.dumps({
+                "version": 1,
+                "nodes": [{
+                    "slot_id": "exit-34",
+                    "address": "153.121.38.245",
+                    "port": 8477,
+                    "uuid": "44444444-4444-4444-4444-444444444444",
+                    "sni": "addons.mozilla.org",
+                    "public_key": "abcdefghijklmnopqrstuvwxyzABCDEFGH1234567_",
+                    "short_id": "aabbccddeeff0011",
+                }],
+            }),
+            encoding="utf-8",
+        )
+        self.server.reality_nodes_file = manifest
+        status, data = self.request("/api/data")
+        token = data["mySubToken"]
+
+        status, body = self.request(
+            f"/api/sub?user={data['mySubUser']}&token={token}&format=clash",
+            expect_json=False,
+        )
+
+        self.assertEqual(200, status)
+        node_name = "US未验证·RESI·exit-34"
+        self.assertIn(f'name: "{node_name}"', body)
+        residential_start = body.index('  - name: "🏠 住宅自动"')
+        residential_block = body[residential_start:body.index("\n  - name:", residential_start + 1)]
+        self.assertNotIn(node_name, residential_block)
+        self.assertNotIn(f'{node_name}·链式', body)
+
+        manifest.write_text(
+            json.dumps({
+                "version": 1,
+                "nodes": [{
+                    "slot_id": "exit-35",
+                    "address": "153.121.38.245",
+                    "port": 8478,
+                    "uuid": "55555555-5555-5555-5555-555555555555",
+                    "sni": "addons.mozilla.org",
+                    "public_key": "abcdefghijklmnopqrstuvwxyzABCDEFGH1234567_",
+                    "short_id": "aabbccddeeff0011",
+                }],
+            }),
+            encoding="utf-8",
+        )
+        status, body = self.request(
+            f"/api/sub?user={data['mySubUser']}&token={token}&format=clash",
+            expect_json=False,
+        )
+        self.assertEqual(200, status)
+        self.assertNotIn("exit-35", body)
+
     def test_reality_clash_subscription_exposes_direct_and_cloudflare_entries(self):
         self.manager.set_slot_ready("exit-01")
         manifest = Path(self.tempdir.name) / "public-nodes.json"

@@ -10,6 +10,13 @@ from pathlib import Path
 from typing import Any
 
 from .models import ExitSlotSnapshot
+from .slot_config import (
+    BASE_PROXY_PORT,
+    BASE_ROUTE_TABLE,
+    LEGACY_SLOT_COUNT,
+    MAX_PROXY_PORT,
+    MAX_SLOT_COUNT,
+)
 
 
 DEFAULT_COUNTRIES = (
@@ -20,6 +27,7 @@ DEFAULT_COUNTRIES = (
     "FR", "FR", "RU", "RU",
     "VN", "VN", "TH", "TH",
 )
+SLOT_COUNTRIES = DEFAULT_COUNTRIES + ("ANY",) * (MAX_SLOT_COUNT - LEGACY_SLOT_COUNT)
 LEGACY_ANY_COUNTRIES = ("ANY",) * 20 + ("VN", "VN", "TH", "TH")
 VALID_STATES = {"idle", "starting", "connecting", "ready", "degraded", "failed", "disabled"}
 
@@ -46,9 +54,9 @@ class LocalStore:
         try:
             slot_count = int(slot_count)
         except (TypeError, ValueError) as error:
-            raise ValueError(f"slot_count must be between 1 and {len(DEFAULT_COUNTRIES)}") from error
-        if not 1 <= slot_count <= len(DEFAULT_COUNTRIES):
-            raise ValueError(f"slot_count must be between 1 and {len(DEFAULT_COUNTRIES)}")
+            raise ValueError(f"slot_count must be between 1 and {MAX_SLOT_COUNT}") from error
+        if not 1 <= slot_count <= MAX_SLOT_COUNT:
+            raise ValueError(f"slot_count must be between 1 and {MAX_SLOT_COUNT}")
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         with self._lock, self._connect() as db:
@@ -249,23 +257,25 @@ class LocalStore:
                     if name not in existing:
                         db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
             now = int(time.time())
-            for index, country in enumerate(DEFAULT_COUNTRIES[:slot_count]):
+            for index, country in enumerate(SLOT_COUNTRIES[:slot_count]):
                 db.execute(
                     """
                     INSERT OR IGNORE INTO exit_slots
                     (id, country, enabled, proxy_port, tunnel_name, route_table, mark, updated_at)
                     VALUES (?, ?, 1, ?, ?, ?, ?, ?)
                     """,
-                    (f"exit-{index + 1:02d}", country, 7920 + index, f"tun{index}", 200 + index, 200 + index, now),
+                    (f"exit-{index + 1:02d}", country, BASE_PROXY_PORT + index, f"tun{index}", BASE_ROUTE_TABLE + index, BASE_ROUTE_TABLE + index, now),
                 )
 
             # Migrate only the exact legacy deployment pattern. Custom country
             # assignments must never be overwritten during startup.
             country_rows = db.execute("SELECT id, country FROM exit_slots ORDER BY id").fetchall()
             if (
-                len(country_rows) == len(DEFAULT_COUNTRIES)
-                and tuple(row["id"] for row in country_rows) == tuple(f"exit-{index:02d}" for index in range(1, 25))
-                and tuple(row["country"] for row in country_rows) == LEGACY_ANY_COUNTRIES
+                len(country_rows) >= LEGACY_SLOT_COUNT
+                and tuple(row["id"] for row in country_rows[:LEGACY_SLOT_COUNT])
+                == tuple(f"exit-{index:02d}" for index in range(1, LEGACY_SLOT_COUNT + 1))
+                and tuple(row["country"] for row in country_rows[:LEGACY_SLOT_COUNT]) == LEGACY_ANY_COUNTRIES
+                and all(row["country"] == "ANY" for row in country_rows[LEGACY_SLOT_COUNT:])
             ):
                 for index, country in enumerate(DEFAULT_COUNTRIES, start=1):
                     db.execute(
@@ -328,8 +338,8 @@ class LocalStore:
         next_port = current.proxy_port if proxy_port is None else int(proxy_port)
         if not re.fullmatch(r"[A-Z]{2}|ANY", next_country):
             raise ValueError("country must be a two-letter code or ANY")
-        if not 7920 <= next_port <= 7943:
-            raise ValueError("proxy port must be between 7920 through 7943")
+        if not BASE_PROXY_PORT <= next_port <= MAX_PROXY_PORT:
+            raise ValueError(f"proxy port must be between {BASE_PROXY_PORT} through {MAX_PROXY_PORT}")
         with self._lock, self._connect() as db:
             row = db.execute(
                 "SELECT id FROM exit_slots WHERE proxy_port = ? AND id <> ?",

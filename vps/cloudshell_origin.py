@@ -5,7 +5,7 @@ Runs inside Docker only. It joins the existing kui-local-multi-exit compose
 network and exposes:
 
   * VLESS+WS ``/vless``      -> VPS direct egress
-  * VLESS+WS ``/res-01..24`` -> kui per-slot residential SOCKS exits
+  * VLESS+WS ``/res-01..34`` -> kui per-slot SOCKS exits
   * HTTP  ``/<secret>``      -> dynamic Clash YAML in the legacy CloudShell format
 
 Secrets (tunnel credentials, uuid, subscription path, front-node fragment)
@@ -29,6 +29,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+try:
+    from .slot_config import BASE_PROXY_PORT, MAX_SLOT_COUNT
+except ImportError:  # standalone CloudShell-origin image
+    from slot_config import BASE_PROXY_PORT, MAX_SLOT_COUNT
+
 SECRETS_DIR = Path(os.environ.get("KUI_CLOUDSHELL_SECRETS", "/run/secrets"))
 DATA_DIR = Path(os.environ.get("KUI_CLOUDSHELL_DATA", "/kui-data"))
 RUNTIME_DIR = Path(os.environ.get("KUI_CLOUDSHELL_RUNTIME", "/run/origin"))
@@ -37,7 +42,7 @@ KUI_SOCKS_HOST = os.environ.get("KUI_CLOUDSHELL_SOCKS_HOST", "kui-local-multi-ex
 BASE_PORT = 38080
 SUB_PORT = 38081
 FIRST_RES_PORT = 38090
-FIRST_SOCKS_PORT = 7920
+FIRST_SOCKS_PORT = BASE_PROXY_PORT
 CACHE_TTL = 20
 
 ISP_SHORT = {
@@ -113,10 +118,10 @@ def res_domains() -> list[tuple[str, str]]:
 
 def slot_count(environ: dict[str, str] | None = None) -> int:
     env = os.environ if environ is None else environ
-    raw = str(env.get("KUI_SLOT_COUNT") or "24").strip().lower()
+    raw = str(env.get("KUI_SLOT_COUNT") or str(MAX_SLOT_COUNT)).strip().lower()
     if raw == "auto" or not raw.isdigit():
-        return 24
-    return max(1, min(24, int(raw)))
+        return MAX_SLOT_COUNT
+    return max(1, min(MAX_SLOT_COUNT, int(raw)))
 
 
 def write_runtime_configs(slot_count_value: int, inputs: dict[str, Any]) -> None:
@@ -228,6 +233,10 @@ def _slot_kind(slot: dict[str, Any]) -> tuple[str, bool]:
         return "住宅", True
     if egress_type == "datacenter":
         return "机房", False
+    if egress_type == "enterprise":
+        return "企业", False
+    if egress_type == "unverified":
+        return "未验证", False
     return "未知", False
 
 

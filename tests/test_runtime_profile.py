@@ -56,7 +56,7 @@ class RuntimeProfileTest(unittest.TestCase):
             (int(2.5 * GIB), (4, 2, 64)),
             (int(2.5 * GIB) + 1, (8, 2, 128)),
             (4 * GIB, (8, 2, 128)),
-            (4 * GIB + 1, (24, 4, 256)),
+            (4 * GIB + 1, (34, 4, 256)),
         ):
             with self.subTest(memory_bytes=memory_bytes):
                 (self.cgroup_root / "memory.max").write_text(str(memory_bytes), encoding="utf-8")
@@ -102,6 +102,23 @@ class RuntimeProfileTest(unittest.TestCase):
         )
 
         self.assertEqual(2, profile.slot_count)
+
+    def test_explicit_34_slot_override_is_supported(self):
+        profile = resolve_runtime_profile(
+            cgroup_root=self.cgroup_root,
+            meminfo_path=self.meminfo_path,
+            environ={"KUI_SLOT_COUNT": "34"},
+        )
+
+        self.assertEqual(34, profile.slot_count)
+
+    def test_35_slot_override_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "KUI_SLOT_COUNT"):
+            resolve_runtime_profile(
+                cgroup_root=self.cgroup_root,
+                meminfo_path=self.meminfo_path,
+                environ={"KUI_SLOT_COUNT": "35"},
+            )
 
     def test_invalid_overrides_are_rejected(self):
         cases = (

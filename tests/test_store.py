@@ -17,7 +17,7 @@ class LocalStoreTest(unittest.TestCase):
     def tearDown(self):
         self.tempdir.cleanup()
 
-    def test_initializes_twelve_editable_exit_slots(self):
+    def test_initializes_24_editable_exit_slots_by_default(self):
         slots = self.store.list_slots()
 
         self.assertEqual(24, len(slots))
@@ -25,6 +25,14 @@ class LocalStoreTest(unittest.TestCase):
         self.assertEqual(list(range(7920, 7944)), [slot.proxy_port for slot in slots])
         self.assertEqual([f"tun{i}" for i in range(24)], [slot.tunnel_name for slot in slots])
         self.assertEqual(list(range(200, 224)), [slot.route_table for slot in slots])
+
+    def test_initializes_34_slots_when_explicitly_requested(self):
+        expanded = LocalStore(Path(self.tempdir.name) / "full.db")
+        expanded.initialize(slot_count=34)
+        slots = expanded.list_slots()
+        self.assertEqual(34, len(slots))
+        self.assertEqual(["ANY"] * 10, [slot.country for slot in slots[24:]])
+        self.assertEqual(7953, slots[-1].proxy_port)
 
     def test_initialize_migrates_only_exact_legacy_any_country_pattern(self):
         for slot, country in zip(self.store.list_slots(), LEGACY_ANY_COUNTRIES):
@@ -60,11 +68,26 @@ class LocalStoreTest(unittest.TestCase):
         limited.initialize(slot_count=2)
         self.assertEqual([f"exit-{index:02d}" for index in range(1, 5)], [slot.id for slot in limited.list_slots()])
 
+    def test_initialize_expands_existing_24_slots_without_reassigning_them(self):
+        expanded_path = Path(self.tempdir.name) / "expanded.db"
+        expanded = LocalStore(expanded_path)
+        expanded.initialize(slot_count=24)
+        expanded.update_slot("exit-01", country="CA", enabled=False)
+
+        expanded.initialize(slot_count=34)
+
+        slots = expanded.list_slots()
+        self.assertEqual(34, len(slots))
+        self.assertEqual("CA", slots[0].country)
+        self.assertFalse(slots[0].enabled)
+        self.assertEqual(["ANY"] * 10, [slot.country for slot in slots[24:]])
+        self.assertEqual(7953, slots[-1].proxy_port)
+
     def test_initialize_rejects_invalid_slot_count(self):
         with self.assertRaisesRegex(ValueError, "slot_count"):
             self.store.initialize(slot_count=0)
         with self.assertRaisesRegex(ValueError, "slot_count"):
-            self.store.initialize(slot_count=25)
+            self.store.initialize(slot_count=35)
 
     def test_updates_one_slot_without_changing_other_slots(self):
         before = self.store.get_slot("exit-02")
@@ -82,7 +105,7 @@ class LocalStoreTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already used"):
             self.store.update_slot("exit-01", proxy_port=7921)
 
-        with self.assertRaisesRegex(ValueError, "7920 through 7943"):
+        with self.assertRaisesRegex(ValueError, "7920 through 7953"):
             self.store.update_slot("exit-01", proxy_port=9001)
 
     def test_three_consecutive_failures_auto_disable_only_that_slot(self):
@@ -128,7 +151,7 @@ class LocalStoreTest(unittest.TestCase):
         self.assertEqual("connected", events[0]["kind"])
 
     def test_validate_slot_update_checks_port_before_runtime_actions(self):
-        with self.assertRaisesRegex(ValueError, "7920 through 7943"):
+        with self.assertRaisesRegex(ValueError, "7920 through 7953"):
             self.store.validate_slot_update("exit-01", country=None, proxy_port=9001, enabled=None)
 
     def test_stale_generation_cannot_write_runtime(self):

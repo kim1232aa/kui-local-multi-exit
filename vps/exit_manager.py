@@ -16,6 +16,7 @@ from .models import ExitSlotSnapshot
 from .openvpn_sources import fetch_all_openvpn_nodes
 from .proxy_server import ProxyListener
 from .routing import RouteManager
+from .slot_config import is_connectivity_only_slot
 from .store import LocalStore
 from .vpngate import STREAM_URLS, NodePool, check_residential, detect_egress, probe_204, probe_targets
 
@@ -759,31 +760,40 @@ class ExitManager:
                     return
                 if not egress_ip:
                     raise RuntimeError("real egress IP unavailable")
-                residential, residential_result = check_residential(egress_ip)
-                if self._worker_is_stale(slot_id, generation, stop_event):
-                    return
-                status = str(residential_result.get("status", "")).lower()
-                egress_type = str(residential_result.get("egress_type", "unknown")).lower()
-                raw = residential_result.get("raw") if isinstance(residential_result.get("raw"), dict) else {}
-                geo = raw.get("geo") if isinstance(raw.get("geo"), dict) else {}
-                actual_country = str(geo.get("country_code") or "").upper()
-                if (
-                    slot.country != "ANY"
-                    and not node.get("country_fallback")
-                    and re.fullmatch(r"[A-Z]{2}", actual_country)
-                    and actual_country != slot.country
-                ):
-                    self.node_pool.penalize(endpoint_ip, 20000)
-                    raise RuntimeError(
-                        f"egress country mismatch: target={slot.country}, actual={actual_country}"
-                    )
-                allow_non_residential = os.environ.get("KUI_ALLOW_NON_RESIDENTIAL", "1").strip().lower() in {"1", "true", "yes", "on"}
-                if status != "checked" or egress_type == "unknown":
-                    self.node_pool.penalize(endpoint_ip, 5000)
-                    raise RuntimeError("TestISP check failed or unknown IP type")
-                if egress_type == "datacenter" and not allow_non_residential:
-                    self.node_pool.penalize(endpoint_ip, 50000)
-                    raise RuntimeError("exit classified as datacenter")
+                if is_connectivity_only_slot(slot_id):
+                    residential_result = {
+                        "status": "skipped",
+                        "validation_mode": "connectivity_only",
+                        "is_residential": False,
+                        "egress_type": "unverified",
+                        "egress_type_label": "未验证IP",
+                    }
+                else:
+                    _residential, residential_result = check_residential(egress_ip)
+                    if self._worker_is_stale(slot_id, generation, stop_event):
+                        return
+                    status = str(residential_result.get("status", "")).lower()
+                    egress_type = str(residential_result.get("egress_type", "unknown")).lower()
+                    raw = residential_result.get("raw") if isinstance(residential_result.get("raw"), dict) else {}
+                    geo = raw.get("geo") if isinstance(raw.get("geo"), dict) else {}
+                    actual_country = str(geo.get("country_code") or "").upper()
+                    if (
+                        slot.country != "ANY"
+                        and not node.get("country_fallback")
+                        and re.fullmatch(r"[A-Z]{2}", actual_country)
+                        and actual_country != slot.country
+                    ):
+                        self.node_pool.penalize(endpoint_ip, 20000)
+                        raise RuntimeError(
+                            f"egress country mismatch: target={slot.country}, actual={actual_country}"
+                        )
+                    allow_non_residential = os.environ.get("KUI_ALLOW_NON_RESIDENTIAL", "1").strip().lower() in {"1", "true", "yes", "on"}
+                    if status != "checked" or egress_type == "unknown":
+                        self.node_pool.penalize(endpoint_ip, 5000)
+                        raise RuntimeError("TestISP check failed or unknown IP type")
+                    if egress_type == "datacenter" and not allow_non_residential:
+                        self.node_pool.penalize(endpoint_ip, 50000)
+                        raise RuntimeError("exit classified as datacenter")
                 probe_result = probe_targets(slot.tunnel_name, STREAM_URLS, self._run)
                 if self._worker_is_stale(slot_id, generation, stop_event):
                     return

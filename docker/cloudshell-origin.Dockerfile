@@ -3,6 +3,7 @@ FROM ghcr.io/xtls/xray-core:latest AS xray
 FROM python:3.12-slim-bookworm
 COPY --from=xray /usr/local/bin/xray /usr/local/bin/xray
 COPY vps/cloudshell_origin.py /app/cloudshell_origin.py
+COPY vps/slot_config.py /app/slot_config.py
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

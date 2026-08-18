@@ -209,6 +209,99 @@ class VPNGateFetchTest(unittest.TestCase):
 
         self.assertEqual(["JP", "US"], countries)
 
+    def test_ippure_classifies_home_broadband_as_residential(self):
+        body = """
+\x1b[1m===============================================\x1b[0m
+  目标 IP:     73.162.111.22
+  地理位置:    美国 加州 聖荷西
+  自治系统:    AS7922 Comcast Cable Communications, LLC
+  运营商/归属: Comcast Cable Communications
+  网络类型:    家庭宽带 (住宅纯净 IP)
+"""
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return body.encode()
+
+        class Opener:
+            def open(self, *_args, **_kwargs):
+                return Response()
+
+        checker = getattr(vpngate, "check_ippure", None)
+        self.assertTrue(callable(checker), "check_ippure is missing")
+        with patch.object(vpngate, "direct_url_opener", return_value=Opener()):
+            detail = checker("73.162.111.22")
+
+        self.assertEqual("checked", detail["status"])
+        self.assertEqual("residential", detail["egress_type"])
+        self.assertEqual("住宅IP", detail["egress_type_label"])
+        self.assertTrue(detail["is_residential"])
+        self.assertEqual("AS7922 Comcast Cable Communications, LLC", detail["asn"])
+        self.assertEqual("Comcast Cable Communications", detail["organization"])
+
+    def test_ippure_classifies_datacenter_and_enterprise_labels(self):
+        reports = (
+            ("IDC 机房 (数据中心/云服务器/代理)", "datacenter", "机房IP", False),
+            ("企业专线 / 混合网络", "enterprise", "企业/混合网络IP", False),
+        )
+        for network_type, expected_type, expected_label, expected_residential in reports:
+            with self.subTest(network_type=network_type):
+                body = (
+                    "目标 IP:     203.0.113.9\n"
+                    "自治系统:    AS999 Example Networks\n"
+                    "运营商/归属: Example Networks\n"
+                    f"网络类型:    {network_type}\n"
+                )
+
+                class Response:
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *_args):
+                        return False
+
+                    def read(self):
+                        return body.encode()
+
+                class Opener:
+                    def open(self, *_args, **_kwargs):
+                        return Response()
+
+                with patch.object(vpngate, "direct_url_opener", return_value=Opener()):
+                    detail = vpngate.check_ippure("203.0.113.9")
+
+                self.assertEqual(expected_type, detail["egress_type"])
+                self.assertEqual(expected_label, detail["egress_type_label"])
+                self.assertEqual(expected_residential, detail["is_residential"])
+
+    def test_ippure_malformed_response_is_unknown(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b"not an ippure report"
+
+        class Opener:
+            def open(self, *_args, **_kwargs):
+                return Response()
+
+        with patch.object(vpngate, "direct_url_opener", return_value=Opener()):
+            detail = vpngate.check_ippure("203.0.113.9")
+
+        self.assertEqual("unknown", detail["status"])
+        self.assertEqual("unknown", detail["egress_type"])
+        self.assertFalse(detail["is_residential"])
+
     def test_residential_lookup_failure_is_not_classified_as_residential(self):
         class BrokenOpener:
             def open(self, *_args, **_kwargs):
@@ -279,6 +372,42 @@ class VPNGateFetchTest(unittest.TestCase):
         self.assertFalse(residential)
         self.assertEqual("datacenter", detail["egress_type"])
         self.assertEqual("机房IP", detail["egress_type_label"])
+
+    def test_residential_testisp_result_is_not_overturned_by_ippure(self):
+        report = {
+            "geo": {"is_native": True, "country_code": "JP"},
+            "isp": {"flag": "residential", "type": "broadband", "warning": ""},
+        }
+        ippure = {
+            "status": "checked",
+            "is_residential": False,
+            "egress_type": "datacenter",
+            "egress_type_label": "机房IP",
+            "source": "ippure",
+        }
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return __import__("json").dumps(report).encode()
+
+        class Opener:
+            def open(self, *_args, **_kwargs):
+                return Response()
+
+        with patch.object(vpngate, "direct_url_opener", return_value=Opener()), patch.object(
+            vpngate, "check_ippure", return_value=ippure
+        ):
+            residential, detail = vpngate.check_residential("203.0.113.9")
+
+        self.assertTrue(residential)
+        self.assertEqual("residential", detail["egress_type"])
+        self.assertEqual(ippure, detail["ippure"])
 
         class Result:
             returncode = 0

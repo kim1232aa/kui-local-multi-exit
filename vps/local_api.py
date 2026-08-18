@@ -977,7 +977,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 continue
             if not (
-                re.fullmatch(r"exit-(?:0[1-9]|1[0-9]|2[0-4])", slot_id)
+                re.fullmatch(r"exit-(?:0[1-9]|1[0-9]|2[0-9]|3[0-4])", slot_id)
                 or re.fullmatch(r"tr-\d+", slot_id)
             ):
                 continue
@@ -1092,6 +1092,10 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             return "residential", "住宅IP"
         if explicitly_non_residential:
             return "datacenter", "机房IP"
+        if str(residential.get("validation_mode", "")).lower() == "connectivity_only":
+            return "unverified", "未验证IP"
+        if str(residential.get("egress_type", "")).lower() == "enterprise":
+            return "enterprise", "企业/混合网络IP"
         return "unknown", "未知IP类型"
 
     @classmethod
@@ -1169,7 +1173,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         nodes = []
         for slot_id, node in reality_nodes.items():
             if slot_id in publishable:
-                # The 24 OpenVPN slots are direct exits and never use a
+                # Local OpenVPN slots are direct exits and never use a
                 # client-side dialer proxy.
                 nodes.append({
                     **node,
@@ -1313,7 +1317,12 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         """cs-pa style node name: JP住宅·SonyNURO·exit-03 (country + type + ISP + slot)."""
         country = self._slot_country_code(slot)
         egress_type, _ = self._slot_egress_type_info(slot)
-        kind = {"residential": "住宅", "datacenter": "机房"}.get(egress_type, "未知")
+        kind = {
+            "residential": "住宅",
+            "datacenter": "机房",
+            "enterprise": "企业",
+            "unverified": "未验证",
+        }.get(egress_type, "未知")
         isp = self._cs_isp_short(self._slot_isp(slot).get("org"))
         return f"{country}{kind}·{isp}·{slot['id']}"
 

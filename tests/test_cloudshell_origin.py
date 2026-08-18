@@ -58,18 +58,18 @@ class CloudShellOriginTest(unittest.TestCase):
 
     def test_write_runtime_configs_maps_slots_to_xray_and_cloudflared_paths(self):
         inputs = cloudshell_origin.load_runtime_inputs()
-        cloudshell_origin.write_runtime_configs(24, inputs)
+        cloudshell_origin.write_runtime_configs(34, inputs)
 
         xray = json.loads((self.runtime / "xray.json").read_text(encoding="utf-8"))
-        self.assertEqual(25, len(xray["inbounds"]))
+        self.assertEqual(35, len(xray["inbounds"]))
         by_tag = {inbound["tag"]: inbound for inbound in xray["inbounds"]}
         self.assertEqual("/vless", by_tag["vless-base"]["streamSettings"]["wsSettings"]["path"])
         self.assertEqual(38090, by_tag["res-01"]["port"])
-        self.assertEqual("/res-24", by_tag["res-24"]["streamSettings"]["wsSettings"]["path"])
+        self.assertEqual("/res-34", by_tag["res-34"]["streamSettings"]["wsSettings"]["path"])
         socks = {outbound["tag"]: outbound for outbound in xray["outbounds"] if outbound["tag"].startswith("socks-")}
-        self.assertEqual(24, len(socks))
+        self.assertEqual(34, len(socks))
         self.assertEqual(7920, socks["socks-res-01"]["settings"]["servers"][0]["port"])
-        self.assertEqual(7943, socks["socks-res-24"]["settings"]["servers"][0]["port"])
+        self.assertEqual(7953, socks["socks-res-34"]["settings"]["servers"][0]["port"])
         self.assertEqual("internal-pass", socks["socks-res-01"]["settings"]["servers"][0]["users"][0]["pass"])
         routing = {rule["inboundTag"][0]: rule["outboundTag"] for rule in xray["routing"]["rules"]}
         self.assertEqual("direct", routing["vless-base"])
@@ -84,7 +84,7 @@ class CloudShellOriginTest(unittest.TestCase):
         self.assertEqual("^/sub-secret$", routes[-2]["path"])
         self.assertEqual("http_status:404", routes[-1]["service"])
         self.assertEqual("http://kui-cloudshell-origin:38080", routes[0]["service"])
-        self.assertEqual("http://kui-cloudshell-origin:38113", routes[-3]["service"])
+        self.assertEqual("http://kui-cloudshell-origin:38123", routes[-3]["service"])
 
     def test_subscription_keeps_legacy_groups_without_country_split(self):
         inputs = cloudshell_origin.load_runtime_inputs()

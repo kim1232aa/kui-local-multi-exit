@@ -80,6 +80,19 @@ class TestRealityGateway(unittest.TestCase):
             stored = json.loads(identities_file.read_text(encoding="utf-8"))["nodes"]
             self.assertEqual({"exit-01", "exit-02", "exit-03", "exit-04"}, set(stored))
 
+    @patch("vps.reality_gateway.generate_x25519_keypair", return_value=("A" * 43, "B" * 43))
+    def test_load_or_create_identities_supports_34_slots(self, _mock_generate):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            identities = load_or_create_identities(Path(tmpdir) / "identities.json", count=34)
+
+        self.assertEqual("exit-34", list(identities)[-1])
+        self.assertEqual(34, len(identities))
+
+    def test_load_or_create_identities_rejects_35_slots(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaisesRegex(ValueError, "count"):
+                load_or_create_identities(Path(tmpdir) / "identities.json", count=35)
+
     def test_build_sing_box_config_uses_one_shared_reality_inbound(self):
         identities = {
             f"exit-{i:02d}": {

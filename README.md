@@ -19,16 +19,16 @@
 | `<= 1.5 GiB` | 2 | 1 | 32 |
 | `<= 2.5 GiB` | 4 | 2 | 64 |
 | `<= 4 GiB` | 8 | 2 | 128 |
-| `> 4 GiB` | 24 | 4 | 256 |
+| `> 4 GiB` | 34 | 4 | 256 |
 | 无法检测 | 4 | 2 | 64 |
 
-因此 1–2 GiB VPS 默认只启动 2–4 个出口，而不是尝试同时运行 24 条 OpenVPN。需要满配时可显式设置 `KUI_SLOT_COUNT=24`。
+因此 1–2 GiB VPS 默认只启动 2–4 个出口，而不是尝试同时运行几十条 OpenVPN。需要更多出口时显式设置 `KUI_SLOT_COUNT=24`（全部住宅校验）或 `KUI_SLOT_COUNT=34`（24 个校验槽 + 10 个宽松槽）。
 
 三个覆盖项均在启动时校验：
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `KUI_SLOT_COUNT` | `auto` | `1`–`24` 或 `auto`。受管槽位数。 |
+| `KUI_SLOT_COUNT` | `auto` | `1`–`34` 或 `auto`。受管槽位数。 |
 | `KUI_DIAL_WORKERS` | 档位默认值 | 同时拨号数，也限制桥接订阅的测速并发；范围为 `1` 到当前槽位数。 |
 | `PROXY_MAX_CONNECTIONS` | 档位默认值 | 所有槽位共享的 SOCKS 连接总数，不是每个槽位各自的上限。 |
 
@@ -95,7 +95,7 @@ TCP 8080（或 KUI_MANAGEMENT_PORT）  管理面板/API
 TCP 8443（或 KUI_REALITY_PORT）     唯一 XTLS-Reality 入口
 ```
 
-内部 SOCKS5 `7920+` 仅在 `kui-local-multi-exit` 容器和 Compose 网络可达。不能把 `socks5://...@VPS_IP:7920` 当成公网地址。
+内部 SOCKS5 `7920`–`7953` 仅在 `kui-local-multi-exit` 容器和 Compose 网络可达。不能把 `socks5://...@VPS_IP:7920` 当成公网地址。
 
 ## 纯 SOCKS5 订阅（可选）
 
@@ -159,7 +159,7 @@ docker compose exec -T kui-local-multi-exit sh -lc \
   'curl --fail --silent --show-error --socks5-hostname "$KUI_MANAGEMENT_USER:$KUI_MANAGEMENT_PASSWORD@127.0.0.1:7920" https://api.ipify.org'
 ```
 
-`/api/local/status` 的 `total` 是当前受管槽位数量，`ready` 是可发布数量。24 槽默认目标为 `JP×4、KR×4、US×2、CA×2、GB×2、DE×2、FR×2、RU×2、VN×2、TH×2`。每个槽位先尝试目标国家；目标国家无可用候选，或连续两次目标连接失败后，才临时回退到其他可用国家，并最多进行三次回退连接。回退不会改写槽位目标，节点会标记 `country_fallback`/`target_country`；健康回退不会被节点池刷新强制中断，下一次实际重拨或服务重启时仍会先尝试目标国家。`/api/proxy/proxies` 仍描述内部 SOCKS5 槽位，不能作为公网订阅。
+`/api/local/status` 的 `total` 是当前受管槽位数量，`ready` 是可发布数量。前 24 槽默认目标为 `JP×4、KR×4、US×2、CA×2、GB×2、DE×2、FR×2、RU×2、VN×2、TH×2`，走完整住宅/机房校验；`exit-25`–`exit-34`（仅 `KUI_SLOT_COUNT=34` 时存在）是 `ANY` 宽松槽，跳过住宅校验、只要求真实出口 IP 与目标连通，节点标注 `未验证IP`，不进入住宅自动组和住宅链式。每个槽位先尝试目标国家；目标国家无可用候选，或连续两次目标连接失败后，才临时回退到其他可用国家，并最多进行三次回退连接。回退不会改写槽位目标，节点会标记 `country_fallback`/`target_country`；健康回退不会被节点池刷新强制中断，下一次实际重拨或服务重启时仍会先尝试目标国家。`/api/proxy/proxies` 仍描述内部 SOCKS5 槽位，不能作为公网订阅。
 
 Reality 的 Clash/Mihomo 订阅为每个 ready 槽位生成两份客户端入口：一份是 VPS 直连，一份名称带 `Cloudflare优选` 并设置 `dialer-proxy: 🔗链式前置`。订阅用户可在 `PROXY` 组中选择 `<用户>-vps-住宅` 或 `<用户>-cloudflare-vps-住宅`；在 `🔗链式前置` 组中选择具体 Cloudflare/桥接前置或 `DIRECT`。只有 `format=clash`/`format=clash-meta` 能表达这个前置关系，默认 VLESS Base64 格式只包含直连链接。
 
