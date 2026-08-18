@@ -1015,6 +1015,28 @@ class LocalAPITest(unittest.TestCase):
             references = [yaml_name(item) for item in re.findall(r"^      - (.+)$", group_block, re.MULTILINE)]
             self.assertTrue(set(references) <= proxy_names | group_names | {"DIRECT"})
 
+    def test_subscription_accepts_token_only_for_default_user(self):
+        content = "vless://11111111-1111-1111-1111-111111111111@vpn.example.com:443#Tokyo"
+        with patch("vps.local_api.fetch_subscription_text", return_value=content):
+            status, _ = self.request(
+                "/api/thirdparty",
+                method="POST",
+                body={"name": "sub1", "url": "https://subscription.example.com/profile"},
+            )
+        self.assertEqual(200, status)
+
+        status, data = self.request("/api/data")
+        self.assertEqual(200, status)
+        token = data["mySubToken"]
+
+        status, encoded = self.request(f"/api/sub?token={token}", expect_json=False)
+        self.assertEqual(200, status)
+        links = base64.b64decode(encoded).decode()
+        self.assertIn("vless://11111111-1111-1111-1111-111111111111@vpn.example.com:443", links)
+
+        status, body = self.request(f"/api/sub?token=bad-token", expect_json=True)
+        self.assertEqual(404, status)
+
     def test_subscription_user_parameter_is_not_hardcoded(self):
         self.server.username = "panel-user"
         status, data = self.request("/api/data")

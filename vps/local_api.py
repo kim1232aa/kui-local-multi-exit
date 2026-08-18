@@ -1210,6 +1210,9 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         username = self._query_param("user") or ""
         token = self._query_param("token") or ""
         user = self.server.store.get_user(username)
+        # Allow token-only access for the default admin account.
+        if not user and not username and token:
+            user = self.server.store.get_user(self.server.username)
         if not user or not user.get("enable") or not token or not hmac.compare_digest(token, str(user.get("sub_token", ""))):
             return None
         return user
