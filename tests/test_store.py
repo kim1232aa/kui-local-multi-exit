@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from vps.store import LocalStore
+from vps.store import DEFAULT_COUNTRIES, LEGACY_ANY_COUNTRIES, LocalStore
 
 
 class LocalStoreTest(unittest.TestCase):
@@ -21,9 +21,31 @@ class LocalStoreTest(unittest.TestCase):
         slots = self.store.list_slots()
 
         self.assertEqual(24, len(slots))
+        self.assertEqual(list(DEFAULT_COUNTRIES), [slot.country for slot in slots])
         self.assertEqual(list(range(7920, 7944)), [slot.proxy_port for slot in slots])
         self.assertEqual([f"tun{i}" for i in range(24)], [slot.tunnel_name for slot in slots])
         self.assertEqual(list(range(200, 224)), [slot.route_table for slot in slots])
+
+    def test_initialize_migrates_only_exact_legacy_any_country_pattern(self):
+        for slot, country in zip(self.store.list_slots(), LEGACY_ANY_COUNTRIES):
+            self.store.update_slot(slot.id, country=country)
+
+        self.store.initialize()
+
+        self.assertEqual(list(DEFAULT_COUNTRIES), [slot.country for slot in self.store.list_slots()])
+        events = self.store.list_events(limit=10)
+        self.assertTrue(any(event["kind"] == "country_template_migrated" for event in events))
+
+    def test_initialize_preserves_custom_country_pattern(self):
+        for slot, country in zip(self.store.list_slots(), LEGACY_ANY_COUNTRIES):
+            self.store.update_slot(slot.id, country=country)
+        self.store.update_slot("exit-01", country="US")
+
+        self.store.initialize()
+
+        self.assertEqual("US", self.store.get_slot("exit-01").country)
+        self.assertEqual("ANY", self.store.get_slot("exit-02").country)
+        self.assertEqual("VN", self.store.get_slot("exit-21").country)
 
     def test_initialize_creates_only_requested_slots_and_never_removes_existing_slots(self):
         limited_path = Path(self.tempdir.name) / "limited.db"

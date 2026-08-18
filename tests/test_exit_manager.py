@@ -270,6 +270,97 @@ class ExitManagerTest(unittest.TestCase):
         self.assertTrue(self.store.get_slot("exit-02").enabled)
         self.assertFalse(self.store.get_slot("exit-03").enabled)
 
+    def test_country_slot_prefers_target_country_over_better_any_candidate(self):
+        self.manager.node_pool.replace(
+            [
+                {"ip": "198.51.100.1", "country": "JP", "ping": 1, "score": 100, "config": "proto tcp\n"},
+                {"ip": "198.51.100.2", "country": "US", "ping": 50, "score": 90, "config": "proto tcp\n"},
+            ]
+        )
+
+        selected = self.manager._reserve_node("exit-01", "US")
+
+        self.assertEqual("US", selected["country"])
+        self.assertNotIn("country_fallback", selected)
+
+    def test_country_slot_falls_back_when_target_pool_is_empty(self):
+        self.manager.node_pool.replace(
+            [{"ip": "198.51.100.1", "country": "JP", "ping": 1, "score": 100, "config": "proto tcp\n"}]
+        )
+
+        selected = self.manager._reserve_node("exit-01", "US")
+
+        self.assertEqual("JP", selected["country"])
+        self.assertTrue(selected["country_fallback"])
+        self.assertEqual("US", selected["target_country"])
+
+    def test_country_slot_uses_non_target_fallback_after_target_failures(self):
+        self.manager.node_pool.replace(
+            [
+                {"ip": "198.51.100.1", "country": "US", "ping": 1, "score": 100, "config": "proto tcp\n"},
+                {"ip": "198.51.100.2", "country": "JP", "ping": 2, "score": 90, "config": "proto tcp\n"},
+            ]
+        )
+
+        selected = self.manager._reserve_node(
+            "exit-01",
+            "US",
+            allow_country_fallback=True,
+        )
+
+        self.assertEqual("JP", selected["country"])
+        self.assertTrue(selected["country_fallback"])
+        self.assertEqual("US", selected["target_country"])
+
+    def test_commit_ready_allows_only_marked_country_fallback(self):
+        self.store.update_slot("exit-01", country="US")
+        generation = self.store.get_slot("exit-01").generation
+
+        rejected = self.manager.commit_ready(
+            "exit-01",
+            generation,
+            entry_ip="198.51.100.1",
+            egress_ip="203.0.113.1",
+            node={"country": "JP"},
+            check_result={"is_residential": True},
+        )
+        accepted = self.manager.commit_ready(
+            "exit-01",
+            generation,
+            entry_ip="198.51.100.2",
+            egress_ip="203.0.113.2",
+            node={"country": "JP", "country_fallback": True, "target_country": "US"},
+            check_result={"is_residential": True},
+        )
+
+        self.assertFalse(rejected)
+        self.assertTrue(accepted)
+        slot = self.store.get_slot("exit-01")
+        self.assertEqual("US", slot.country)
+        self.assertTrue(slot.current_node["country_fallback"])
+
+    def test_country_fallback_starts_only_after_two_target_failures(self):
+        slot = self.store.get_slot("exit-01")
+        self.assertFalse(self.manager._country_fallback_allowed(slot))
+        self.store.set_runtime("exit-01", failure_streak=1)
+        self.assertFalse(self.manager._country_fallback_allowed(self.store.get_slot("exit-01")))
+        self.store.set_runtime("exit-01", failure_streak=2)
+        self.assertTrue(self.manager._country_fallback_allowed(self.store.get_slot("exit-01")))
+
+    def test_country_connection_failure_limit_leaves_three_fallback_attempts(self):
+        self.manager.start_workers = False
+        for attempt in range(1, 6):
+            current = self.store.get_slot("exit-01")
+            failed = self.manager._handle_connection_failure(
+                "exit-01",
+                current.generation,
+                f"failed {attempt}",
+            )
+            self.assertEqual(attempt, failed.failure_streak)
+            self.assertEqual(attempt < 5, failed.enabled)
+
+        self.assertEqual("automatic_failure_limit", failed.disabled_reason)
+
     def test_concurrent_selection_reserves_distinct_nodes_until_released(self):
         self.manager.node_pool.replace(
             [
@@ -726,7 +817,7 @@ class ExitManagerTest(unittest.TestCase):
         )()
         self.manager.start_workers = False
 
-        for attempt in range(3):
+        for attempt in range(5):
             generation = self.store.get_slot("exit-01").generation
             runtime = self.manager.runtime("exit-01")
             runtime.process = RunningProcess()
@@ -740,7 +831,7 @@ class ExitManagerTest(unittest.TestCase):
         failed = self.store.get_slot("exit-01")
         self.assertFalse(failed.enabled)
         self.assertEqual("disabled", failed.state)
-        self.assertEqual(3, failed.failure_streak)
+        self.assertEqual(5, failed.failure_streak)
         self.assertEqual("automatic_failure_limit", failed.disabled_reason)
         self.assertTrue(self.store.get_slot("exit-02").enabled)
 

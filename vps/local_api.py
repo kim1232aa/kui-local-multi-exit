@@ -1094,10 +1094,13 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
 
     @classmethod
     def _slot_label_country(cls, slot: dict[str, Any]) -> str:
-        """Slot label country: keep an explicit target (VN/TH/...), but show the
-        detected egress country when the target is ANY so names never render as
-        ANY/XX."""
+        """Show the target country, or both actual/target for a fallback exit."""
         target = str(slot.get("country") or "").upper()
+        current_node = slot.get("current_node") if isinstance(slot.get("current_node"), dict) else {}
+        if current_node.get("country_fallback"):
+            actual = cls._slot_country_code(slot)
+            if actual not in {"XX", target}:
+                return f"{actual}-FB-{target}"
         if target and target not in {"ANY", "XX"}:
             return target
         return cls._slot_country_code(slot)

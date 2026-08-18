@@ -159,7 +159,7 @@ docker compose exec -T kui-local-multi-exit sh -lc \
   'curl --fail --silent --show-error --socks5-hostname "$KUI_MANAGEMENT_USER:$KUI_MANAGEMENT_PASSWORD@127.0.0.1:7920" https://api.ipify.org'
 ```
 
-`/api/local/status` 的 `total` 是当前受管槽位数量，`ready` 是可发布数量。`/api/proxy/proxies` 仍描述内部 SOCKS5 槽位，不能作为公网订阅；公网客户端使用 `/api/sub` 生成的 VLESS + Reality 订阅。
+`/api/local/status` 的 `total` 是当前受管槽位数量，`ready` 是可发布数量。24 槽默认目标为 `JP×4、KR×4、US×2、CA×2、GB×2、DE×2、FR×2、RU×2、VN×2、TH×2`。每个槽位先尝试目标国家；目标国家无可用候选，或连续两次目标连接失败后，才临时回退到其他可用国家，并最多进行三次回退连接。回退不会改写槽位目标，节点会标记 `country_fallback`/`target_country`；健康回退不会被节点池刷新强制中断，下一次实际重拨或服务重启时仍会先尝试目标国家。`/api/proxy/proxies` 仍描述内部 SOCKS5 槽位，不能作为公网订阅；公网客户端使用 `/api/sub` 生成的 VLESS + Reality 订阅。
 
 ## 节点来源和桥接
 

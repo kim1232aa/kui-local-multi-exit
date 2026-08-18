@@ -18,8 +18,9 @@ DEFAULT_COUNTRIES = (
     "US", "US", "CA", "CA",
     "GB", "GB", "DE", "DE",
     "FR", "FR", "RU", "RU",
-    "TH", "TH", "ANY", "ANY",
+    "VN", "VN", "TH", "TH",
 )
+LEGACY_ANY_COUNTRIES = ("ANY",) * 20 + ("VN", "VN", "TH", "TH")
 VALID_STATES = {"idle", "starting", "connecting", "ready", "degraded", "failed", "disabled"}
 
 
@@ -258,6 +259,28 @@ class LocalStore:
                     (f"exit-{index + 1:02d}", country, 7920 + index, f"tun{index}", 200 + index, 200 + index, now),
                 )
 
+            # Migrate only the exact legacy deployment pattern. Custom country
+            # assignments must never be overwritten during startup.
+            country_rows = db.execute("SELECT id, country FROM exit_slots ORDER BY id").fetchall()
+            if (
+                len(country_rows) == len(DEFAULT_COUNTRIES)
+                and tuple(row["id"] for row in country_rows) == tuple(f"exit-{index:02d}" for index in range(1, 25))
+                and tuple(row["country"] for row in country_rows) == LEGACY_ANY_COUNTRIES
+            ):
+                for index, country in enumerate(DEFAULT_COUNTRIES, start=1):
+                    db.execute(
+                        """
+                        UPDATE exit_slots
+                        SET country = ?, generation = generation + 1, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (country, now, f"exit-{index:02d}"),
+                    )
+                db.execute(
+                    "INSERT INTO events (slot_id, kind, message, created_at) VALUES (NULL, ?, ?, ?)",
+                    ("country_template_migrated", "restored country-targeted 24-slot template", now),
+                )
+
     @staticmethod
     def _row_to_slot(row: sqlite3.Row) -> ExitSlotSnapshot:
         return ExitSlotSnapshot(
@@ -356,10 +379,12 @@ class LocalStore:
             raise
         return self.get_slot(slot_id)
 
-    def record_failure(self, slot_id: str, error: str) -> ExitSlotSnapshot:
+    def record_failure(self, slot_id: str, error: str, *, max_failures: int = 3) -> ExitSlotSnapshot:
+        if max_failures < 1:
+            raise ValueError("max_failures must be positive")
         current = self.get_slot(slot_id)
         failures = current.failure_streak + 1
-        enabled = failures < 3
+        enabled = failures < max_failures
         state = "failed" if enabled else "disabled"
         reason = "" if enabled else "automatic_failure_limit"
         with self._lock, self._connect() as db:

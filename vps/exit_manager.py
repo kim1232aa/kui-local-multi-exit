@@ -31,6 +31,10 @@ class SlotRuntime:
     preferred_node_ip: str = ""
 
 
+COUNTRY_FALLBACK_AFTER_FAILURES = 2
+COUNTRY_SLOT_FAILURE_LIMIT = 5
+
+
 class ExitManager:
     def __init__(
         self,
@@ -185,6 +189,8 @@ class ExitManager:
                 if slot.enabled or slot.disabled_reason != "automatic_failure_limit":
                     continue
                 node = self._select_node(slot.country, excluded)
+                if node is None and slot.country != "ANY":
+                    node = self._select_node("ANY", excluded, excluded_countries={slot.country})
                 if node is None:
                     continue
                 recoverable.append(slot.id)
@@ -328,13 +334,13 @@ class ExitManager:
         self.store.record_event(slot_id, "disabled", "slot disabled manually")
         return slot
 
-    def fail_slot(self, slot_id: str, error: str) -> ExitSlotSnapshot:
+    def fail_slot(self, slot_id: str, error: str, *, max_failures: int = 3) -> ExitSlotSnapshot:
         self._require_managed_slot(slot_id)
         runtime = self.runtime(slot_id)
         assert runtime.lock is not None and runtime.stop is not None
         with runtime.lock:
             runtime.stop.set()
-            slot = self.store.record_failure(slot_id, error)
+            slot = self.store.record_failure(slot_id, error, max_failures=max_failures)
             listener = runtime.listener
             runtime.listener = None
             process = runtime.process
@@ -393,7 +399,8 @@ class ExitManager:
             current = self.store.get_slot(slot_id)
             if not current.enabled or current.generation != generation:
                 return current
-            failed = self.fail_slot(slot_id, error)
+            max_failures = COUNTRY_SLOT_FAILURE_LIMIT if current.country != "ANY" else 3
+            failed = self.fail_slot(slot_id, error, max_failures=max_failures)
         if endpoint_ip:
             self.node_pool.penalize(endpoint_ip, 10000)
         if failed.enabled and self.start_workers:
@@ -419,7 +426,16 @@ class ExitManager:
         check_result: dict[str, Any],
     ) -> bool:
         current = self.store.get_slot(slot_id)
-        if not current.enabled or current.generation != generation or current.country not in {"ANY", node.get("country")}:
+        node_country = str(node.get("country") or "")
+        fallback_matches = (
+            bool(node.get("country_fallback"))
+            and str(node.get("target_country") or "") == current.country
+        )
+        if (
+            not current.enabled
+            or current.generation != generation
+            or (current.country not in {"ANY", node_country} and not fallback_matches)
+        ):
             return False
         runtime = self.runtime(slot_id)
         assert runtime.lock is not None and runtime.stop is not None
@@ -498,26 +514,56 @@ class ExitManager:
             re.search(r"(?m)^proto\s+tcp(?:-client)?\b", node["config"])
         )
 
-    def _select_node(self, country: str, excluded: set[str]) -> dict[str, Any] | None:
+    def _select_node(
+        self,
+        country: str,
+        excluded: set[str],
+        *,
+        excluded_countries: set[str] | None = None,
+    ) -> dict[str, Any] | None:
         skipped = set(excluded)
+        excluded_countries = excluded_countries or set()
         while True:
             node = self.node_pool.select(country, skipped)
             if not node:
                 return None
-            if self._node_eligible(node):
+            if node.get("country") not in excluded_countries and self._node_eligible(node):
                 return node
             skipped.add(node["ip"])
 
-    def _reserve_node(self, slot_id: str, country: str, preferred_ip: str = "") -> dict[str, Any] | None:
+    def _reserve_node(
+        self,
+        slot_id: str,
+        country: str,
+        preferred_ip: str = "",
+        *,
+        allow_country_fallback: bool = False,
+    ) -> dict[str, Any] | None:
         with self._selection_lock:
             self._reserved_nodes.pop(slot_id, None)
             excluded = self.active_entry_ips(excluding=slot_id)
             node = self.node_pool.get(preferred_ip, country) if preferred_ip else None
             if node is not None and (node["ip"] in excluded or not self._node_eligible(node)):
                 node = None
-            if node is None:
+            fallback = False
+            if node is None and preferred_ip:
                 node = self._select_node(country, excluded)
+            elif node is None and country != "ANY" and allow_country_fallback:
+                node = self._select_node("ANY", excluded, excluded_countries={country})
+                fallback = node is not None
+                if node is None:
+                    node = self._select_node(country, excluded)
+            elif node is None:
+                node = self._select_node(country, excluded)
+                if node is None and country != "ANY":
+                    node = self._select_node("ANY", excluded, excluded_countries={country})
+                    fallback = node is not None
             if node:
+                node.pop("country_fallback", None)
+                node.pop("target_country", None)
+                if fallback:
+                    node["country_fallback"] = True
+                    node["target_country"] = country
                 self._reserved_nodes[slot_id] = str(node["ip"])
             return node
 
@@ -612,6 +658,10 @@ class ExitManager:
                 return True
         return False
 
+    @staticmethod
+    def _country_fallback_allowed(slot: ExitSlotSnapshot) -> bool:
+        return slot.country != "ANY" and slot.failure_streak >= COUNTRY_FALLBACK_AFTER_FAILURES
+
     def _connect_worker(self, slot_id: str, generation: int) -> None:
         self._require_managed_slot(slot_id)
         slot = self.store.get_slot(slot_id)
@@ -627,9 +677,20 @@ class ExitManager:
                 with runtime.lock:
                     preferred_ip = runtime.preferred_node_ip
                     runtime.preferred_node_ip = ""
-                node = self._reserve_node(slot_id, slot.country, preferred_ip)
+                node = self._reserve_node(
+                    slot_id,
+                    slot.country,
+                    preferred_ip,
+                    allow_country_fallback=self._country_fallback_allowed(slot),
+                )
                 if not node:
                     raise RuntimeError(f"no OpenVPN node for {slot.country}; distribution={self.node_pool.counts()}")
+                if node.get("country_fallback"):
+                    self.store.record_event(
+                        slot_id,
+                        "country_fallback",
+                        f"preferred {slot.country} unavailable; using {node.get('country', 'ANY')}",
+                    )
                 endpoint_ip = str(node["ip"])
                 config_path = self.config_dir / f"{slot_id}.ovpn"
                 log_path = self.workspace / f"{slot_id}.log"
@@ -703,6 +764,19 @@ class ExitManager:
                     return
                 status = str(residential_result.get("status", "")).lower()
                 egress_type = str(residential_result.get("egress_type", "unknown")).lower()
+                raw = residential_result.get("raw") if isinstance(residential_result.get("raw"), dict) else {}
+                geo = raw.get("geo") if isinstance(raw.get("geo"), dict) else {}
+                actual_country = str(geo.get("country_code") or "").upper()
+                if (
+                    slot.country != "ANY"
+                    and not node.get("country_fallback")
+                    and re.fullmatch(r"[A-Z]{2}", actual_country)
+                    and actual_country != slot.country
+                ):
+                    self.node_pool.penalize(endpoint_ip, 20000)
+                    raise RuntimeError(
+                        f"egress country mismatch: target={slot.country}, actual={actual_country}"
+                    )
                 allow_non_residential = os.environ.get("KUI_ALLOW_NON_RESIDENTIAL", "1").strip().lower() in {"1", "true", "yes", "on"}
                 if status != "checked" or egress_type == "unknown":
                     self.node_pool.penalize(endpoint_ip, 5000)
