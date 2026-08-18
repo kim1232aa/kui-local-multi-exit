@@ -1429,8 +1429,8 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         else:
             groups.append('  - name: "🏠 住宅自动"\n    type: select\n    proxies:\n      - "🚀 节点选择"')
         for grp in ("🧠 Claude", "🤖 ChatGPT", "🔵 Google·Gemini"):
-            groups.append(f'  - name: "{grp}"\n    type: select\n    proxies:\n' + lst(["🏠 住宅自动", "🚀 节点选择", "⚡ 自动选择", *pure_names]))
-        groups.append('  - name: "🌐 其他流量"\n    type: select\n    proxies:\n' + lst(["🚀 节点选择", "⚡ 自动选择", "🏠 住宅自动", "DIRECT"]))
+            groups.append(f'  - name: "{grp}"\n    type: select\n    proxies:\n' + lst(["🏠 住宅自动", "🚀 节点选择", "⚡ 自动选择", chain_group_name, *pure_names]))
+        groups.append(f'  - name: "🌐 其他流量"\n    type: select\n    proxies:\n' + lst(["🚀 节点选择", "⚡ 自动选择", "🏠 住宅自动", chain_group_name, "DIRECT"]))
         groups.append('  - name: "🇨🇳 中国流量"\n    type: select\n    proxies:\n' + lst(["DIRECT", "🚀 节点选择"]))
 
         rules = ["rules:"]
