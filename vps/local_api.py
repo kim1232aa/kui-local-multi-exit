@@ -1346,6 +1346,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         proxies: list[str] = []
         direct_names: list[str] = []
         pure_names: list[str] = []
+        chain_names: list[str] = []
         extra_names: list[str] = []
 
         def add(node: dict[str, Any], bucket: list[str]) -> str | None:
@@ -1364,6 +1365,10 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 added = add({**node, "name": self._exit_clash_name(slot)}, direct_names)
                 if added and self._slot_egress_type_info(slot)[0] == "residential":
                     pure_names.append(added)
+                    add(
+                        {**node, "name": f"{added}·链式", "dialer-proxy": "⚡ 自动选择"},
+                        chain_names,
+                    )
             else:
                 # tr-* slots are chained exits: first hop via the auto group.
                 add({**node, "dialer-proxy": "⚡ 自动选择"}, extra_names)
@@ -1410,17 +1415,17 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         else:
             lines.append("proxies: []")
 
-        # One dynamic chain entry: first hop = the current ⚡ 自动选择 pick,
-        # exit = the current 🏠 住宅自动 pick. Only emitted when residential
-        # exits exist — with the fallback 🏠 (-> 🚀) the relay would loop.
-        relay_name = "VLESS-REALITY-链式" if pure_names else ""
+        # Mihomo removed relay groups. Each residential exit gets a chain
+        # clone with a fixed first-hop dialer, so the chain remains valid.
+        chain_group_name = "VLESS-REALITY-链式" if chain_names else ""
 
         groups = ["proxy-groups:"]
-        groups.append('  - name: "🚀 节点选择"\n    type: select\n    proxies:\n' + lst(["⚡ 自动选择", "🏠 住宅自动", *([relay_name] if relay_name else []), *front_names, *all_names, "DIRECT"]))
+        groups.append('  - name: "🚀 节点选择"\n    type: select\n    proxies:\n' + lst(["⚡ 自动选择", "🏠 住宅自动", *([chain_group_name] if chain_group_name else []), *front_names, *all_names, "DIRECT"]))
         groups.append('  - name: "⚡ 自动选择"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 300\n    tolerance: 100\n    proxies:\n' + lst(front_names or direct_names))
         if pure_names:
             groups.append('  - name: "🏠 住宅自动"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 300\n    tolerance: 150\n    proxies:\n' + lst(pure_names))
-            groups.append(f'  - name: "{relay_name}"\n    type: relay\n    proxies:\n      - "⚡ 自动选择"\n      - "🏠 住宅自动"')
+        if chain_names:
+            groups.append(f'  - name: "{chain_group_name}"\n    type: select\n    proxies:\n' + lst(chain_names))
         else:
             groups.append('  - name: "🏠 住宅自动"\n    type: select\n    proxies:\n      - "🚀 节点选择"')
         for grp in ("🧠 Claude", "🤖 ChatGPT", "🔵 Google·Gemini"):

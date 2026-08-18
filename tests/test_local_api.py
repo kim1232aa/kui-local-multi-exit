@@ -1157,10 +1157,14 @@ class LocalAPITest(unittest.TestCase):
         self.assertNotIn("type: socks5", body)
         self.assertNotIn("ANY_exit-03_ready", body)
         self.assertIn('  - name: "🏠 住宅自动"\n    type: url-test', body)
-        # dynamic chain: current ⚡ front pick -> current 🏠 residential pick
+        self.assertNotIn("type: relay", body)
+        chain_proxy_name = "JP住宅·KDDI·exit-03·链式"
+        chain_proxy_start = body.index(f'  - name: "{chain_proxy_name}"')
+        chain_proxy_block = body[chain_proxy_start:body.index("\nproxy-groups:", chain_proxy_start)]
+        self.assertIn('dialer-proxy: "⚡ 自动选择"', chain_proxy_block)
         self.assertIn(
-            '  - name: "VLESS-REALITY-链式"\n    type: relay\n'
-            '    proxies:\n      - "⚡ 自动选择"\n      - "🏠 住宅自动"',
+            '  - name: "VLESS-REALITY-链式"\n    type: select\n'
+            f'    proxies:\n      - "{chain_proxy_name}"',
             body,
         )
         rocket_start = body.index('  - name: "🚀 节点选择"')
