@@ -35,10 +35,10 @@
 ## 前提
 
 - Linux 提供 `/dev/net/tun`。
-- Docker Engine 和 Docker Compose v2 可用（镜像支持 `linux/amd64` 和 `linux/arm64`）。
-- 当前用户有 Docker 权限。
+- 系统是 Debian/Ubuntu `amd64` 或 `arm64`。
+- 一键安装会自动补齐 Docker Engine 和 Docker Compose v2；手动部署需预先安装并具有 Docker 权限。
 - VPS 可访问外部 HTTPS 与 OpenVPN 节点。
-- 公开入口需放行管理端口和一个 Reality TCP 端口。
+- 公开入口需自行放行管理端口和一个 Reality TCP 端口；安装脚本不修改防火墙。
 
 ```bash
 test -c /dev/net/tun && echo 'TUN OK'
@@ -46,7 +46,34 @@ docker version
 docker compose version
 ```
 
-## 部署
+## 一键安装（Debian/Ubuntu）
+
+在 `amd64` 或 `arm64` VPS 上以 root 运行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kim1232aa/kui-local-multi-exit/main/install.sh | sudo sh
+```
+
+需要固定公网地址或启用 34 个槽位：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kim1232aa/kui-local-multi-exit/main/install.sh \
+  | sudo sh -s -- --public-host vpn.example.com --slot-count 34
+```
+
+脚本会检查 TUN、安装缺失的 Docker Engine/Compose、部署到 `/opt/kui-local-multi-exit`、生成权限 `0600` 的随机管理凭据并验证核心服务。参数只在首次生成 `.env` 时写入；重复执行会 `git pull --ff-only` 后重建 Compose 服务，并保留现有 `.env`、数据库、Reality 身份和 Docker volumes。脚本不会修改防火墙、`sudoers` 或 Docker 用户组，也不会运行 `down -v`。
+
+Cloudflare Tunnel 是可选项。外部 volume `kui-cloudshell-secrets` 中六个凭据文件完整时，一键脚本会启动全部四个容器并实测公网订阅；否则只启动主服务和 Reality，并明确提示 Cloudflare 未启动。可用参数：
+
+```text
+--public-host HOST
+--slot-count 1-34|auto
+--management-port PORT
+--reality-port PORT
+--install-dir DIR
+```
+
+## 手动部署
 
 ```bash
 git clone https://github.com/kim1232aa/kui-local-multi-exit.git
