@@ -148,7 +148,7 @@ https://YOUR_DOMAIN/socks5.json?user=<用户>&token=<token>
 vps/socks5-bridge.sh            # 管理密码取自 .env，也可作为第一个参数传入
 ```
 
-脚本在 Compose 网络上运行一个 sing-box 容器，把每个 ready 槽位以管理凭据认证发布到宿主机同名端口，另发布一个自动选路入口（默认 `1080`，可用 `AUTO_PORT` 覆盖）。注意：发布后任何可达者都能触达这些端口，SOCKS5 认证为明文握手，且主动探测可能导致端口被封；请按需用防火墙限制来源。
+脚本在 Compose 网络上运行一个 sing-box 容器，把每个受管槽位以管理凭据认证固定发布到宿主机同名端口，另发布一个自动选路入口（默认 `1080`，可用 `AUTO_PORT` 覆盖）。槽位后端尚未 ready 时，对应端口仍会保持监听，但代理连接会失败；后端恢复后无需重建桥接。注意：发布后任何可达者都能触达这些端口，SOCKS5 认证为明文握手，且主动探测可能导致端口被封；请按需用防火墙限制来源。
 
 所有订阅节点共享同一个 Reality 地址和端口，但 UUID 各不相同：
 
@@ -186,7 +186,7 @@ docker compose exec -T kui-local-multi-exit sh -lc \
   'curl --fail --silent --show-error --socks5-hostname "$KUI_MANAGEMENT_USER:$KUI_MANAGEMENT_PASSWORD@127.0.0.1:7920" https://api.ipify.org'
 ```
 
-`/api/local/status` 的 `total` 是当前受管槽位数量，`ready` 是可发布数量。前 24 槽默认目标为 `JP×4、KR×4、US×2、CA×2、GB×2、DE×2、FR×2、RU×2、VN×2、TH×2`，走完整住宅/机房校验；`exit-25`–`exit-34`（仅 `KUI_SLOT_COUNT=34` 时存在）是 `ANY` 宽松槽，跳过住宅校验、只要求真实出口 IP 与目标连通，节点标注 `未验证IP`，不进入住宅自动组和住宅链式。每个槽位先尝试目标国家；目标国家无可用候选，或连续两次目标连接失败后，才临时回退到其他可用国家，并最多进行三次回退连接。回退不会改写槽位目标，节点会标记 `country_fallback`/`target_country`；健康回退不会被节点池刷新强制中断，下一次实际重拨或服务重启时仍会先尝试目标国家。`/api/proxy/proxies` 仍描述内部 SOCKS5 槽位，不能作为公网订阅。
+`/api/local/status` 的 `total` 是当前受管槽位数量，`ready` 是可发布数量。前 24 槽默认目标为 `JP×4、KR×4、US×2、CA×2、GB×2、DE×2、FR×2、RU×2、VN×2、TH×2`，走完整住宅/机房校验；`exit-25`–`exit-34`（仅 `KUI_SLOT_COUNT=34` 时存在）是 `ANY` 宽松槽，跳过住宅校验、只要求真实出口 IP 与目标连通，节点标注 `未验证IP`，会进入住宅自动组，但不生成住宅链式克隆。每个槽位先尝试目标国家；目标国家无可用候选，或连续两次目标连接失败后，才临时回退到其他可用国家，并最多进行三次回退连接。回退不会改写槽位目标，节点会标记 `country_fallback`/`target_country`；健康回退不会被节点池刷新强制中断，下一次实际重拨或服务重启时仍会先尝试目标国家。`/api/proxy/proxies` 仍描述内部 SOCKS5 槽位，不能作为公网订阅。
 
 Reality 的 Clash/Mihomo 订阅为每个 ready 槽位生成两份客户端入口：一份是 VPS 直连，一份名称带 `Cloudflare优选` 并设置 `dialer-proxy: 🔗链式前置`。订阅用户可在 `PROXY` 组中选择 `<用户>-vps-住宅` 或 `<用户>-cloudflare-vps-住宅`；在 `🔗链式前置` 组中选择具体 Cloudflare/桥接前置或 `DIRECT`。只有 `format=clash`/`format=clash-meta` 能表达这个前置关系，默认 VLESS Base64 格式只包含直连链接。
 

@@ -1177,7 +1177,7 @@ class LocalAPITest(unittest.TestCase):
         self.assertIn("JP-%E6%97%A5%E6%9C%AC%20%7C%20%E4%BD%8F%E5%AE%85IP%20%7C%20KDDI%20%7C%20203.0.113.30%20%7C%20exit-03", links)
         self.assertNotIn("socks5://", links)
 
-    def test_connectivity_only_exit_34_is_publishable_but_not_residential(self):
+    def test_connectivity_only_exit_34_joins_residential_group_without_chain(self):
         self.store.initialize(slot_count=34)
         self.manager.set_slot_ready("exit-34")
         self.store.set_runtime(
@@ -1227,7 +1227,7 @@ class LocalAPITest(unittest.TestCase):
         self.assertIn(f'name: "{node_name}"', body)
         residential_start = body.index('  - name: "🏠 住宅自动"')
         residential_block = body[residential_start:body.index("\n  - name:", residential_start + 1)]
-        self.assertNotIn(node_name, residential_block)
+        self.assertIn(f'      - "{node_name}"', residential_block)
         self.assertNotIn(f'{node_name}·链式', body)
 
         manifest.write_text(

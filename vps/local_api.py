@@ -1372,8 +1372,10 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             slot = publishable.get(str(node.get("_slot_id") or ""))
             if slot is not None:
                 added = add({**node, "name": self._exit_clash_name(slot)}, direct_names)
-                if added and self._slot_egress_type_info(slot)[0] == "residential":
+                egress_type = self._slot_egress_type_info(slot)[0] if added else ""
+                if egress_type in {"residential", "unverified"}:
                     pure_names.append(added)
+                if egress_type == "residential":
                     add(
                         {**node, "name": f"{added}·链式", "dialer-proxy": "⚡ 自动选择"},
                         chain_names,
@@ -1412,7 +1414,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         now = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
         lines = [
             f"# K-UI Local Multi-Exit subscription — generated {now} (dynamic)",
-            f"# {len(front_names)} CF front nodes + {len(direct_names)} exit nodes ({len(pure_names)} verified residential) + {len(extra_names)} chained/third-party nodes",
+            f"# {len(front_names)} CF front nodes + {len(direct_names)} exit nodes ({len(pure_names)} residential + lenient) + {len(extra_names)} chained/third-party nodes",
             "mixed-port: 7890",
             "allow-lan: false",
             "mode: rule",

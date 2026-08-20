@@ -4,7 +4,7 @@
 # Slot listeners (7920+) live inside the Compose network behind auto-generated
 # internal credentials, so the links from `/api/sub?format=socks5` are not
 # reachable from outside. This sidecar runs sing-box on the Compose network and
-# re-publishes every ready slot on the host, authenticated with the management
+# re-publishes every managed slot on the host, authenticated with the management
 # credentials that the subscription links already carry. A single url-test
 # entry port (default 1080) is published as well.
 #
@@ -44,9 +44,9 @@ GU_USER=$(echo "$GU" | sed -n 1p); GU_PASS=$(echo "$GU" | sed -n 2p)
 [ -n "$GU_PASS" ] || { echo "FATAL: cannot read internal proxy credentials" >&2; exit 1; }
 
 SLOTS=$(curl -fsS --max-time 10 -u "$MGMT_USER:$PW" "$KUI_BASE_URL/api/local/exits" \
-  | python3 -c "import json,sys; d=json.load(sys.stdin); print(','.join(f\"{s['id']}:{s['proxy_port']}:{s.get('country') or 'UN'}\" for s in d.get('exits',[]) if s.get('state')=='ready' and s.get('proxy_port')))")
-[ -n "$SLOTS" ] || { echo "FATAL: no ready slots; check /api/local/exits first" >&2; exit 1; }
-echo "[*] ready slots: $SLOTS"
+  | python3 -c "import json,sys; d=json.load(sys.stdin); print(','.join(f\"{s['id']}:{s['proxy_port']}:{s.get('country') or 'UN'}\" for s in d.get('exits',[]) if s.get('proxy_port')))")
+[ -n "$SLOTS" ] || { echo "FATAL: no managed slots; check /api/local/exits first" >&2; exit 1; }
+echo "[*] managed slots: $SLOTS"
 
 mkdir -p "$BRIDGE_STATE_DIR"
 python3 - "$PW" "$MGMT_USER" "$GU_USER" "$GU_PASS" "$KUI_CONTAINER" "$AUTO_PORT" "$SLOTS" > "$BRIDGE_STATE_DIR/config.json" <<'PY'
@@ -76,6 +76,7 @@ print(json.dumps({
     "route": {"rules": [{"inbound": sid, "outbound": sid} for sid, _, _ in trips], "final": "auto"},
 }, indent=2))
 PY
+chmod 600 "$BRIDGE_STATE_DIR/config.json"
 
 NETWORK=$($DOCKER inspect "$KUI_CONTAINER" --format '{{range $k, $_ := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' | head -1)
 [ -n "$NETWORK" ] || { echo "FATAL: cannot locate the compose network" >&2; exit 1; }
