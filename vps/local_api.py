@@ -1408,6 +1408,9 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             return json.dumps(value, ensure_ascii=False)
 
         def lst(items: list[str]) -> str:
+            # Skip empty entries (e.g. chain_group_name when no chain clones)
+            # so groups never reference an undefined "" proxy.
+            items = [item for item in items if item]
             return "\n".join(f"      - {q(item)}" for item in items) if items else "      - DIRECT"
 
         all_names = direct_names + extra_names
