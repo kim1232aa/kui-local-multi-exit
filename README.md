@@ -61,9 +61,7 @@ curl -fsSL https://raw.githubusercontent.com/kim1232aa/kui-local-multi-exit/main
   | sudo sh -s -- --public-host vpn.example.com --slot-count 34
 ```
 
-脚本会检查 TUN、安装缺失的 Docker Engine/Compose、部署到 `/opt/kui-local-multi-exit`、生成权限 `0600` 的随机管理凭据并验证核心服务。参数只在首次生成 `.env` 时写入；重复执行会 `git pull --ff-only` 后重建 Compose 服务，并保留现有 `.env`、数据库、Reality 身份和 Docker volumes。脚本不会修改防火墙、`sudoers` 或 Docker 用户组，也不会运行 `down -v`。
-
-Cloudflare Tunnel 是可选项。外部 volume `kui-cloudshell-secrets` 中六个凭据文件完整时，一键脚本会启动全部四个容器并实测公网订阅；否则只启动主服务和 Reality，并明确提示 Cloudflare 未启动。可用参数：
+脚本会检查 TUN、安装缺失的 Docker Engine/Compose、部署到 `/opt/kui-local-multi-exit`、生成权限 `0600` 的随机管理凭据并验证核心服务。参数只在首次生成 `.env` 时写入；重复执行会 `git pull --ff-only` 后重建 Compose 服务，并保留现有 `.env`、数据库、Reality 身份和 Docker volumes。脚本不会修改防火墙、`sudoers` 或 Docker 用户组，也不会运行 `down -v`。可用参数：
 
 ```text
 --public-host HOST
@@ -205,8 +203,6 @@ KUI_BRIDGE_TOP_N=16
 ```
 
 桥接订阅只在配置 `KUI_BRIDGE_SUB_URLS` 时后台刷新。测试并发继承 `KUI_DIAL_WORKERS`，以免低配机器同时启动过多 curl 或 sing-box 进程。
-
-可选 Docker 版 CloudShell 兼容入口见 `README.local.md`：`kui-cloudshell-origin` 提供 `/vless` 与 `/res-NN`，`kui-cloudflared` 使用外部 secrets volume 接入固定 Cloudflare Tunnel；宿主机不安装程序、不新增监听端口。
 
 ## 日常检查
 

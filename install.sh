@@ -10,8 +10,6 @@ SYSTEM_BIN=${KUI_SYSTEM_BIN:-}
 ETC_DIR=${KUI_ETC_DIR:-/etc}
 HEALTH_TIMEOUT=${KUI_HEALTH_TIMEOUT:-180}
 HEALTH_INTERVAL=${KUI_HEALTH_INTERVAL:-3}
-CLOUDFLARE_TIMEOUT=${KUI_CLOUDFLARE_TIMEOUT:-90}
-CLOUDFLARE_INTERVAL=${KUI_CLOUDFLARE_INTERVAL:-5}
 PUBLIC_HOST=""
 SLOT_COUNT="auto"
 MANAGEMENT_PORT="8080"
@@ -115,8 +113,6 @@ valid_port "$REALITY_PORT" || fail "--reality-port 必须是 1-65535"
 [ "$MANAGEMENT_PORT" != "$REALITY_PORT" ] || fail "管理端口和 Reality 端口不能相同"
 valid_positive_integer "$HEALTH_TIMEOUT" || fail "KUI_HEALTH_TIMEOUT 必须是正整数"
 valid_positive_integer "$HEALTH_INTERVAL" || fail "KUI_HEALTH_INTERVAL 必须是正整数"
-valid_positive_integer "$CLOUDFLARE_TIMEOUT" || fail "KUI_CLOUDFLARE_TIMEOUT 必须是正整数"
-valid_positive_integer "$CLOUDFLARE_INTERVAL" || fail "KUI_CLOUDFLARE_INTERVAL 必须是正整数"
 case "$PUBLIC_HOST" in
     ''|*[!A-Za-z0-9._:-]*) [ -z "$PUBLIC_HOST" ] || fail "--public-host 只能包含域名、IPv4 或 IPv6 地址" ;;
 esac
@@ -217,9 +213,6 @@ else
 fi
 
 cd "$INSTALL_DIR"
-if ! docker volume inspect kui-cloudshell-secrets >/dev/null 2>&1; then
-    docker volume create kui-cloudshell-secrets >/dev/null
-fi
 
 printf '%s\n' '[4/5] 构建并启动核心服务...'
 docker compose up -d --build kui-local-multi-exit kui-reality-gateway
@@ -248,40 +241,7 @@ docker compose exec -T kui-reality-gateway \
 curl --noproxy '*' -fsS --max-time 10 \
     "http://127.0.0.1:${MANAGEMENT_PORT}/healthz" >/dev/null
 
-cloudflare_ready=0
-if docker compose exec -T kui-local-multi-exit sh -c '
-    for file in cf-tunnel-creds.json cf-hostname uuid sub-path sub-front.yaml res-domains.txt; do
-        test -s "/run/cloudshell-secrets/$file" || exit 1
-    done
-' >/dev/null 2>&1; then
-    cloudflare_ready=1
-fi
-
-if [ "$cloudflare_ready" -eq 1 ]; then
-    docker compose up -d --build
-    wait_healthy kui-cloudshell-origin
-    cloudflare_host=$(docker compose exec -T kui-local-multi-exit cat /run/cloudshell-secrets/cf-hostname | tr -d '\r\n')
-    cloudflare_path=$(docker compose exec -T kui-local-multi-exit cat /run/cloudshell-secrets/sub-path | tr -d '\r\n')
-    elapsed=0
-    public_subscription=""
-    while [ "$elapsed" -le "$CLOUDFLARE_TIMEOUT" ]; do
-        public_subscription=$(curl --noproxy '*' -fsS --max-time 20 "https://${cloudflare_host}${cloudflare_path}" 2>/dev/null || true)
-        if printf '%s' "$public_subscription" | grep -q '^proxies:' \
-            && printf '%s' "$public_subscription" | grep -q '^proxy-groups:' \
-            && printf '%s' "$public_subscription" | grep -q '^rules:'; then
-            break
-        fi
-        public_subscription=""
-        sleep "$CLOUDFLARE_INTERVAL"
-        elapsed=$((elapsed + CLOUDFLARE_INTERVAL))
-    done
-    [ -n "$public_subscription" ] || fail "Cloudflare 公网订阅未在 ${CLOUDFLARE_TIMEOUT} 秒内就绪"
-    printf '%s\n' '安装完成。Cloudflare Tunnel 已启动。'
-    printf '订阅地址：https://%s%s\n' "$cloudflare_host" "$cloudflare_path"
-else
-    printf '%s\n' '安装完成。Cloudflare secrets 不完整，Cloudflare 入口未启动；核心管理/API 和 Reality 已启动。'
-    printf '%s\n' '补齐 kui-cloudshell-secrets 后，在安装目录执行：docker compose up -d --build'
-fi
+printf '%s\n' '安装完成。核心管理/API 和 Reality 已启动。'
 printf '管理面板：http://<VPS-IP>:%s/\n' "$MANAGEMENT_PORT"
 printf 'Reality 端口：%s/tcp\n' "$REALITY_PORT"
 printf '安装目录：%s\n' "$INSTALL_DIR"

@@ -64,21 +64,12 @@ class InstallScriptTest(unittest.TestCase):
             fi
             case "$*" in
                 *127.0.0.1*/healthz*) printf '{"ok":true}\n' ;;
-                *https://*)
-                    attempts=0
-                    [ ! -f "${KUI_TEST_PUBLIC_STATE:-}" ] || attempts=$(cat "$KUI_TEST_PUBLIC_STATE")
-                    if [ "$attempts" -lt "${KUI_TEST_PUBLIC_FAILS:-0}" ]; then
-                        attempts=$((attempts + 1))
-                        printf '%s' "$attempts" > "$KUI_TEST_PUBLIC_STATE"
-                        exit 22
-                    fi
-                    printf 'proxies:\nproxy-groups:\nrules:\n'
-                    ;;
+                *https://*) exit 0 ;;
             esac
             exit 0
             """,
         )
-        self._write_docker(cloudflare_ready=False)
+        self._write_docker()
 
     def _write_executable(self, name: str, body: str) -> Path:
         path = self.bin / name
@@ -86,37 +77,22 @@ class InstallScriptTest(unittest.TestCase):
         path.chmod(0o755)
         return path
 
-    def _write_docker(self, *, cloudflare_ready: bool) -> None:
-        ready = "0" if cloudflare_ready else "1"
+    def _write_docker(self) -> None:
         self._write_executable(
             "docker",
-            f"""
+            """
             #!/bin/sh
-            printf 'docker %s\n' "$*" >> "$KUI_TEST_LOG"
+            printf 'docker %s\\n' "$*" >> "$KUI_TEST_LOG"
             case "$*" in
                 "compose version")
-                    if [ "${{KUI_TEST_COMPOSE_MISSING:-0}}" = "1" ] && [ ! -f "${{KUI_TEST_COMPOSE_STATE:-}}" ]; then
+                    if [ "${KUI_TEST_COMPOSE_MISSING:-0}" = "1" ] && [ ! -f "${KUI_TEST_COMPOSE_STATE:-}" ]; then
                         exit 1
                     fi
                     echo 'Docker Compose version v2.30.0'
                     ;;
                 "info") : ;;
-                "volume inspect kui-cloudshell-secrets")
-                    [ -f "$KUI_TEST_VOLUME_STATE" ] || exit 1
-                    ;;
-                "volume create kui-cloudshell-secrets")
-                    : > "$KUI_TEST_VOLUME_STATE"
-                    echo kui-cloudshell-secrets
-                    ;;
                 "compose ps -q "*) echo service-id ;;
                 "inspect --format "*) echo healthy ;;
-                "compose exec -T kui-local-multi-exit cat /run/cloudshell-secrets/cf-hostname")
-                    [ {ready} -eq 0 ] && echo cf.example.com || exit 1
-                    ;;
-                "compose exec -T kui-local-multi-exit cat /run/cloudshell-secrets/sub-path")
-                    [ {ready} -eq 0 ] && echo /sub-secret || exit 1
-                    ;;
-                "compose exec -T kui-local-multi-exit sh -c "*) exit {ready} ;;
                 "compose exec -T kui-reality-gateway kui-sing-box check -c /var/lib/kui-reality/config.json") : ;;
             esac
             exit 0
@@ -133,7 +109,6 @@ class InstallScriptTest(unittest.TestCase):
                 "KUI_ETC_DIR": str(self.work / "etc"),
                 "KUI_TUN_DEVICE": "/dev/null",
                 "KUI_TEST_LOG": str(self.log),
-                "KUI_TEST_VOLUME_STATE": str(self.work / "volume-created"),
                 "KUI_HEALTH_TIMEOUT": "1",
                 "KUI_HEALTH_INTERVAL": "1",
             }
@@ -149,7 +124,7 @@ class InstallScriptTest(unittest.TestCase):
             timeout=15,
         )
 
-    def test_fresh_install_generates_private_env_and_starts_core_without_cloudflare(self):
+    def test_fresh_install_generates_private_env_and_starts_core_services(self):
         result = self._run("--public-host", "vpn.example.com", "--slot-count", "34")
 
         self.assertEqual(0, result.returncode, result.stderr + result.stdout)
@@ -173,8 +148,7 @@ class InstallScriptTest(unittest.TestCase):
             commands,
         )
         self.assertNotIn("docker compose up -d --build\n", commands)
-        self.assertIn("Cloudflare", result.stdout)
-        self.assertIn("未启动", result.stdout)
+        self.assertIn("安装完成", result.stdout)
 
     def test_rerun_preserves_env_and_fast_forwards_existing_checkout(self):
         (self.install_dir / ".git").mkdir(parents=True)
@@ -197,35 +171,6 @@ class InstallScriptTest(unittest.TestCase):
         self.assertNotIn(" down ", commands)
         self.assertNotIn(" -v", commands)
 
-    def test_complete_cloudflare_secrets_start_all_services(self):
-        self._write_docker(cloudflare_ready=True)
-
-        result = self._run()
-
-        self.assertEqual(0, result.returncode, result.stderr + result.stdout)
-        commands = self.log.read_text(encoding="utf-8")
-        self.assertIn("docker compose up -d --build\n", commands)
-        self.assertIn("curl --noproxy * -fsS --max-time 20 https://cf.example.com/sub-secret", commands)
-        self.assertIn("Cloudflare Tunnel 已启动", result.stdout)
-        self.assertIn("订阅地址：https://cf.example.com/sub-secret", result.stdout)
-
-    def test_cloudflare_subscription_is_retried_while_edge_becomes_ready(self):
-        self._write_docker(cloudflare_ready=True)
-        public_state = self.work / "public-attempts"
-
-        result = self._run(
-            extra_env={
-                "KUI_TEST_PUBLIC_FAILS": "2",
-                "KUI_TEST_PUBLIC_STATE": str(public_state),
-                "KUI_CLOUDFLARE_TIMEOUT": "3",
-                "KUI_CLOUDFLARE_INTERVAL": "1",
-            }
-        )
-
-        self.assertEqual(0, result.returncode, result.stderr + result.stdout)
-        self.assertEqual("2", public_state.read_text(encoding="utf-8"))
-        self.assertIn("Cloudflare Tunnel 已启动", result.stdout)
-
     def test_missing_docker_is_installed_from_official_apt_repository(self):
         (self.bin / "docker").unlink()
         system_bin = self.work / "system-bin"
@@ -238,7 +183,7 @@ class InstallScriptTest(unittest.TestCase):
         docker_template.write_text(
             "#!/bin/sh\n"
             "printf 'docker %s\\n' \"$*\" >> \"$KUI_TEST_LOG\"\n"
-            "case \"$*\" in \"compose version\") : ;; \"info\") : ;; \"volume inspect kui-cloudshell-secrets\") exit 1 ;; \"volume create kui-cloudshell-secrets\") echo kui-cloudshell-secrets ;; \"compose ps -q \"*) echo service-id ;; \"inspect --format \"*) echo healthy ;; \"compose exec -T kui-local-multi-exit sh -c \"*) exit 1 ;; esac\n",
+            "case \"$*\" in \"compose version\") : ;; \"info\") : ;; \"compose ps -q \"*) echo service-id ;; \"inspect --format \"*) echo healthy ;; esac\n",
             encoding="utf-8",
         )
         docker_template.chmod(0o755)
@@ -372,8 +317,6 @@ class InstallScriptTest(unittest.TestCase):
             ("KUI_HEALTH_TIMEOUT", "10ms"),
             ("KUI_HEALTH_INTERVAL", "0"),
             ("KUI_HEALTH_INTERVAL", "08"),
-            ("KUI_CLOUDFLARE_TIMEOUT", "-1"),
-            ("KUI_CLOUDFLARE_INTERVAL", "0"),
         )
         for variable, value in invalid_settings:
             with self.subTest(variable=variable, value=value):

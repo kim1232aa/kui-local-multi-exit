@@ -36,9 +36,6 @@ services:
       - kui-local-data:/opt/kui-local
       - ./providers:/opt/kui-providers:ro
       - ./runtime/reality:/run/kui-reality:ro
-      # Front nodes (CF 前置) for the Clash subscription; optional content —
-      # missing files simply mean no front nodes in the output.
-      - kui-cloudshell-secrets:/run/cloudshell-secrets:ro
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2)\""]
       interval: 10s
@@ -80,44 +77,6 @@ services:
       retries: 3
       start_period: 10s
 
-  kui-cloudshell-origin:
-    build:
-      context: .
-      dockerfile: docker/cloudshell-origin.Dockerfile
-    container_name: kui-cloudshell-origin
-    restart: unless-stopped
-    depends_on:
-      kui-local-multi-exit:
-        condition: service_healthy
-    environment:
-      KUI_SLOT_COUNT: ${KUI_SLOT_COUNT:-auto}
-      KUI_CLOUDSHELL_LOG: ${KUI_CLOUDSHELL_LOG:-warning}
-    volumes:
-      - kui-local-data:/kui-data:ro
-      - kui-cloudshell-secrets:/run/secrets:ro
-      - kui-cloudshell-origin:/run/origin
-    healthcheck:
-      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:38081/healthz', timeout=2)\" && test -s /run/origin/cloudflared.yml"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 5s
-
-  kui-cloudflared:
-    image: cloudflare/cloudflared:latest
-    container_name: kui-cloudflared
-    restart: unless-stopped
-    depends_on:
-      kui-cloudshell-origin:
-        condition: service_healthy
-    command: ["tunnel", "--config", "/run/origin/cloudflared.yml", "--no-autoupdate", "--protocol", "http2", "run"]
-    volumes:
-      - kui-cloudshell-secrets:/run/secrets:ro
-      - kui-cloudshell-origin:/run/origin:ro
-
 volumes:
   kui-local-data:
   kui-reality-data:
-  kui-cloudshell-secrets:
-    external: true
-  kui-cloudshell-origin:

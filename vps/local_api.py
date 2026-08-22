@@ -1326,24 +1326,6 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         isp = self._cs_isp_short(self._slot_isp(slot).get("org"))
         return f"{country}{kind}·{isp}·{slot['id']}"
 
-    def _front_nodes_fragment(self) -> tuple[str, list[str]]:
-        """Verbatim CF front-node YAML fragment + names, when the VPS runs the
-        Cloudflare tunnel origin (kui-cloudshell-secrets volume). These are the
-        前置 entries: preferred-CF-domain vless+ws nodes through the tunnel."""
-        secrets = Path(os.environ.get("KUI_CLOUDSHELL_SECRETS", "") or "/run/cloudshell-secrets")
-        try:
-            fragment = (secrets / "sub-front.yaml").read_text(encoding="utf-8").rstrip()
-        except OSError:
-            return "", []
-        if not fragment:
-            return "", []
-        names = [
-            ln.split('"')[1]
-            for ln in fragment.splitlines()
-            if ln.strip().startswith("- name:") and '"' in ln
-        ]
-        return fragment, names
-
     def _clash_subscription_yaml(self, thirdparty_nodes: list[dict[str, Any]]) -> str:
         """Clash/Mihomo subscription in the cs-pa (Cloud Shell) layout:
         🚀 节点选择 / ⚡ 自动选择 / 🏠 住宅自动 + AI site groups + CN direct."""
@@ -1400,10 +1382,6 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         for node in thirdparty_nodes:
             add(node, extra_names)
 
-        front_fragment, front_names = self._front_nodes_fragment()
-        if front_fragment:
-            proxies.insert(0, front_fragment)
-
         def q(value: str) -> str:
             return json.dumps(value, ensure_ascii=False)
 
@@ -1417,7 +1395,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         now = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
         lines = [
             f"# K-UI Local Multi-Exit subscription — generated {now} (dynamic)",
-            f"# {len(front_names)} CF front nodes + {len(direct_names)} exit nodes ({len(pure_names)} residential + lenient) + {len(extra_names)} chained/third-party nodes",
+            f"# {len(direct_names)} exit nodes ({len(pure_names)} residential + lenient) + {len(extra_names)} chained/third-party nodes",
             "mixed-port: 7890",
             "allow-lan: false",
             "mode: rule",
@@ -1434,8 +1412,8 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         chain_group_name = "VLESS-REALITY-链式" if chain_names else ""
 
         groups = ["proxy-groups:"]
-        groups.append('  - name: "🚀 节点选择"\n    type: select\n    proxies:\n' + lst(["⚡ 自动选择", "🏠 住宅自动", *([chain_group_name] if chain_group_name else []), *front_names, *all_names, "DIRECT"]))
-        groups.append('  - name: "⚡ 自动选择"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 300\n    tolerance: 100\n    proxies:\n' + lst(front_names or direct_names))
+        groups.append('  - name: "🚀 节点选择"\n    type: select\n    proxies:\n' + lst(["⚡ 自动选择", "🏠 住宅自动", *([chain_group_name] if chain_group_name else []), *all_names, "DIRECT"]))
+        groups.append('  - name: "⚡ 自动选择"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 300\n    tolerance: 100\n    proxies:\n' + lst(direct_names))
         if pure_names:
             groups.append('  - name: "🏠 住宅自动"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 300\n    tolerance: 150\n    proxies:\n' + lst(pure_names))
         if chain_names:
