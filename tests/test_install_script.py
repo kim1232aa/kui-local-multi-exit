@@ -144,7 +144,7 @@ class InstallScriptTest(unittest.TestCase):
         self.assertIn("不会修改防火墙", result.stdout)
         commands = self.log.read_text(encoding="utf-8")
         self.assertIn(
-            "docker compose up -d --build kui-local-multi-exit kui-reality-gateway",
+            "docker compose up -d --build kui-local-multi-exit kui-reality-gateway kui-socks5-bridge",
             commands,
         )
         self.assertNotIn("docker compose up -d --build\n", commands)

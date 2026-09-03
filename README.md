@@ -4,8 +4,9 @@
 
 ## 工作方式
 
-- 每个 active 槽位有独立 OpenVPN 隧道、策略路由和内部 SOCKS5 listener（从 `7920` 开始）。这些 SOCKS5 端口**不发布到宿主机**。
+- 每个 active 槽位有独立 OpenVPN 隧道、策略路由和内部 SOCKS5 listener（从 `7920` 开始）。这些内部端口只在 Compose 网络可达。
 - `kui-reality-gateway` 使用一个 VLESS + XTLS-Reality inbound。认证到不同 UUID 后，sing-box 按 `auth_user` 将流量送到对应 `exit-XX` 的内部 SOCKS5 端口。
+- `kui-socks5-bridge` 把每个受管槽位以管理凭据再发布到宿主机同名端口（`7920`–`7953`），另提供自动选路入口（默认 `1080`）。
 - 订阅只发布状态为 `ready` 且 listener 已就绪的槽位；节点名称来自实际出口信息。
 - 旧数据库中的未受管槽位不会删除，但低配档位不会启动、暴露或接受对它们的操作。
 - 公共 VPN/OpenVPN 节点本身会离线、限流或不通过探针；槽位不足不能靠伪造 ready 状态解决。
@@ -99,9 +100,10 @@ docker compose ps
 | `KUI_MANAGEMENT_USER` | `admin` | 面板生成本地 SOCKS5 验证时使用的用户名。 |
 | `KUI_MANAGEMENT_PASSWORD` | 必填 | 管理页生成的内部 SOCKS5 验证密码；不是面板登录密码。 |
 | `KUI_MANAGEMENT_PORT` | `8080` | 宿主机管理 API 映射端口。 |
-| `KUI_REALITY_PORT` | `8443` | 唯一发布到宿主机的 Reality TCP 端口。 |
+| `KUI_REALITY_PORT` | `8443` | 发布到宿主机的 Reality TCP 端口。 |
 | `KUI_PUBLIC_HOST` | 自动发现 | VLESS 链接使用的公网地址。 |
 | `KUI_SOCKS5_PUBLIC_HOST` | Reality 清单地址 | 纯 SOCKS5 链接使用的公网地址；若 DNS 下载域名经过 Cloudflare 代理，建议显式设置为直连 IP/域名。 |
+| `KUI_SOCKS5_AUTO_PORT` | `1080` | SOCKS5 自动选路入口。每槽位端口固定为 `7920`–`7953`。 |
 | `KUI_REALITY_SNI` | `addons.mozilla.org` | Reality 回落握手域名。 |
 | `KUI_FETCH_PROXY` | 空 | 拉取 VPN 数据时使用的显式 HTTP/HTTPS/SOCKS5 代理。 |
 | `KUI_OPENVPN_SOCKS_PROXY` | 空 | OpenVPN TCP 握手使用的 SOCKS5 上游代理。 |
@@ -113,14 +115,16 @@ docker compose ps
 
 ## 端口、Reality 和证书
 
-Compose 只发布：
+Compose 发布：
 
 ```text
 TCP 8080（或 KUI_MANAGEMENT_PORT）  管理面板/API
 TCP 8443（或 KUI_REALITY_PORT）     唯一 XTLS-Reality 入口
+TCP 1080（或 KUI_SOCKS5_AUTO_PORT） SOCKS5 自动选路入口
+TCP 7920–7953                      每槽位 SOCKS5 桥接入口
 ```
 
-内部 SOCKS5 `7920`–`7953` 仅在 `kui-local-multi-exit` 容器和 Compose 网络可达。不能把 `socks5://...@VPS_IP:7920` 当成公网地址。
+主容器内部的 `7920+` 仍只在 Compose 网络可达，且使用独立的 gateway 凭据。公网 `socks5.txt` 链接走的是 `kui-socks5-bridge` 发布的同名端口，认证为管理用户。
 
 ## 纯 SOCKS5 订阅（可选）
 
@@ -130,7 +134,7 @@ TCP 8443（或 KUI_REALITY_PORT）     唯一 XTLS-Reality 入口
 /api/sub?user=<用户>&token=<token>&format=socks5
 ```
 
-返回 base64 编码的链接列表：每个 ready 槽位一条 `socks5://`，第三方节点中仅保留 SOCKS5 条目。链接凭据与面板管理用户一致，端口为槽位内部端口（`7920+`）。这些端口默认不发布到宿主机；需要外部可达时运行桥接 sidecar：
+返回 base64 编码的链接列表：每个 ready 槽位一条 `socks5://`，第三方节点中仅保留 SOCKS5 条目。链接凭据与面板管理用户一致，端口为槽位内部端口（`7920+`）。这些端口由 Compose 服务 `kui-socks5-bridge` 发布到宿主机：
 
 也可以直接使用域名路径（同样需要用户和 token）：
 
@@ -143,10 +147,10 @@ https://YOUR_DOMAIN/socks5.json?user=<用户>&token=<token>
 未携带 `user`/`token` 时返回 404，这是为了避免把带认证信息的 SOCKS5 地址公开。`socks5.json` 输出 `exported_at`、实时 `proxies` 和空的 `accounts`；代理项包含 `proxy_key`、名称、协议、地址、端口、可选认证信息、状态与回退模式。SOCKS5 链接主机优先使用 `KUI_SOCKS5_PUBLIC_HOST`，未设置时从 Reality 节点清单取公网地址；因此不要把经过 Cloudflare 代理的订阅下载域名当作 SOCKS5 端口主机。
 
 ```bash
-vps/socks5-bridge.sh            # 管理密码取自 .env，也可作为第一个参数传入
+docker compose up -d kui-socks5-bridge
 ```
 
-脚本在 Compose 网络上运行一个 sing-box 容器，把每个受管槽位以管理凭据认证固定发布到宿主机同名端口，另发布一个自动选路入口（默认 `1080`，可用 `AUTO_PORT` 覆盖）。槽位后端尚未 ready 时，对应端口仍会保持监听，但代理连接会失败；后端恢复后无需重建桥接。注意：发布后任何可达者都能触达这些端口，SOCKS5 认证为明文握手，且主动探测可能导致端口被封；请按需用防火墙限制来源。
+桥接服务把每个受管槽位以管理凭据认证固定发布到宿主机同名端口，另发布一个自动选路入口（默认 `1080`，可用 `KUI_SOCKS5_AUTO_PORT` 覆盖）。槽位后端尚未 ready 时，对应端口仍会保持监听，但代理连接会失败；后端恢复后无需重建桥接。注意：发布后任何可达者都能触达这些端口，SOCKS5 认证为明文握手，且主动探测可能导致端口被封；请按需用防火墙限制来源。
 
 所有订阅节点共享同一个 Reality 地址和端口，但 UUID 各不相同：
 
@@ -210,10 +214,11 @@ KUI_BRIDGE_TOP_N=16
 docker compose ps
 docker compose logs --tail=200 kui-local-multi-exit
 docker compose logs --tail=200 kui-reality-gateway
-docker stats kui-local-multi-exit kui-reality-gateway
+docker compose logs --tail=200 kui-socks5-bridge
+docker stats kui-local-multi-exit kui-reality-gateway kui-socks5-bridge
 ```
 
-重建或升级不会删除 `kui-local-data` 和 `kui-reality-data` volumes：
+重建或升级不会删除 `kui-local-data`、`kui-reality-data` 和 `kui-socks5-bridge-data` volumes：
 
 ```bash
 docker compose up -d --build

@@ -38,14 +38,16 @@ docker compose ps
 
 ## 网络边界
 
-Compose 只向宿主机发布：
+Compose 向宿主机发布：
 
 ```text
 KUI_MANAGEMENT_PORT（默认 8080/TCP）
 KUI_REALITY_PORT（默认 8443/TCP）
+KUI_SOCKS5_AUTO_PORT（默认 1080/TCP）
+7920–7953/TCP（每槽位 SOCKS5 桥接）
 ```
 
-`exit-01` 起的 SOCKS5 端口仍是 `7920+`，但只存在于主容器和 Compose 网络中。网关使用一个公共 Reality 端口，按 UUID 路由：
+主容器内部的 `7920+` 仍只在 Compose 网络中，使用 gateway 凭据。公网 SOCKS5 链接走 `kui-socks5-bridge` 发布的同名端口。网关使用一个公共 Reality 端口，按 UUID 路由：
 
 ```text
 exit-01 UUID ─┐
@@ -53,11 +55,11 @@ exit-02 UUID ─┼─ KUI_PUBLIC_HOST:KUI_REALITY_PORT ─ gateway ─ internal
 exit-03 UUID ─┘
 ```
 
-不要从宿主机或公网直连 `7920`。验证时在容器内运行：
+验证公网 SOCKS5 桥接：
 
 ```bash
-docker compose exec -T kui-local-multi-exit sh -lc \
-  'curl --fail --silent --show-error --socks5-hostname "$KUI_MANAGEMENT_USER:$KUI_MANAGEMENT_PASSWORD@127.0.0.1:7920" https://api.ipify.org'
+curl --fail --silent --show-error --socks5-hostname \
+  "$KUI_MANAGEMENT_USER:$KUI_MANAGEMENT_PASSWORD@127.0.0.1:7920" https://api.ipify.org
 ```
 
 Reality 不使用本机 HTTPS 证书，默认端口为 `8443`，不占用 `443`，也不改 OpenResty。旧版 `8444`–`8466` 每槽位链接已失效，升级后刷新订阅。
@@ -114,7 +116,8 @@ KUI_BRIDGE_TOP_N=16
 docker compose ps
 docker compose logs --tail=200 kui-local-multi-exit
 docker compose logs --tail=200 kui-reality-gateway
-docker stats kui-local-multi-exit kui-reality-gateway
+docker compose logs --tail=200 kui-socks5-bridge
+docker stats kui-local-multi-exit kui-reality-gateway kui-socks5-bridge
 ```
 
 公共 VPN 节点会暂时不可用。应查看槽位事件、换候选或降低 `KUI_SLOT_COUNT`；不要为了填满面板启动超过机器资源承受能力的并发隧道。

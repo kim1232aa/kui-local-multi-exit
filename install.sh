@@ -215,7 +215,7 @@ fi
 cd "$INSTALL_DIR"
 
 printf '%s\n' '[4/5] 构建并启动核心服务...'
-docker compose up -d --build kui-local-multi-exit kui-reality-gateway
+docker compose up -d --build kui-local-multi-exit kui-reality-gateway kui-socks5-bridge
 
 wait_healthy() {
     service=$1
@@ -236,6 +236,7 @@ wait_healthy() {
 printf '%s\n' '[5/5] 验证服务...'
 wait_healthy kui-local-multi-exit
 wait_healthy kui-reality-gateway
+wait_healthy kui-socks5-bridge
 docker compose exec -T kui-reality-gateway \
     kui-sing-box check -c /var/lib/kui-reality/config.json >/dev/null
 curl --noproxy '*' -fsS --max-time 10 \

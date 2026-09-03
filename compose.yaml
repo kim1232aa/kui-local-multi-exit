@@ -77,6 +77,40 @@ services:
       retries: 3
       start_period: 10s
 
+  kui-socks5-bridge:
+    build: .
+    container_name: kui-socks5-bridge
+    restart: unless-stopped
+    command: ["python3", "-m", "vps.socks5_bridge"]
+    depends_on:
+      kui-local-multi-exit:
+        condition: service_healthy
+    ports:
+      - "${KUI_SOCKS5_AUTO_PORT:-1080}:${KUI_SOCKS5_AUTO_PORT:-1080}/tcp"
+      - "7920-7953:7920-7953/tcp"
+    environment:
+      KUI_MANAGEMENT_USER: ${KUI_MANAGEMENT_USER:-admin}
+      KUI_MANAGEMENT_PASSWORD: ${KUI_MANAGEMENT_PASSWORD:?set KUI_MANAGEMENT_PASSWORD}
+      KUI_SLOT_COUNT: ${KUI_SLOT_COUNT:-auto}
+      KUI_REALITY_SOCKS_HOST: kui-local-multi-exit
+      KUI_REALITY_SOCKS_BASE_PORT: "7920"
+      KUI_SOCKS5_AUTO_PORT: ${KUI_SOCKS5_AUTO_PORT:-1080}
+      KUI_SOCKS5_BRIDGE_DATA_DIR: /var/lib/kui-socks5-bridge
+      KUI_SING_BOX_BIN: /usr/local/bin/sing-box
+      KUI_INTERNAL_PROXY_USER: ${KUI_INTERNAL_PROXY_USER:-}
+      KUI_INTERNAL_PROXY_PASSWORD: ${KUI_INTERNAL_PROXY_PASSWORD:-}
+      KUI_INTERNAL_PROXY_WORKSPACE: /opt/kui-local
+    volumes:
+      - kui-local-data:/opt/kui-local:ro
+      - kui-socks5-bridge-data:/var/lib/kui-socks5-bridge
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import os; from pathlib import Path; port = format(int(os.environ.get('KUI_SOCKS5_AUTO_PORT', '1080')), '04X'); listening = {line.split()[1].split(':')[1] for path in ('/proc/net/tcp', '/proc/net/tcp6') for line in Path(path).read_text().splitlines()[1:] if line.split()[3] == '0A'}; assert port in listening\""]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
 volumes:
   kui-local-data:
   kui-reality-data:
+  kui-socks5-bridge-data:
