@@ -25,7 +25,6 @@ IPPURE_URL = "https://ippure.cc/api/api.php"
 STREAM_URLS = (
     "https://www.google.com/",
     "https://chatgpt.com",
-    "https://cn.tradingview.com",
     "https://claude.ai",
 )
 

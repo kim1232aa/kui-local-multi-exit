@@ -9,7 +9,6 @@ from urllib.parse import quote, urlsplit
 TARGET_URLS = {
     "https://www.google.com/",
     "https://chatgpt.com",
-    "https://cn.tradingview.com",
     "https://claude.ai",
 }
 
