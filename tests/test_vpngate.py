@@ -448,9 +448,9 @@ class VPNGateFetchTest(unittest.TestCase):
             run=run,
         )
 
-        self.assertFalse(report["accepted"])
+        self.assertTrue(report["accepted"])
         self.assertTrue(report["base_ok"])
-        self.assertFalse(report["custom_ok"])
+        self.assertTrue(report["custom_ok"])
         self.assertEqual(list(target_codes), [attempt["url"] for attempt in report["attempts"]])
         self.assertEqual(
             ["204", "301", "403", "500", "000"],
@@ -484,13 +484,38 @@ class VPNGateFetchTest(unittest.TestCase):
             self.assertIn("cloudflare-dns.com:443:1.1.1.1", command)
             self.assertEqual("tun0", command[command.index("--interface") + 1])
 
-    def test_probe_targets_requires_every_custom_target_success(self):
+    def test_probe_targets_accepts_when_any_custom_target_succeeds(self):
         codes = {
             vpngate.DEFAULT_STREAM_URL: "204",
             "https://www.google.com/": "200",
             "https://chatgpt.com": "403",
             "https://cn.tradingview.com": "000",
             "https://claude.ai": "403",
+        }
+
+        class Result:
+            stderr = ""
+
+        def run(command, **_kwargs):
+            result = Result()
+            result.stdout = codes[command[-1]]
+            result.returncode = 0 if result.stdout != "000" else 28
+            return result
+
+        report = vpngate.probe_targets(
+            "tun0",
+            tuple(codes)[1:],
+            run=run,
+        )
+
+        self.assertTrue(report["accepted"])
+        self.assertTrue(report["custom_ok"])
+
+    def test_probe_targets_rejects_when_no_custom_target_succeeds(self):
+        codes = {
+            vpngate.DEFAULT_STREAM_URL: "204",
+            "https://www.google.com/": "500",
+            "https://chatgpt.com": "000",
         }
 
         class Result:
