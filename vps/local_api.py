@@ -1363,9 +1363,10 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         isp = self._cs_isp_short(self._slot_isp(slot).get("org"))
         return f"{country}{kind}·{isp}·{slot['id']}"
 
-    def _cf_tunnel_config(self) -> tuple[str, str, str]:
+    def _cf_tunnel_config(self) -> tuple[str, str, str] | None:
         """Returns (hostname, uuid, ws_path) for the Cloudflare tunnel origin.
-        Reads from environment variables, mounted secret files, or defaults."""
+        Reads from environment variables or mounted secret files.
+        Returns None when Cloudflare tunnel is not explicitly configured."""
         hostname = os.environ.get("KUI_CF_HOSTNAME", "").strip()
         if not hostname:
             for p in ("/run/cloudshell-secrets/cf-hostname", "/run/secrets/cf-hostname", "/run/origin/cf-hostname"):
@@ -1376,7 +1377,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 except OSError:
                     pass
         if not hostname:
-            hostname = "vps.alibb123.ccwu.cc"
+            return None
 
         uuid_val = os.environ.get("KUI_CF_UUID", "").strip()
         if not uuid_val:
@@ -1388,14 +1389,17 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 except OSError:
                     pass
         if not uuid_val:
-            uuid_val = "e799e3d5-6f8b-46cd-bb68-6dd38a20f2d0"
+            return None
 
         ws_path = os.environ.get("KUI_CF_PATH", "/vless").strip() or "/vless"
         return hostname, uuid_val, ws_path
 
     def _cf_front_entries(self) -> list[tuple[str, str]]:
         """Returns list of (server_domain_or_ip, display_name)."""
-        hostname, _, _ = self._cf_tunnel_config()
+        cfg = self._cf_tunnel_config()
+        if not cfg:
+            return []
+        hostname, _, _ = cfg
         custom_entries: list[tuple[str, str]] = []
         for p in ("/opt/kui-local/front-domains.txt", "/run/kui-reality/front-domains.txt"):
             try:
@@ -1438,7 +1442,10 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         ))
 
     def _cf_vless_link(self, domain: str, name: str) -> str:
-        hostname, uuid_val, path = self._cf_tunnel_config()
+        cfg = self._cf_tunnel_config()
+        if not cfg:
+            return ""
+        hostname, uuid_val, path = cfg
         qs = urllib.parse.urlencode({
             "type": "ws",
             "security": "tls",
@@ -1506,15 +1513,16 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         for node in thirdparty_nodes:
             add(node, extra_names)
 
-        cf_hostname, cf_uuid, cf_path = self._cf_tunnel_config()
-        cf_entries = self._cf_front_entries()
+        cf_cfg = self._cf_tunnel_config()
         cf_proxies: list[str] = []
         cf_names: list[str] = []
-        for domain, display_name in cf_entries:
-            normalized = self._unique_clash_node({"name": display_name}, used_names)
-            node_yaml = self._cf_vless_node(normalized["name"], domain, cf_path, cf_uuid, cf_hostname)
-            cf_proxies.append(node_yaml)
-            cf_names.append(normalized["name"])
+        if cf_cfg:
+            cf_hostname, cf_uuid, cf_path = cf_cfg
+            for domain, display_name in self._cf_front_entries():
+                normalized = self._unique_clash_node({"name": display_name}, used_names)
+                node_yaml = self._cf_vless_node(normalized["name"], domain, cf_path, cf_uuid, cf_hostname)
+                cf_proxies.append(node_yaml)
+                cf_names.append(normalized["name"])
 
         def q(value: str) -> str:
             return json.dumps(value, ensure_ascii=False)
@@ -1781,8 +1789,10 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.NOT_FOUND, {"code": "not_found", "error": "subscription not found"})
                 return
             links = [link for link in self._local_subscription_links() if link]
-            cf_links = [self._cf_vless_link(domain, name) for domain, name in self._cf_front_entries()]
-            links = cf_links + links
+            cf_entries = self._cf_front_entries()
+            if cf_entries:
+                cf_links = [link for domain, name in cf_entries if (link := self._cf_vless_link(domain, name))]
+                links = cf_links + links
             thirdparty_nodes = self.server.store.list_enabled_thirdparty_nodes()
             links.extend(
                 link

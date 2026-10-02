@@ -1315,10 +1315,40 @@ class LocalAPITest(unittest.TestCase):
         rocket_block = body[rocket_start:body.index("\n  - name:", rocket_start + 1)]
         self.assertIn(f'      - "{direct_name}"', rocket_block)
         self.assertIn(f'      - "{chain_name}"', rocket_block)
+        self.assertNotIn('  - name: "⚡ CF入口"', body)
+
+    def test_clash_subscription_includes_cf_entries_when_configured(self):
+        self.manager.set_slot_ready("exit-01")
+        manifest = Path(self.tempdir.name) / "reality-nodes.json"
+        manifest.write_text(
+            json.dumps({
+                "version": 1,
+                "nodes": [{
+                    "slot_id": "exit-01",
+                    "address": "198.51.100.1",
+                    "port": 8443,
+                    "uuid": "11111111-1111-1111-1111-111111111111",
+                    "sni": "addons.mozilla.org",
+                    "public_key": "abcdefghijklmnopqrstuvwxyzABCDEFGH1234567_",
+                    "short_id": "1122334455667788",
+                }],
+            }),
+            encoding="utf-8",
+        )
+        self.server.reality_nodes_file = manifest
+        status, data = self.request("/api/data")
+        token = data["mySubToken"]
+
+        with patch.dict(os.environ, {"KUI_CF_HOSTNAME": "cf.example.com", "KUI_CF_UUID": "99999999-9999-9999-9999-999999999999"}):
+            status, body = self.request(
+                f"/api/sub?user={data['mySubUser']}&token={token}&format=clash",
+                expect_json=False,
+            )
+
+        self.assertEqual(200, status)
         self.assertIn('  - name: "⚡ CF入口"', body)
         self.assertIn('  - name: "CF·本机"', body)
         self.assertIn('  - name: "CF优选·中国香港数码港"', body)
-        self.assertIn('      - "⚡ CF入口"', rocket_block)
 
     def test_subscription_excludes_disabled_local_exit_socks5_nodes(self):
         self.request("/api/local/exits/exit-01/disable", method="POST", body={})
