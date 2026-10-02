@@ -35,6 +35,43 @@ MAX_GITHUB_PROBE_DATA_BYTES = 4 * 1024 * 1024
 MAX_SUBSCRIPTION_BYTES = 4 * 1024 * 1024
 
 
+CF_PREFERRED_DOMAINS = [
+    ("vps.alibb123.ccwu.cc", "CF·本机"),
+    ("cyberport.hk", "CF优选·中国香港数码港"),
+    ("jebsen.com", "CF优选·中国香港捷成"),
+    ("transunion.hk", "CF优选·中国香港环联"),
+    ("tomleemusic.com", "CF优选·中国香港通利"),
+    ("three.com.hk", "CF优选·中国香港和记电讯"),
+    ("caritas.org.hk", "CF优选·中国香港明爱"),
+    ("www.aeon.info", "CF优选·中国香港永旺·www.aeon.info"),
+    ("cathaypacific.com", "CF优选·香港国泰航空"),
+    ("hongkongairport.com", "CF优选·香港机场"),
+    ("foodpanda.hk", "CF优选·香港富胖达"),
+    ("sasa.com", "CF优选·中国香港莎莎"),
+    ("stheadline.com", "CF优选·香港星岛头条"),
+    ("mplus.org.hk", "CF优选·香港M+博物馆"),
+    ("citysuper.com.hk", "CF优选·中国香港CitySuper"),
+    ("yesstyle.com", "CF优选·中国香港YesStyle"),
+    ("hk.jobsdb.com", "CF优选·中国香港JobsDB"),
+    ("yata.hk", "CF优选·中国香港一田百货"),
+    ("pfizer.com.hk", "CF优选·中国香港辉瑞"),
+    ("advantech.tw", "CF优选·中国台湾研华"),
+    ("zeekrlife.com", "CF优选·中国极氪汽车"),
+    ("deepin.org", "CF优选·中国深度系统"),
+    ("cn.ubuntu.com", "CF优选·中国鸟班图"),
+    ("nestle.com.cn", "CF优选·中国雀巢"),
+    ("yuntongxun.com", "CF优选·中国容联"),
+    ("70mai.com", "CF优选·中国70迈"),
+    ("fossil.com", "CF优选·中国Fossil"),
+    ("52pojie.cn", "CF优选·吾爱破解"),
+    ("cf.090227.xyz", "CF优选·090227"),
+    ("bestcf.030101.xyz", "CF优选·移动"),
+    ("saas.sin.fan", "CF优选·MIYU"),
+    ("www.visa.cn", "伪装·VISA"),
+    ("time.is", "伪装·TimeIs"),
+    ("cloudflare.com", "CF·cloudflare.com"),
+]
+
 class UnsupportedField(ValueError):
     """The client sent a field this endpoint does not implement."""
 
@@ -1326,11 +1363,85 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         isp = self._cs_isp_short(self._slot_isp(slot).get("org"))
         return f"{country}{kind}·{isp}·{slot['id']}"
 
+    def _cf_tunnel_config(self) -> tuple[str, str, str]:
+        """Returns (hostname, uuid, ws_path) for the Cloudflare tunnel origin.
+        Reads from environment variables, mounted secret files, or defaults."""
+        hostname = os.environ.get("KUI_CF_HOSTNAME", "").strip()
+        if not hostname:
+            for p in ("/run/cloudshell-secrets/cf-hostname", "/run/secrets/cf-hostname", "/run/origin/cf-hostname"):
+                try:
+                    hostname = Path(p).read_text(encoding="utf-8").strip()
+                    if hostname:
+                        break
+                except OSError:
+                    pass
+        if not hostname:
+            hostname = "vps.alibb123.ccwu.cc"
+
+        uuid_val = os.environ.get("KUI_CF_UUID", "").strip()
+        if not uuid_val:
+            for p in ("/run/cloudshell-secrets/uuid", "/run/secrets/uuid", "/run/origin/uuid"):
+                try:
+                    uuid_val = Path(p).read_text(encoding="utf-8").strip()
+                    if uuid_val:
+                        break
+                except OSError:
+                    pass
+        if not uuid_val:
+            uuid_val = "e799e3d5-6f8b-46cd-bb68-6dd38a20f2d0"
+
+        ws_path = os.environ.get("KUI_CF_PATH", "/vless").strip() or "/vless"
+        return hostname, uuid_val, ws_path
+
+    def _cf_front_entries(self) -> list[tuple[str, str]]:
+        """Returns list of (server_domain_or_ip, display_name)."""
+        hostname, _, _ = self._cf_tunnel_config()
+        custom_entries: list[tuple[str, str]] = []
+        for p in ("/opt/kui-local/front-domains.txt", "/run/kui-reality/front-domains.txt"):
+            try:
+                for line in Path(p).read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        parts = line.split(None, 1)
+                        if parts:
+                            custom_entries.append((parts[0], parts[1] if len(parts) > 1 else parts[0]))
+                if custom_entries:
+                    break
+            except OSError:
+                pass
+        if custom_entries:
+            return custom_entries
+
+        res = [(hostname, "CF·本机")]
+        for domain, name in CF_PREFERRED_DOMAINS:
+            if domain != hostname:
+                res.append((domain, name))
+        return res
+
+    @staticmethod
+    def _cf_vless_node(name: str, domain: str, path: str, uuid_val: str, host: str) -> str:
+        return "\n".join((
+            f"  - name: {json.dumps(name, ensure_ascii=False)}",
+            "    type: vless",
+            f"    server: {domain}",
+            "    port: 443",
+            f"    uuid: {json.dumps(uuid_val)}",
+            "    network: ws",
+            "    tls: true",
+            f"    servername: {json.dumps(host, ensure_ascii=False)}",
+            '    client-fingerprint: "chrome"',
+            "    udp: true",
+            "    ws-opts:",
+            f"      path: {json.dumps(path)}",
+            "      headers:",
+            f"        Host: {json.dumps(host, ensure_ascii=False)}",
+        ))
+
     def _clash_subscription_yaml(self, thirdparty_nodes: list[dict[str, Any]]) -> str:
         """Clash/Mihomo subscription in the cs-pa (Cloud Shell) layout:
         🚀 节点选择 / ⚡ 自动选择 / 🏠 住宅自动 + AI site groups + CN direct."""
         used_names = {
-            "🚀 节点选择", "⚡ 自动选择", "🏠 住宅自动", "VLESS-REALITY-链式",
+            "🚀 节点选择", "⚡ CF入口", "⚡ 自动选择", "🏠 住宅自动", "VLESS-REALITY-链式",
             "🧠 Claude", "🤖 ChatGPT", "🔵 Google·Gemini",
             "🌐 其他流量", "🇨🇳 中国流量", "DIRECT",
         }
@@ -1382,6 +1493,16 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         for node in thirdparty_nodes:
             add(node, extra_names)
 
+        cf_hostname, cf_uuid, cf_path = self._cf_tunnel_config()
+        cf_entries = self._cf_front_entries()
+        cf_proxies: list[str] = []
+        cf_names: list[str] = []
+        for domain, display_name in cf_entries:
+            normalized = self._unique_clash_node({"name": display_name}, used_names)
+            node_yaml = self._cf_vless_node(normalized["name"], domain, cf_path, cf_uuid, cf_hostname)
+            cf_proxies.append(node_yaml)
+            cf_names.append(normalized["name"])
+
         def q(value: str) -> str:
             return json.dumps(value, ensure_ascii=False)
 
@@ -1395,25 +1516,49 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         now = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
         lines = [
             f"# K-UI Local Multi-Exit subscription — generated {now} (dynamic)",
-            f"# {len(direct_names)} exit nodes ({len(pure_names)} residential + lenient) + {len(extra_names)} chained/third-party nodes",
+            f"# {len(cf_names)} CF front nodes + {len(direct_names)} exit nodes ({len(pure_names)} residential + lenient) + {len(extra_names)} chained/third-party nodes",
             "mixed-port: 7890",
             "allow-lan: false",
             "mode: rule",
             "log-level: warning",
         ]
-        if proxies:
+        all_proxy_lines = list(proxies)
+        if cf_proxies:
+            all_proxy_lines.extend(cf_proxies)
+
+        if all_proxy_lines:
             lines.append("proxies:")
-            lines.extend(proxies)
+            lines.extend(all_proxy_lines)
         else:
             lines.append("proxies: []")
 
         # Mihomo removed relay groups. Each residential exit gets a chain
         # clone with a fixed first-hop dialer, so the chain remains valid.
         chain_group_name = "VLESS-REALITY-链式" if chain_names else ""
+        cf_group_name = "⚡ CF入口" if cf_names else ""
 
         groups = ["proxy-groups:"]
-        groups.append('  - name: "🚀 节点选择"\n    type: select\n    proxies:\n' + lst(["⚡ 自动选择", "🏠 住宅自动", *([chain_group_name] if chain_group_name else []), *all_names, "DIRECT"]))
-        groups.append('  - name: "⚡ 自动选择"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 300\n    tolerance: 100\n    proxies:\n' + lst(direct_names))
+        rocket_proxies = [
+            *([cf_group_name] if cf_group_name else []),
+            "⚡ 自动选择",
+            "🏠 住宅自动",
+            *([chain_group_name] if chain_group_name else []),
+            *cf_names,
+            *all_names,
+            "DIRECT",
+        ]
+        groups.append('  - name: "🚀 节点选择"\n    type: select\n    proxies:\n' + lst(rocket_proxies))
+        if cf_group_name:
+            groups.append(
+                f'  - name: "{cf_group_name}"\n'
+                '    type: url-test\n'
+                '    url: "http://www.gstatic.com/generate_204"\n'
+                '    interval: 300\n'
+                '    tolerance: 100\n'
+                '    proxies:\n' + lst(cf_names)
+            )
+        auto_proxies = [*cf_names, *direct_names] if cf_names else direct_names
+        groups.append('  - name: "⚡ 自动选择"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 300\n    tolerance: 100\n    proxies:\n' + lst(auto_proxies))
         if pure_names:
             groups.append('  - name: "🏠 住宅自动"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 300\n    tolerance: 150\n    proxies:\n' + lst(pure_names))
         if chain_names:
@@ -1421,8 +1566,8 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         else:
             groups.append('  - name: "🏠 住宅自动"\n    type: select\n    proxies:\n      - "🚀 节点选择"')
         for grp in ("🧠 Claude", "🤖 ChatGPT", "🔵 Google·Gemini"):
-            groups.append(f'  - name: "{grp}"\n    type: select\n    proxies:\n' + lst(["🏠 住宅自动", "🚀 节点选择", "⚡ 自动选择", chain_group_name, *pure_names]))
-        groups.append(f'  - name: "🌐 其他流量"\n    type: select\n    proxies:\n' + lst(["🚀 节点选择", "⚡ 自动选择", "🏠 住宅自动", chain_group_name, "DIRECT"]))
+            groups.append(f'  - name: "{grp}"\n    type: select\n    proxies:\n' + lst(["🏠 住宅自动", "🚀 节点选择", *([cf_group_name] if cf_group_name else []), "⚡ 自动选择", chain_group_name, *pure_names]))
+        groups.append(f'  - name: "🌐 其他流量"\n    type: select\n    proxies:\n' + lst(["🚀 节点选择", *([cf_group_name] if cf_group_name else []), "⚡ 自动选择", "🏠 住宅自动", chain_group_name, "DIRECT"]))
         groups.append('  - name: "🇨🇳 中国流量"\n    type: select\n    proxies:\n' + lst(["DIRECT", "🚀 节点选择"]))
 
         rules = ["rules:"]

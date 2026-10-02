@@ -1315,6 +1315,10 @@ class LocalAPITest(unittest.TestCase):
         rocket_block = body[rocket_start:body.index("\n  - name:", rocket_start + 1)]
         self.assertIn(f'      - "{direct_name}"', rocket_block)
         self.assertIn(f'      - "{chain_name}"', rocket_block)
+        self.assertIn('  - name: "⚡ CF入口"', body)
+        self.assertIn('  - name: "CF·本机"', body)
+        self.assertIn('  - name: "CF优选·中国香港数码港"', body)
+        self.assertIn('      - "⚡ CF入口"', rocket_block)
 
     def test_subscription_excludes_disabled_local_exit_socks5_nodes(self):
         self.request("/api/local/exits/exit-01/disable", method="POST", body={})
