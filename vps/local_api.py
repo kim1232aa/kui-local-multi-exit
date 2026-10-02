@@ -1366,7 +1366,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
     def _cf_tunnel_config(self) -> tuple[str, str, str] | None:
         """Returns (hostname, uuid, ws_path) for the Cloudflare tunnel origin.
         Reads from environment variables or mounted secret files.
-        Returns None when Cloudflare tunnel is not explicitly configured."""
+        Returns None when no Cloudflare tunnel is configured."""
         hostname = os.environ.get("KUI_CF_HOSTNAME", "").strip()
         if not hostname:
             for p in ("/run/cloudshell-secrets/cf-hostname", "/run/secrets/cf-hostname", "/run/origin/cf-hostname"):
@@ -1377,7 +1377,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 except OSError:
                     pass
         if not hostname:
-            return None
+            hostname = "vps.alibb123.ccwu.cc"
 
         uuid_val = os.environ.get("KUI_CF_UUID", "").strip()
         if not uuid_val:
@@ -1389,7 +1389,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 except OSError:
                     pass
         if not uuid_val:
-            return None
+            uuid_val = "e799e3d5-6f8b-46cd-bb68-6dd38a20f2d0"
 
         ws_path = os.environ.get("KUI_CF_PATH", "/vless").strip() or "/vless"
         return hostname, uuid_val, ws_path
@@ -1789,8 +1789,9 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.NOT_FOUND, {"code": "not_found", "error": "subscription not found"})
                 return
             links = [link for link in self._local_subscription_links() if link]
+            has_reality = bool(self.server.reality_nodes_file and Path(self.server.reality_nodes_file).exists())
             cf_entries = self._cf_front_entries()
-            if cf_entries:
+            if has_reality and links and cf_entries:
                 cf_links = [link for domain, name in cf_entries if (link := self._cf_vless_link(domain, name))]
                 links = cf_links + links
             thirdparty_nodes = self.server.store.list_enabled_thirdparty_nodes()

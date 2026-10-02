@@ -1315,9 +1315,12 @@ class LocalAPITest(unittest.TestCase):
         rocket_block = body[rocket_start:body.index("\n  - name:", rocket_start + 1)]
         self.assertIn(f'      - "{direct_name}"', rocket_block)
         self.assertIn(f'      - "{chain_name}"', rocket_block)
-        self.assertNotIn('  - name: "⚡ CF入口"', body)
+        self.assertIn('  - name: "⚡ CF入口"', body)
+        self.assertIn('  - name: "CF·本机"', body)
+        self.assertIn('  - name: "CF优选·中国香港数码港"', body)
+        self.assertIn('      - "⚡ CF入口"', rocket_block)
 
-    def test_clash_subscription_includes_cf_entries_when_configured(self):
+    def test_clash_subscription_uses_custom_cf_hostname_when_configured(self):
         self.manager.set_slot_ready("exit-01")
         manifest = Path(self.tempdir.name) / "reality-nodes.json"
         manifest.write_text(
