@@ -294,6 +294,19 @@ class LocalStoreTest(unittest.TestCase):
         self.assertEqual({}, failed.current_node)
         self.assertEqual({}, failed.check_result)
 
+    def test_touch_slot_updates_timestamp_without_incrementing_generation(self):
+        slot = self.store.get_slot("exit-01")
+        initial_gen = slot.generation
+        initial_time = slot.updated_at - 100
+        with self.store._lock, self.store._connect() as db:
+            db.execute("UPDATE exit_slots SET updated_at = ? WHERE id = 'exit-01'", (initial_time,))
+
+        self.assertTrue(self.store.touch_slot("exit-01", generation=initial_gen))
+        updated = self.store.get_slot("exit-01")
+        self.assertEqual(initial_gen, updated.generation)
+        self.assertGreater(updated.updated_at, initial_time)
+        self.assertFalse(self.store.touch_slot("exit-01", generation=initial_gen + 999))
+
 
 if __name__ == "__main__":
     unittest.main()

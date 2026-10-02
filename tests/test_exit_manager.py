@@ -1,6 +1,7 @@
 import os
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -48,6 +49,9 @@ class FakeProcess:
 
     def wait(self, timeout=None):
         return 0
+
+    def poll(self):
+        return None
 
 
 class ExitManagerTest(unittest.TestCase):
@@ -1036,6 +1040,186 @@ class ExitManagerTest(unittest.TestCase):
 
         self.assertEqual(1, len(handled))
         self.assertIn("TestISP check failed", handled[0])
+
+    def _commit_ready_slot(self, slot_id="exit-01"):
+        generation = self.store.get_slot(slot_id).generation
+        self.manager.commit_ready(
+            slot_id,
+            generation,
+            entry_ip="198.51.100.1",
+            egress_ip="203.0.113.1",
+            node={"country": "JP"},
+            check_result={"is_residential": True},
+        )
+        runtime = self.manager.runtime(slot_id)
+        runtime.process = type("RunningProcess", (), {"poll": lambda self: None})()
+        self.manager.routing.is_installed = lambda _slot: True
+        (self.manager.workspace / "internal_proxy.json").write_text(
+            '{"version":1,"username":"kui-gateway","password":"pw"}', encoding="utf-8"
+        )
+        return generation, runtime
+
+    def test_verify_client_path_fails_slot_when_listener_stops_serving(self):
+        generation, runtime = self._commit_ready_slot()
+        self.manager.start_workers = True
+        scheduled = []
+        self.manager._schedule_retry = lambda slot_id, failed_generation, delay: scheduled.append(
+            (slot_id, failed_generation, delay)
+        )
+        self.manager.redial_slot = lambda _slot_id: self.fail("health worker must not redial itself")
+        results = iter([
+            type("CmdResult", (), {"returncode": 28, "stdout": "000"})(),
+            type("CmdResult", (), {"returncode": 28, "stdout": "000"})(),
+        ])
+        self.manager._run = lambda command, capture_output=True, text=True, check=False: next(results)
+        self.manager._sleep = lambda _seconds: None
+
+        self.manager._verify_client_path("exit-01", self.store.get_slot("exit-01"), generation)
+
+        failed = self.store.get_slot("exit-01")
+        self.assertTrue(failed.enabled)
+        self.assertEqual("failed", failed.state)
+        self.assertEqual(1, failed.failure_streak)
+        self.assertEqual("SOCKS listener not serving clients", failed.last_error)
+        self.assertEqual([("exit-01", failed.generation, 5)], scheduled)
+        self.assertTrue(runtime.stop.is_set())
+
+    def test_verify_client_path_accepts_working_listener(self):
+        generation, _runtime = self._commit_ready_slot()
+        handled = []
+        self.manager._handle_connection_failure = lambda *args, **kwargs: handled.append(args)
+        self.manager._run = lambda command, capture_output=True, text=True, check=False: type(
+            "CmdResult", (), {"returncode": 0, "stdout": "204"}
+        )()
+        self.manager._sleep = lambda _seconds: None
+
+        self.manager._verify_client_path("exit-01", self.store.get_slot("exit-01"), generation)
+
+        self.assertEqual([], handled)
+        self.assertEqual("ready", self.store.get_slot("exit-01").state)
+
+    def test_verify_client_path_skips_without_listener_credentials(self):
+        generation, _runtime = self._commit_ready_slot()
+        handled = []
+        self.manager._handle_connection_failure = lambda *args, **kwargs: handled.append(args)
+        self.manager._run = lambda *_args, **_kwargs: self.fail("probe must not run without credentials")
+
+        with patch("vps.exit_manager.load_internal_proxy_credentials", side_effect=RuntimeError("unavailable")):
+            self.manager._verify_client_path("exit-01", self.store.get_slot("exit-01"), generation)
+
+        self.assertEqual([], handled)
+        kinds = [event["kind"] for event in self.store.list_events(50)]
+        self.assertIn("health_check_skip", kinds)
+
+    def test_redial_revives_auto_disabled_slot(self):
+        generation = self.store.get_slot("exit-01").generation
+        self.manager.store.record_failure("exit-01", "boom", max_failures=1)
+        slot = self.store.get_slot("exit-01")
+        self.assertEqual("disabled", slot.state)
+        self.assertEqual("automatic_failure_limit", slot.disabled_reason)
+        started = []
+        self.manager.start_slot = lambda slot_id: started.append(slot_id) or slot
+
+        self.manager.redial_slot("exit-01")
+
+        revived = self.store.get_slot("exit-01")
+        self.assertTrue(revived.enabled)
+        self.assertEqual("idle", revived.state)
+        self.assertEqual("", revived.disabled_reason)
+        self.assertEqual(0, revived.failure_streak)
+        self.assertEqual(["exit-01"], started)
+        self.assertNotEqual(generation, revived.generation)
+
+    def test_refresh_loop_redials_stale_ready_slot(self):
+        slot_id = "exit-01"
+        stale_time = int(time.time()) - 3600
+        with self.store._lock, self.store._connect() as db:
+            db.execute(
+                "UPDATE exit_slots SET state = 'ready', enabled = 1, entry_ip = ?, updated_at = ? WHERE id = ?",
+                ("198.51.100.1", stale_time, slot_id),
+            )
+        redialed = []
+        self.manager.redial_slot = lambda slot: redialed.append(slot)
+        self.manager._shutdown = threading.Event()
+
+        self.manager._try_recover_stale_slots()
+
+        self.assertEqual([slot_id], redialed)
+
+    def test_refresh_loop_leaves_fresh_slots_alone(self):
+        with self.store._lock, self.store._connect() as db:
+            db.execute(
+                "UPDATE exit_slots SET state = 'ready', enabled = 1, entry_ip = ?, updated_at = ? WHERE id = 'exit-01'",
+                ("198.51.100.1", int(time.time())),
+            )
+        redialed = []
+        self.manager.redial_slot = lambda slot: redialed.append(slot)
+
+        self.manager._try_recover_stale_slots()
+
+        self.assertEqual([], redialed)
+
+    def test_health_loop_refreshes_updated_at_on_successful_probe(self):
+        slot_id = "exit-01"
+        slot = self.store.get_slot(slot_id)
+        generation = slot.generation
+        old_time = int(time.time()) - 200
+        with self.store._lock, self.store._connect() as db:
+            db.execute("UPDATE exit_slots SET state = 'ready', updated_at = ? WHERE id = ?", (old_time, slot_id))
+
+        runtime = self.manager.runtime(slot_id)
+        runtime.process = FakeProcess()
+        runtime.stop = threading.Event()
+        self.manager.routing.is_installed = lambda _s: True
+
+        with patch.object(runtime.stop, "wait", side_effect=[False, True]):
+            with patch("vps.exit_manager.probe_204", return_value=True):
+                self.manager._health_loop(slot_id, generation, stop_event=runtime.stop)
+
+        refreshed = self.store.get_slot(slot_id)
+        self.assertGreater(refreshed.updated_at, old_time)
+
+    def test_start_slot_replaces_stopping_worker(self):
+        slot_id = "exit-01"
+        runtime = self.manager.runtime(slot_id)
+        runtime.stop = threading.Event()
+        runtime.stop.set()
+        started_event = threading.Event()
+
+        def slow_worker():
+            started_event.set()
+            time.sleep(0.05)
+
+        old_t = threading.Thread(target=slow_worker)
+        old_t.start()
+        started_event.wait(timeout=1)
+        runtime.worker = old_t
+
+        self.manager.start_workers = True
+        with patch.object(self.manager, "_connect_worker"):
+            slot = self.manager.start_slot(slot_id)
+
+        self.assertEqual("connecting", slot.state)
+        self.assertIsNotNone(runtime.worker)
+        self.assertIsNot(runtime.worker, old_t)
+        self.assertFalse(runtime.stop.is_set())
+
+    def test_refresh_loop_recovers_idle_unsupervised_slot(self):
+        slot_id = "exit-01"
+        with self.store._lock, self.store._connect() as db:
+            db.execute("UPDATE exit_slots SET state = 'ready' WHERE id != ?", (slot_id,))
+            db.execute(
+                "UPDATE exit_slots SET state = 'idle', enabled = 1, updated_at = ? WHERE id = ?",
+                (int(time.time()) - 500, slot_id),
+            )
+        started = []
+        self.manager.start_slot = lambda sid: started.append(sid)
+
+        self.manager._try_recover_idle_slots()
+
+        self.assertEqual([slot_id], started)
+        kinds = [e["kind"] for e in self.store.list_events(10) if e["slot_id"] == slot_id]
+        self.assertIn("auto_recovery", kinds)
 
 
 if __name__ == "__main__":

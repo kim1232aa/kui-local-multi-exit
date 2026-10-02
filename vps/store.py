@@ -467,6 +467,19 @@ class LocalStore:
             row = db.execute("SELECT * FROM exit_slots WHERE id = ?", (slot_id,)).fetchone()
         return self._row_to_slot(row)
 
+    def touch_slot(self, slot_id: str, generation: int | None = None) -> bool:
+        """Update slot updated_at without modifying its state or incrementing generation."""
+        now = int(time.time())
+        with self._lock, self._connect() as db:
+            if generation is None:
+                cursor = db.execute("UPDATE exit_slots SET updated_at = ? WHERE id = ?", (now, slot_id))
+            else:
+                cursor = db.execute(
+                    "UPDATE exit_slots SET updated_at = ? WHERE id = ? AND generation = ?",
+                    (now, slot_id, int(generation)),
+                )
+            return cursor.rowcount == 1
+
     def replace_vpn_nodes(self, nodes: list[dict[str, Any]], *, retention_days: int = 30) -> None:
         """Merge the latest provider snapshot into a rolling OpenVPN history pool."""
         now = int(time.time())

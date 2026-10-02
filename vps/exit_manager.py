@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .models import ExitSlotSnapshot
+from .internal_proxy import load_internal_proxy_credentials
 from .openvpn_sources import fetch_all_openvpn_nodes
 from .proxy_server import ProxyListener
 from .routing import RouteManager
@@ -30,10 +31,13 @@ class SlotRuntime:
     stop: threading.Event | None = None
     lock: threading.RLock | None = None
     preferred_node_ip: str = ""
+    last_verify: float = 0.0
 
 
 COUNTRY_FALLBACK_AFTER_FAILURES = 2
 COUNTRY_SLOT_FAILURE_LIMIT = 5
+HEALTH_VERIFY_INTERVAL_SECONDS = 180
+STALE_SLOT_AFTER_SECONDS = 1800
 
 
 class ExitManager:
@@ -174,11 +178,56 @@ class ExitManager:
         next_refresh = time.time() + refresh_interval
         while not self._shutdown.wait(recovery_interval):
             self._try_recover_auto_disabled_slots()
+            self._try_recover_idle_slots()
+            self._try_recover_stale_slots()
             if time.time() >= next_refresh:
                 count = self.refresh_nodes()
                 if count > 0:
                     self._try_recover_auto_disabled_slots()
                 next_refresh = time.time() + refresh_interval
+
+    def _try_recover_idle_slots(self) -> None:
+        """Recover enabled managed slots that have no active worker or retry timer.
+
+        If a slot is enabled but left in 'idle' or an orphaned state without an
+        active connection worker or scheduled retry, restart it automatically so
+        transient races or deadlocks never cause slots to stay dead silently.
+        """
+        for slot in self._managed_slots():
+            if not slot.enabled or slot.state == "ready":
+                continue
+            runtime = self.runtime(slot.id)
+            assert runtime.lock is not None
+            with runtime.lock:
+                worker_active = runtime.worker is not None and runtime.worker.is_alive()
+                has_timer = runtime.retry_timer is not None
+            if not worker_active and not has_timer:
+                self.store.record_event(
+                    slot.id,
+                    "auto_recovery",
+                    "idle slot restarted by self-healing loop",
+                )
+                self.start_slot(slot.id)
+
+    def _try_recover_stale_slots(self) -> None:
+        """Re-dial slots whose runtime record stopped making progress.
+
+        A dead health thread leaves the slot in ``ready`` forever, so the
+        record itself is the last-resort liveness signal: when a ready slot
+        has not been touched for ``STALE_SLOT_AFTER_SECONDS`` while other
+        slots still commit, force a redial.
+        """
+        stale_after = STALE_SLOT_AFTER_SECONDS
+        with self._selection_lock:
+            slots = self._managed_slots()
+        any_recent = any(slot.updated_at > time.time() - stale_after for slot in slots)
+        for slot in slots:
+            if slot.state != "ready" or not slot.enabled:
+                continue
+            if not any_recent or time.time() - slot.updated_at < stale_after:
+                continue
+            self.store.record_event(slot.id, "auto_recovery", "ready slot went stale; forcing redial")
+            self.redial_slot(slot.id)
 
     def _try_recover_auto_disabled_slots(self) -> None:
         """Recover only managed slots that have an eligible unreserved node."""
@@ -223,11 +272,29 @@ class ExitManager:
             return slot
         runtime = self.runtime(slot_id)
         assert runtime.lock is not None and runtime.stop is not None
+
+        old_worker = None
         with runtime.lock:
             if runtime.worker is not None:
-                if runtime.worker.is_alive():
+                if runtime.worker.is_alive() and not runtime.stop.is_set() and slot.state in {"connecting", "ready"}:
                     return slot
-                runtime.worker = None
+                old_worker = runtime.worker
+
+        if old_worker is not None and old_worker is not threading.current_thread():
+            old_worker.join(timeout=3)
+
+        with runtime.lock:
+            current_slot = self.store.get_slot(slot_id)
+            if not current_slot.enabled:
+                return current_slot
+            if (
+                runtime.worker is not None
+                and runtime.worker.is_alive()
+                and not runtime.stop.is_set()
+                and current_slot.state in {"connecting", "ready"}
+            ):
+                return current_slot
+            runtime.worker = None
             if runtime.retry_timer:
                 runtime.retry_timer.cancel()
                 runtime.retry_timer = None
@@ -285,11 +352,10 @@ class ExitManager:
                 self.store.set_runtime(slot_id, state="idle", entry_ip="", egress_ip="", current_node={}, check_result={})
             worker = runtime.worker
         if worker is not None and worker is not threading.current_thread():
-            worker.join(timeout=2)
-            if not worker.is_alive():
-                with runtime.lock:
-                    if runtime.worker is worker:
-                        runtime.worker = None
+            worker.join(timeout=3)
+            with runtime.lock:
+                if runtime.worker is worker and not worker.is_alive():
+                    runtime.worker = None
 
     def redial_slot(self, slot_id: str) -> ExitSlotSnapshot:
         self._require_managed_slot(slot_id)
@@ -299,7 +365,9 @@ class ExitManager:
         self.stop_slot(slot_id, stop_listener=False)
         updated = self.store.get_slot(slot_id)
         if not updated.enabled:
-            updated = self.store.update_slot(slot_id, enabled=True)
+            # A manual redial is an explicit recovery request: lift any
+            # automatic disable instead of returning a dead slot.
+            updated = self.store.enable_slot(slot_id)
         self.store.record_event(slot_id, "redial", "manual redial requested")
         return self.start_slot(updated.id)
 
@@ -860,6 +928,11 @@ class ExitManager:
                 return
             if probe_204(current.tunnel_name, self._run):
                 failures = 0
+                now = time.time()
+                self.store.touch_slot(slot_id, generation)
+                if now - runtime.last_verify >= HEALTH_VERIFY_INTERVAL_SECONDS:
+                    runtime.last_verify = now
+                    self._verify_client_path(slot_id, current, generation)
                 continue
             failures += 1
             if failures >= 2:
@@ -874,6 +947,54 @@ class ExitManager:
                 self._handle_connection_failure(slot_id, generation, error, current.entry_ip)
                 return
 
+    def _verify_client_path(
+        self,
+        slot_id: str,
+        slot: ExitSlotSnapshot,
+        generation: int,
+    ) -> None:
+        """Fail the slot when its local SOCKS listener stops serving clients.
+
+        probe_204 only exercises the tunnel itself. A stuck listener serves
+        nothing even though the tunnel is healthy, so the check runs through
+        the client entry (127.0.0.1:proxy_port) with listener credentials.
+        """
+        runtime = self.runtime(slot_id)
+        assert runtime.lock is not None
+        with runtime.lock:
+            listener = runtime.listener
+        if listener is None:
+            return
+        try:
+            username, password = load_internal_proxy_credentials(str(self.workspace))
+        except (RuntimeError, ValueError) as error:
+            self.store.record_event(slot_id, "health_check_skip", str(error))
+            return
+        failures = 0
+        while failures < 2 and not self._worker_is_stale(slot_id, generation, runtime.stop):
+            result = self._run(
+                [
+                    "curl",
+                    "-o", "/dev/null",
+                    "-s", "-w", "%{http_code}",
+                    "-m", "10",
+                    "-x", f"socks5h://{username}:{password}@127.0.0.1:{slot.proxy_port}",
+                    "https://www.gstatic.com/generate_204",
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0 and _probe_status_ok(getattr(result, "stdout", "")):
+                self.store.touch_slot(slot_id, generation)
+                return
+            failures += 1
+            if failures < 2:
+                self._sleep(2)
+        error = "SOCKS listener not serving clients"
+        self.store.record_event(slot_id, "health_check_failed", f"{error}, triggering retry")
+        self._handle_connection_failure(slot_id, generation, error, slot.entry_ip)
+
     def snapshot(self) -> list[dict[str, Any]]:
         return [slot.as_dict() for slot in self._managed_slots()]
 
@@ -884,3 +1005,13 @@ class ExitManager:
         self._shutdown.set()
         for slot_id in self._managed_slot_ids:
             self.stop_slot(slot_id)
+
+
+def _probe_status_ok(stdout: Any) -> bool:
+    code = str(stdout or "").strip()
+    if not re.fullmatch(r"[0-9]{3}", code):
+        return False
+    if code == "000":
+        return False
+    status = int(code)
+    return 200 <= status < 300 or 400 <= status < 500 and status != 407
