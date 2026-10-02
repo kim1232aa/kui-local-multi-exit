@@ -20,6 +20,18 @@ from .slot_config import (
 
 
 DEFAULT_COUNTRIES = (
+    "JP", "JP", "JP", "JP", "JP", "JP", "JP", "JP",
+    "KR", "KR", "KR", "KR", "KR", "KR", "KR", "KR",
+    "US", "US", "US", "US", "US", "US", "US", "US",
+)
+SLOT_COUNTRIES = DEFAULT_COUNTRIES + (
+    "JP", "JP", "JP", "JP",
+    "KR", "KR", "KR", "KR",
+    "US", "US",
+)
+ALLOWED_COUNTRIES = {"JP", "KR", "US"}
+LEGACY_ANY_COUNTRIES = ("ANY",) * 20 + ("VN", "VN", "TH", "TH")
+LEGACY_MULTI_COUNTRIES = (
     "JP", "JP", "JP", "JP",
     "KR", "KR", "KR", "KR",
     "US", "US", "CA", "CA",
@@ -27,8 +39,6 @@ DEFAULT_COUNTRIES = (
     "FR", "FR", "RU", "RU",
     "VN", "VN", "TH", "TH",
 )
-SLOT_COUNTRIES = DEFAULT_COUNTRIES + ("ANY",) * (MAX_SLOT_COUNT - LEGACY_SLOT_COUNT)
-LEGACY_ANY_COUNTRIES = ("ANY",) * 20 + ("VN", "VN", "TH", "TH")
 VALID_STATES = {"idle", "starting", "connecting", "ready", "degraded", "failed", "disabled"}
 
 
@@ -267,17 +277,10 @@ class LocalStore:
                     (f"exit-{index + 1:02d}", country, BASE_PROXY_PORT + index, f"tun{index}", BASE_ROUTE_TABLE + index, BASE_ROUTE_TABLE + index, now),
                 )
 
-            # Migrate only the exact legacy deployment pattern. Custom country
-            # assignments must never be overwritten during startup.
             country_rows = db.execute("SELECT id, country FROM exit_slots ORDER BY id").fetchall()
-            if (
-                len(country_rows) >= LEGACY_SLOT_COUNT
-                and tuple(row["id"] for row in country_rows[:LEGACY_SLOT_COUNT])
-                == tuple(f"exit-{index:02d}" for index in range(1, LEGACY_SLOT_COUNT + 1))
-                and tuple(row["country"] for row in country_rows[:LEGACY_SLOT_COUNT]) == LEGACY_ANY_COUNTRIES
-                and all(row["country"] == "ANY" for row in country_rows[LEGACY_SLOT_COUNT:])
-            ):
-                for index, country in enumerate(DEFAULT_COUNTRIES, start=1):
+            any_disallowed = any(row["country"] not in ALLOWED_COUNTRIES for row in country_rows)
+            if any_disallowed:
+                for index, country in enumerate(SLOT_COUNTRIES[:slot_count], start=1):
                     db.execute(
                         """
                         UPDATE exit_slots
@@ -288,7 +291,7 @@ class LocalStore:
                     )
                 db.execute(
                     "INSERT INTO events (slot_id, kind, message, created_at) VALUES (NULL, ?, ?, ?)",
-                    ("country_template_migrated", "restored country-targeted 24-slot template", now),
+                    ("country_template_migrated", "migrated slots to strict JP/KR/US template", now),
                 )
 
     @staticmethod

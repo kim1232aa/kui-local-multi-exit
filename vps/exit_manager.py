@@ -239,8 +239,12 @@ class ExitManager:
                 if slot.enabled or slot.disabled_reason != "automatic_failure_limit":
                     continue
                 node = self._select_node(slot.country, excluded)
-                if node is None and slot.country != "ANY":
-                    node = self._select_node("ANY", excluded, excluded_countries={slot.country})
+                if node is None:
+                    for fb in ("JP", "KR", "US"):
+                        if fb != slot.country:
+                            node = self._select_node(fb, excluded)
+                            if node is not None:
+                                break
                 if node is None:
                     continue
                 recoverable.append(slot.id)
@@ -596,7 +600,8 @@ class ExitManager:
             node = self.node_pool.select(country, skipped)
             if not node:
                 return None
-            if node.get("country") not in excluded_countries and self._node_eligible(node):
+            node_country = str(node.get("country") or "").upper()
+            if node_country in {"JP", "KR", "US"} and node_country not in excluded_countries and self._node_eligible(node):
                 return node
             skipped.add(node["ip"])
 
@@ -617,16 +622,22 @@ class ExitManager:
             fallback = False
             if node is None and preferred_ip:
                 node = self._select_node(country, excluded)
-            elif node is None and country != "ANY" and allow_country_fallback:
-                node = self._select_node("ANY", excluded, excluded_countries={country})
-                fallback = node is not None
-                if node is None:
-                    node = self._select_node(country, excluded)
+            elif node is None and allow_country_fallback:
+                fallback_pool = [c for c in ("JP", "KR", "US") if c != country]
+                for fb_country in fallback_pool:
+                    node = self._select_node(fb_country, excluded)
+                    if node is not None:
+                        fallback = True
+                        break
             elif node is None:
                 node = self._select_node(country, excluded)
-                if node is None and country != "ANY":
-                    node = self._select_node("ANY", excluded, excluded_countries={country})
-                    fallback = node is not None
+                if node is None:
+                    fallback_pool = [c for c in ("JP", "KR", "US") if c != country]
+                    for fb_country in fallback_pool:
+                        node = self._select_node(fb_country, excluded)
+                        if node is not None:
+                            fallback = True
+                            break
             if node:
                 node.pop("country_fallback", None)
                 node.pop("target_country", None)
@@ -845,6 +856,9 @@ class ExitManager:
                     raw = residential_result.get("raw") if isinstance(residential_result.get("raw"), dict) else {}
                     geo = raw.get("geo") if isinstance(raw.get("geo"), dict) else {}
                     actual_country = str(geo.get("country_code") or "").upper()
+                    if actual_country and actual_country not in {"JP", "KR", "US"}:
+                        self.node_pool.penalize(endpoint_ip, 50000)
+                        raise RuntimeError(f"egress country {actual_country} not allowed (only JP/KR/US permitted)")
                     if (
                         slot.country != "ANY"
                         and not node.get("country_fallback")

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from vps.store import DEFAULT_COUNTRIES, LEGACY_ANY_COUNTRIES, LocalStore
+from vps.store import DEFAULT_COUNTRIES, LEGACY_ANY_COUNTRIES, LocalStore, SLOT_COUNTRIES
 
 
 class LocalStoreTest(unittest.TestCase):
@@ -31,10 +31,10 @@ class LocalStoreTest(unittest.TestCase):
         expanded.initialize(slot_count=34)
         slots = expanded.list_slots()
         self.assertEqual(34, len(slots))
-        self.assertEqual(["ANY"] * 10, [slot.country for slot in slots[24:]])
+        self.assertEqual(list(SLOT_COUNTRIES[24:]), [slot.country for slot in slots[24:]])
         self.assertEqual(7953, slots[-1].proxy_port)
 
-    def test_initialize_migrates_only_exact_legacy_any_country_pattern(self):
+    def test_initialize_migrates_disallowed_country_pattern(self):
         for slot, country in zip(self.store.list_slots(), LEGACY_ANY_COUNTRIES):
             self.store.update_slot(slot.id, country=country)
 
@@ -44,16 +44,16 @@ class LocalStoreTest(unittest.TestCase):
         events = self.store.list_events(limit=10)
         self.assertTrue(any(event["kind"] == "country_template_migrated" for event in events))
 
-    def test_initialize_preserves_custom_country_pattern(self):
-        for slot, country in zip(self.store.list_slots(), LEGACY_ANY_COUNTRIES):
-            self.store.update_slot(slot.id, country=country)
+    def test_initialize_preserves_valid_jp_kr_us_pattern(self):
         self.store.update_slot("exit-01", country="US")
+        self.store.update_slot("exit-02", country="KR")
+        self.store.update_slot("exit-03", country="JP")
 
         self.store.initialize()
 
         self.assertEqual("US", self.store.get_slot("exit-01").country)
-        self.assertEqual("ANY", self.store.get_slot("exit-02").country)
-        self.assertEqual("VN", self.store.get_slot("exit-21").country)
+        self.assertEqual("KR", self.store.get_slot("exit-02").country)
+        self.assertEqual("JP", self.store.get_slot("exit-03").country)
 
     def test_initialize_creates_only_requested_slots_and_never_removes_existing_slots(self):
         limited_path = Path(self.tempdir.name) / "limited.db"
@@ -72,15 +72,15 @@ class LocalStoreTest(unittest.TestCase):
         expanded_path = Path(self.tempdir.name) / "expanded.db"
         expanded = LocalStore(expanded_path)
         expanded.initialize(slot_count=24)
-        expanded.update_slot("exit-01", country="CA", enabled=False)
+        expanded.update_slot("exit-01", country="KR", enabled=False)
 
         expanded.initialize(slot_count=34)
 
         slots = expanded.list_slots()
         self.assertEqual(34, len(slots))
-        self.assertEqual("CA", slots[0].country)
+        self.assertEqual("KR", slots[0].country)
         self.assertFalse(slots[0].enabled)
-        self.assertEqual(["ANY"] * 10, [slot.country for slot in slots[24:]])
+        self.assertEqual(list(SLOT_COUNTRIES[24:]), [slot.country for slot in slots[24:]])
         self.assertEqual(7953, slots[-1].proxy_port)
 
     def test_initialize_rejects_invalid_slot_count(self):

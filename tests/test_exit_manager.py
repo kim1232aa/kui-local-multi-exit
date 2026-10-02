@@ -316,6 +316,29 @@ class ExitManagerTest(unittest.TestCase):
         self.assertTrue(selected["country_fallback"])
         self.assertEqual("US", selected["target_country"])
 
+    def test_select_node_only_accepts_jp_kr_us_nodes(self):
+        self.manager.node_pool.replace([
+            {"ip": "198.51.100.1", "country": "HR", "ping": 1, "score": 100, "config": "proto tcp\n"},
+            {"ip": "198.51.100.2", "country": "FI", "ping": 2, "score": 90, "config": "proto tcp\n"},
+            {"ip": "198.51.100.3", "country": "DE", "ping": 3, "score": 80, "config": "proto tcp\n"},
+            {"ip": "198.51.100.4", "country": "JP", "ping": 4, "score": 70, "config": "proto tcp\n"},
+        ])
+        selected = self.manager._select_node("JP", set())
+        self.assertIsNotNone(selected)
+        self.assertEqual("198.51.100.4", selected["ip"])
+        self.assertIsNone(self.manager._select_node("HR", set()))
+        self.assertIsNone(self.manager._select_node("FI", set()))
+
+    def test_country_fallback_restricted_to_jp_kr_us(self):
+        self.manager.node_pool.replace([
+            {"ip": "198.51.100.1", "country": "HR", "ping": 1, "score": 100, "config": "proto tcp\n"},
+            {"ip": "198.51.100.2", "country": "KR", "ping": 2, "score": 90, "config": "proto tcp\n"},
+        ])
+        selected = self.manager._reserve_node("exit-01", "JP", allow_country_fallback=True)
+        self.assertIsNotNone(selected)
+        self.assertEqual("KR", selected["country"])
+        self.assertEqual("198.51.100.2", selected["ip"])
+
     def test_commit_ready_allows_only_marked_country_fallback(self):
         self.store.update_slot("exit-01", country="US")
         generation = self.store.get_slot("exit-01").generation
