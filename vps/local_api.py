@@ -36,7 +36,6 @@ MAX_SUBSCRIPTION_BYTES = 4 * 1024 * 1024
 
 
 CF_PREFERRED_DOMAINS = [
-    ("vps.alibb123.ccwu.cc", "CF·本机"),
     ("cyberport.hk", "CF优选·中国香港数码港"),
     ("jebsen.com", "CF优选·中国香港捷成"),
     ("transunion.hk", "CF优选·中国香港环联"),
@@ -1377,7 +1376,15 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 except OSError:
                     pass
         if not hostname:
-            hostname = "vps.alibb123.ccwu.cc"
+            req_host = self._request_proxy_host()
+            if req_host and not req_host.replace(".", "").isdigit():
+                hostname = req_host
+            else:
+                pub = os.environ.get("KUI_PUBLIC_HOST", "").strip()
+                if pub and not pub.replace(".", "").isdigit():
+                    hostname = pub
+                else:
+                    hostname = req_host or "127.0.0.1"
 
         uuid_val = os.environ.get("KUI_CF_UUID", "").strip()
         if not uuid_val:
