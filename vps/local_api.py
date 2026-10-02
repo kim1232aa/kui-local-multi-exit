@@ -1437,6 +1437,19 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             f"        Host: {json.dumps(host, ensure_ascii=False)}",
         ))
 
+    def _cf_vless_link(self, domain: str, name: str) -> str:
+        hostname, uuid_val, path = self._cf_tunnel_config()
+        qs = urllib.parse.urlencode({
+            "type": "ws",
+            "security": "tls",
+            "sni": hostname,
+            "fp": "chrome",
+            "path": path,
+            "host": hostname,
+            "encryption": "none",
+        })
+        return f"vless://{uuid_val}@{domain}:443?{qs}#{urllib.parse.quote(name)}"
+
     def _clash_subscription_yaml(self, thirdparty_nodes: list[dict[str, Any]]) -> str:
         """Clash/Mihomo subscription in the cs-pa (Cloud Shell) layout:
         🚀 节点选择 / ⚡ 自动选择 / 🏠 住宅自动 + AI site groups + CN direct."""
@@ -1768,6 +1781,8 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.NOT_FOUND, {"code": "not_found", "error": "subscription not found"})
                 return
             links = [link for link in self._local_subscription_links() if link]
+            cf_links = [self._cf_vless_link(domain, name) for domain, name in self._cf_front_entries()]
+            links = cf_links + links
             thirdparty_nodes = self.server.store.list_enabled_thirdparty_nodes()
             links.extend(
                 link
