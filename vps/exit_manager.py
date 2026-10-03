@@ -499,15 +499,11 @@ class ExitManager:
         check_result: dict[str, Any],
     ) -> bool:
         current = self.store.get_slot(slot_id)
-        node_country = str(node.get("country") or "")
-        fallback_matches = (
-            bool(node.get("country_fallback"))
-            and str(node.get("target_country") or "") == current.country
-        )
+        node_country = str(node.get("country") or "").upper()
         if (
             not current.enabled
             or current.generation != generation
-            or (current.country not in {"ANY", node_country} and not fallback_matches)
+            or current.country != node_country
         ):
             return False
         runtime = self.runtime(slot_id)
@@ -613,37 +609,18 @@ class ExitManager:
         *,
         allow_country_fallback: bool = False,
     ) -> dict[str, Any] | None:
+        del allow_country_fallback
         with self._selection_lock:
             self._reserved_nodes.pop(slot_id, None)
             excluded = self.active_entry_ips(excluding=slot_id)
             node = self.node_pool.get(preferred_ip, country) if preferred_ip else None
             if node is not None and (node["ip"] in excluded or not self._node_eligible(node)):
                 node = None
-            fallback = False
-            if node is None and preferred_ip:
+            if node is None:
                 node = self._select_node(country, excluded)
-            elif node is None and allow_country_fallback:
-                fallback_pool = [c for c in ("JP", "KR", "US") if c != country]
-                for fb_country in fallback_pool:
-                    node = self._select_node(fb_country, excluded)
-                    if node is not None:
-                        fallback = True
-                        break
-            elif node is None:
-                node = self._select_node(country, excluded)
-                if node is None:
-                    fallback_pool = [c for c in ("JP", "KR", "US") if c != country]
-                    for fb_country in fallback_pool:
-                        node = self._select_node(fb_country, excluded)
-                        if node is not None:
-                            fallback = True
-                            break
             if node:
                 node.pop("country_fallback", None)
                 node.pop("target_country", None)
-                if fallback:
-                    node["country_fallback"] = True
-                    node["target_country"] = country
                 self._reserved_nodes[slot_id] = str(node["ip"])
             return node
 
@@ -740,7 +717,8 @@ class ExitManager:
 
     @staticmethod
     def _country_fallback_allowed(slot: ExitSlotSnapshot) -> bool:
-        return slot.country != "ANY" and slot.failure_streak >= COUNTRY_FALLBACK_AFTER_FAILURES
+        del slot
+        return False
 
     def _connect_worker(self, slot_id: str, generation: int) -> None:
         self._require_managed_slot(slot_id)

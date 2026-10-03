@@ -36,39 +36,25 @@ MAX_SUBSCRIPTION_BYTES = 4 * 1024 * 1024
 
 
 CF_PREFERRED_DOMAINS = [
+    ("saas.sin.fan", "CF优选·MIYU"),
     ("cyberport.hk", "CF优选·中国香港数码港"),
     ("jebsen.com", "CF优选·中国香港捷成"),
     ("transunion.hk", "CF优选·中国香港环联"),
-    ("tomleemusic.com", "CF优选·中国香港通利"),
-    ("three.com.hk", "CF优选·中国香港和记电讯"),
-    ("caritas.org.hk", "CF优选·中国香港明爱"),
-    ("www.aeon.info", "CF优选·中国香港永旺·www.aeon.info"),
-    ("cathaypacific.com", "CF优选·香港国泰航空"),
+    ("www.aeon.info", "CF优选·中国香港永旺"),
     ("hongkongairport.com", "CF优选·香港机场"),
     ("foodpanda.hk", "CF优选·香港富胖达"),
     ("sasa.com", "CF优选·中国香港莎莎"),
-    ("stheadline.com", "CF优选·香港星岛头条"),
-    ("mplus.org.hk", "CF优选·香港M+博物馆"),
     ("citysuper.com.hk", "CF优选·中国香港CitySuper"),
     ("yesstyle.com", "CF优选·中国香港YesStyle"),
     ("hk.jobsdb.com", "CF优选·中国香港JobsDB"),
     ("yata.hk", "CF优选·中国香港一田百货"),
     ("pfizer.com.hk", "CF优选·中国香港辉瑞"),
     ("advantech.tw", "CF优选·中国台湾研华"),
-    ("zeekrlife.com", "CF优选·中国极氪汽车"),
     ("deepin.org", "CF优选·中国深度系统"),
-    ("cn.ubuntu.com", "CF优选·中国鸟班图"),
-    ("nestle.com.cn", "CF优选·中国雀巢"),
-    ("yuntongxun.com", "CF优选·中国容联"),
-    ("70mai.com", "CF优选·中国70迈"),
     ("fossil.com", "CF优选·中国Fossil"),
-    ("52pojie.cn", "CF优选·吾爱破解"),
     ("cf.090227.xyz", "CF优选·090227"),
     ("bestcf.030101.xyz", "CF优选·移动"),
-    ("saas.sin.fan", "CF优选·MIYU"),
-    ("www.visa.cn", "CF优选·VISA"),
     ("time.is", "CF优选·TimeIs"),
-    ("cloudflare.com", "CF·cloudflare.com"),
 ]
 
 class UnsupportedField(ValueError):
@@ -1401,41 +1387,100 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         ws_path = os.environ.get("KUI_CF_PATH", "/vless").strip() or "/vless"
         return hostname, uuid_val, ws_path
 
-    def _cf_front_entries(self) -> list[tuple[str, str]]:
-        """Returns list of (server_domain_or_ip, display_name)."""
+    @staticmethod
+    def _parse_front_domain_line(line: str) -> tuple[str, int, str] | None:
+        """Parse domain line supporting:
+        domain:port#tag
+        domain#tag
+        domain:port tag
+        domain:port
+        domain tag
+        domain
+        """
+        raw = line.strip()
+        if not raw or raw.startswith("#"):
+            return None
+        tag = ""
+        if "#" in raw:
+            raw, tag = raw.split("#", 1)
+            raw = raw.strip()
+            tag = tag.strip()
+        elif " " in raw or "\t" in raw:
+            parts = raw.split(None, 1)
+            raw = parts[0].strip()
+            tag = parts[1].strip() if len(parts) > 1 else ""
+
+        port = 443
+        domain = raw
+        if ":" in raw:
+            host_part, port_part = raw.rsplit(":", 1)
+            if port_part.isdigit() and 1 <= int(port_part) <= 65535:
+                domain = host_part.strip()
+                port = int(port_part)
+
+        if not domain:
+            return None
+        if not tag:
+            tag = f"{domain}:{port}" if port != 443 else domain
+        return domain, port, tag
+
+    def _cf_front_entries(self) -> list[tuple[str, int, str]]:
+        """Returns list of (server_domain_or_ip, port, display_name)."""
         cfg = self._cf_tunnel_config()
         if not cfg:
             return []
         hostname, _, _ = cfg
-        custom_entries: list[tuple[str, str]] = []
-        for p in ("/opt/kui-local/front-domains.txt", "/run/kui-reality/front-domains.txt"):
+        custom_entries: list[tuple[str, int, str]] = []
+
+        # Check explicit source URL or local path
+        src_env = os.environ.get("KUI_CF_DOMAINS_SOURCE", "").strip()
+        if src_env.startswith(("http://", "https://")):
             try:
-                for line in Path(p).read_text(encoding="utf-8").splitlines():
-                    line = line.strip()
-                    if line and not line.startswith("#"):
-                        parts = line.split(None, 1)
-                        if parts:
-                            custom_entries.append((parts[0], parts[1] if len(parts) > 1 else parts[0]))
-                if custom_entries:
-                    break
+                req = urllib.request.Request(src_env, headers={"User-Agent": "curl/7.68.0"})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    text = resp.read().decode("utf-8", errors="replace")
+                    for line in text.splitlines():
+                        parsed = self._parse_front_domain_line(line)
+                        if parsed:
+                            custom_entries.append(parsed)
+            except Exception:
+                pass
+        elif src_env:
+            try:
+                for line in Path(src_env).read_text(encoding="utf-8").splitlines():
+                    parsed = self._parse_front_domain_line(line)
+                    if parsed:
+                        custom_entries.append(parsed)
             except OSError:
                 pass
+        else:
+            for p in ("/opt/kui-local/front-domains.txt", "/run/kui-reality/front-domains.txt"):
+                try:
+                    for line in Path(p).read_text(encoding="utf-8").splitlines():
+                        parsed = self._parse_front_domain_line(line)
+                        if parsed:
+                            custom_entries.append(parsed)
+                    if custom_entries:
+                        break
+                except OSError:
+                    pass
+
         if custom_entries:
             return custom_entries
 
-        res = [(hostname, "CF·本机")]
+        res = [(hostname, 443, "CF·本机")]
         for domain, name in CF_PREFERRED_DOMAINS:
             if domain != hostname:
-                res.append((domain, name))
+                res.append((domain, 443, name))
         return res
 
     @staticmethod
-    def _cf_vless_node(name: str, domain: str, path: str, uuid_val: str, host: str) -> str:
+    def _cf_vless_node(name: str, domain: str, path: str, uuid_val: str, host: str, port: int = 443) -> str:
         return "\n".join((
             f"  - name: {json.dumps(name, ensure_ascii=False)}",
             "    type: vless",
             f"    server: {domain}",
-            "    port: 443",
+            f"    port: {int(port)}",
             f"    uuid: {json.dumps(uuid_val)}",
             "    network: ws",
             "    tls: true",
@@ -1448,7 +1493,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             f"        Host: {json.dumps(host, ensure_ascii=False)}",
         ))
 
-    def _cf_vless_link(self, domain: str, name: str) -> str:
+    def _cf_vless_link(self, domain: str, name: str, port: int = 443) -> str:
         cfg = self._cf_tunnel_config()
         if not cfg:
             return ""
@@ -1462,7 +1507,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             "host": hostname,
             "encryption": "none",
         })
-        return f"vless://{uuid_val}@{domain}:443?{qs}#{urllib.parse.quote(name)}"
+        return f"vless://{uuid_val}@{domain}:{int(port)}?{qs}#{urllib.parse.quote(name)}"
 
     def _clash_subscription_yaml(self, thirdparty_nodes: list[dict[str, Any]]) -> str:
         """Clash/Mihomo subscription in the cs-pa (Cloud Shell) layout:
@@ -1525,9 +1570,9 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         cf_names: list[str] = []
         if cf_cfg:
             cf_hostname, cf_uuid, cf_path = cf_cfg
-            for domain, display_name in self._cf_front_entries():
+            for domain, port, display_name in self._cf_front_entries():
                 normalized = self._unique_clash_node({"name": display_name}, used_names)
-                node_yaml = self._cf_vless_node(normalized["name"], domain, cf_path, cf_uuid, cf_hostname)
+                node_yaml = self._cf_vless_node(normalized["name"], domain, cf_path, cf_uuid, cf_hostname, port=port)
                 cf_proxies.append(node_yaml)
                 cf_names.append(normalized["name"])
 
@@ -1585,7 +1630,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 '    tolerance: 100\n'
                 '    proxies:\n' + lst(cf_names)
             )
-        auto_proxies = [*cf_names, *direct_names] if cf_names else direct_names
+        auto_proxies = direct_names if direct_names else (cf_names or ["DIRECT"])
         groups.append('  - name: "⚡ 自动选择"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 300\n    tolerance: 100\n    proxies:\n' + lst(auto_proxies))
         if pure_names:
             groups.append('  - name: "🏠 住宅自动"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 300\n    tolerance: 150\n    proxies:\n' + lst(pure_names))
@@ -1594,7 +1639,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         else:
             groups.append('  - name: "🏠 住宅自动"\n    type: select\n    proxies:\n      - "🚀 节点选择"')
         for grp in ("🧠 Claude", "🤖 ChatGPT", "🔵 Google·Gemini"):
-            groups.append(f'  - name: "{grp}"\n    type: select\n    proxies:\n' + lst(["🏠 住宅自动", "🚀 节点选择", *([cf_group_name] if cf_group_name else []), "⚡ 自动选择", chain_group_name, *pure_names]))
+            groups.append(f'  - name: "{grp}"\n    type: select\n    proxies:\n' + lst(["🏠 住宅自动", "🚀 节点选择", *([cf_group_name] if cf_group_name else []), "⚡ 自动选择", chain_group_name, *pure_names, "DIRECT"]))
         groups.append(f'  - name: "🌐 其他流量"\n    type: select\n    proxies:\n' + lst(["🚀 节点选择", *([cf_group_name] if cf_group_name else []), "⚡ 自动选择", "🏠 住宅自动", chain_group_name, "DIRECT"]))
         groups.append('  - name: "🇨🇳 中国流量"\n    type: select\n    proxies:\n' + lst(["DIRECT", "🚀 节点选择"]))
 
@@ -1799,7 +1844,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             has_reality = bool(self.server.reality_nodes_file and Path(self.server.reality_nodes_file).exists())
             cf_entries = self._cf_front_entries()
             if has_reality and links and cf_entries:
-                cf_links = [link for domain, name in cf_entries if (link := self._cf_vless_link(domain, name))]
+                cf_links = [link for domain, port, name in cf_entries if (link := self._cf_vless_link(domain, name, port=port))]
                 links = cf_links + links
             thirdparty_nodes = self.server.store.list_enabled_thirdparty_nodes()
             links.extend(

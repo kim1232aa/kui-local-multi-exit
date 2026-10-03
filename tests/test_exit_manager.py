@@ -287,18 +287,15 @@ class ExitManagerTest(unittest.TestCase):
         self.assertEqual("US", selected["country"])
         self.assertNotIn("country_fallback", selected)
 
-    def test_country_slot_falls_back_when_target_pool_is_empty(self):
+    def test_country_slot_strictly_requires_target_country(self):
         self.manager.node_pool.replace(
             [{"ip": "198.51.100.1", "country": "JP", "ping": 1, "score": 100, "config": "proto tcp\n"}]
         )
 
         selected = self.manager._reserve_node("exit-01", "US")
+        self.assertIsNone(selected)
 
-        self.assertEqual("JP", selected["country"])
-        self.assertTrue(selected["country_fallback"])
-        self.assertEqual("US", selected["target_country"])
-
-    def test_country_slot_uses_non_target_fallback_after_target_failures(self):
+    def test_country_slot_never_falls_back_to_other_country_after_failures(self):
         self.manager.node_pool.replace(
             [
                 {"ip": "198.51.100.1", "country": "US", "ping": 1, "score": 100, "config": "proto tcp\n"},
@@ -312,9 +309,8 @@ class ExitManagerTest(unittest.TestCase):
             allow_country_fallback=True,
         )
 
-        self.assertEqual("JP", selected["country"])
-        self.assertTrue(selected["country_fallback"])
-        self.assertEqual("US", selected["target_country"])
+        self.assertEqual("US", selected["country"])
+        self.assertNotIn("country_fallback", selected)
 
     def test_select_node_only_accepts_jp_kr_us_nodes(self):
         self.manager.node_pool.replace([
@@ -329,17 +325,7 @@ class ExitManagerTest(unittest.TestCase):
         self.assertIsNone(self.manager._select_node("HR", set()))
         self.assertIsNone(self.manager._select_node("FI", set()))
 
-    def test_country_fallback_restricted_to_jp_kr_us(self):
-        self.manager.node_pool.replace([
-            {"ip": "198.51.100.1", "country": "HR", "ping": 1, "score": 100, "config": "proto tcp\n"},
-            {"ip": "198.51.100.2", "country": "KR", "ping": 2, "score": 90, "config": "proto tcp\n"},
-        ])
-        selected = self.manager._reserve_node("exit-01", "JP", allow_country_fallback=True)
-        self.assertIsNotNone(selected)
-        self.assertEqual("KR", selected["country"])
-        self.assertEqual("198.51.100.2", selected["ip"])
-
-    def test_commit_ready_allows_only_marked_country_fallback(self):
+    def test_commit_ready_rejects_country_mismatch(self):
         self.store.update_slot("exit-01", country="US")
         generation = self.store.get_slot("exit-01").generation
 
@@ -356,7 +342,7 @@ class ExitManagerTest(unittest.TestCase):
             generation,
             entry_ip="198.51.100.2",
             egress_ip="203.0.113.2",
-            node={"country": "JP", "country_fallback": True, "target_country": "US"},
+            node={"country": "US"},
             check_result={"is_residential": True},
         )
 
@@ -364,15 +350,16 @@ class ExitManagerTest(unittest.TestCase):
         self.assertTrue(accepted)
         slot = self.store.get_slot("exit-01")
         self.assertEqual("US", slot.country)
-        self.assertTrue(slot.current_node["country_fallback"])
+        self.assertEqual("US", slot.current_node["country"])
+        self.assertNotIn("country_fallback", slot.current_node)
 
-    def test_country_fallback_starts_only_after_two_target_failures(self):
+    def test_country_fallback_disabled_always_false(self):
         slot = self.store.get_slot("exit-01")
         self.assertFalse(self.manager._country_fallback_allowed(slot))
         self.store.set_runtime("exit-01", failure_streak=1)
         self.assertFalse(self.manager._country_fallback_allowed(self.store.get_slot("exit-01")))
-        self.store.set_runtime("exit-01", failure_streak=2)
-        self.assertTrue(self.manager._country_fallback_allowed(self.store.get_slot("exit-01")))
+        self.store.set_runtime("exit-01", failure_streak=5)
+        self.assertFalse(self.manager._country_fallback_allowed(self.store.get_slot("exit-01")))
 
     def test_country_connection_failure_limit_leaves_three_fallback_attempts(self):
         self.manager.start_workers = False

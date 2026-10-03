@@ -1293,7 +1293,7 @@ class LocalAPITest(unittest.TestCase):
             "sni": "bridge.example.com",
         }
 
-        with patch("vps.local_api.load_bridge_nodes", return_value=[bridge]):
+        with patch("vps.local_api.load_bridge_nodes", return_value=[bridge]), patch.dict(os.environ, {"KUI_CF_DOMAINS_SOURCE": "/nonexistent"}):
             status, body = self.request(
                 f"/api/sub?user={data['mySubUser']}&token={token}&format=clash",
                 expect_json=False,
@@ -1318,7 +1318,21 @@ class LocalAPITest(unittest.TestCase):
         self.assertIn('  - name: "⚡ CF入口"', body)
         self.assertIn('  - name: "CF·本机"', body)
         self.assertIn('  - name: "CF优选·中国香港数码港"', body)
+        self.assertNotIn("tomleemusic.com", body)
+        self.assertNotIn("cathaypacific.com", body)
         self.assertIn('      - "⚡ CF入口"', rocket_block)
+
+        # 验证 ⚡ 自动选择 不与 CF入口 重复，只包含真实出口
+        auto_start = body.index('  - name: "⚡ 自动选择"')
+        auto_block = body[auto_start:body.index("\n  - name:", auto_start + 1)]
+        self.assertIn(f'      - "{direct_name}"', auto_block)
+        self.assertNotIn("CF·", auto_block)
+
+        # 验证 AI 分流组均包含 DIRECT 选项
+        for grp in ("🧠 Claude", "🤖 ChatGPT", "🔵 Google·Gemini"):
+            grp_start = body.index(f'  - name: "{grp}"')
+            grp_block = body[grp_start:body.index("\n  - name:", grp_start + 1) if "\n  - name:" in body[grp_start + 1:] else len(body)]
+            self.assertIn('      - "DIRECT"', grp_block)
 
     def test_clash_subscription_uses_custom_cf_hostname_when_configured(self):
         self.manager.set_slot_ready("exit-01")
@@ -1342,7 +1356,11 @@ class LocalAPITest(unittest.TestCase):
         status, data = self.request("/api/data")
         token = data["mySubToken"]
 
-        with patch.dict(os.environ, {"KUI_CF_HOSTNAME": "cf.example.com", "KUI_CF_UUID": "99999999-9999-9999-9999-999999999999"}):
+        with patch.dict(os.environ, {
+            "KUI_CF_HOSTNAME": "cf.example.com",
+            "KUI_CF_UUID": "99999999-9999-9999-9999-999999999999",
+            "KUI_CF_DOMAINS_SOURCE": "/nonexistent",
+        }):
             status, body = self.request(
                 f"/api/sub?user={data['mySubUser']}&token={token}&format=clash",
                 expect_json=False,
@@ -1352,6 +1370,32 @@ class LocalAPITest(unittest.TestCase):
         self.assertIn('  - name: "⚡ CF入口"', body)
         self.assertIn('  - name: "CF·本机"', body)
         self.assertIn('  - name: "CF优选·中国香港数码港"', body)
+
+    def test_clash_subscription_parses_custom_ports_and_tags_from_front_domains_source(self):
+        self.manager.set_slot_ready("exit-01")
+        custom_file = Path(self.tempdir.name) / "custom-front.txt"
+        custom_file.write_text(
+            "www.blibli.com:8443#SG 电信优选[www.blibli.com 51ms]\n"
+            "jobsdb.com:2053#SG 电信优选[jobsdb.com 51ms]\n"
+            "plain.example.com:2096\n",
+            encoding="utf-8",
+        )
+        status, data = self.request("/api/data")
+        token = data["mySubToken"]
+
+        with patch.dict(os.environ, {"KUI_CF_DOMAINS_SOURCE": str(custom_file)}):
+            status, body = self.request(
+                f"/api/sub?user={data['mySubUser']}&token={token}&format=clash",
+                expect_json=False,
+            )
+
+        self.assertEqual(200, status)
+        self.assertIn('  - name: "SG 电信优选[www.blibli.com 51ms]"', body)
+        self.assertIn("    server: www.blibli.com\n    port: 8443", body)
+        self.assertIn('  - name: "SG 电信优选[jobsdb.com 51ms]"', body)
+        self.assertIn("    server: jobsdb.com\n    port: 2053", body)
+        self.assertIn('  - name: "plain.example.com:2096"', body)
+        self.assertIn("    server: plain.example.com\n    port: 2096", body)
 
     def test_subscription_excludes_disabled_local_exit_socks5_nodes(self):
         self.request("/api/local/exits/exit-01/disable", method="POST", body={})
