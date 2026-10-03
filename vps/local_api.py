@@ -1484,9 +1484,10 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             f"    uuid: {json.dumps(uuid_val)}",
             "    network: ws",
             "    tls: true",
+            "    udp: false",
+            "    skip-cert-verify: true",
             f"    servername: {json.dumps(host, ensure_ascii=False)}",
             '    client-fingerprint: "chrome"',
-            "    udp: true",
             "    ws-opts:",
             f"      path: {json.dumps(path)}",
             "      headers:",
@@ -1506,6 +1507,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             "path": path,
             "host": hostname,
             "encryption": "none",
+            "allowInsecure": "1",
         })
         return f"vless://{uuid_val}@{domain}:{int(port)}?{qs}#{urllib.parse.quote(name)}"
 
