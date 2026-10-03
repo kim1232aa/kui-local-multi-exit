@@ -66,8 +66,8 @@ CF_PREFERRED_DOMAINS = [
     ("cf.090227.xyz", "CF优选·090227"),
     ("bestcf.030101.xyz", "CF优选·移动"),
     ("saas.sin.fan", "CF优选·MIYU"),
-    ("www.visa.cn", "伪装·VISA"),
-    ("time.is", "伪装·TimeIs"),
+    ("www.visa.cn", "CF优选·VISA"),
+    ("time.is", "CF优选·TimeIs"),
     ("cloudflare.com", "CF·cloudflare.com"),
 ]
 
@@ -1384,7 +1384,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 if pub and not pub.replace(".", "").isdigit():
                     hostname = pub
                 else:
-                    hostname = req_host or "127.0.0.1"
+                    hostname = "mvp.alibb123.ccwu.cc"
 
         uuid_val = os.environ.get("KUI_CF_UUID", "").strip()
         if not uuid_val:

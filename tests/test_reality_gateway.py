@@ -133,6 +133,33 @@ class TestRealityGateway(unittest.TestCase):
         self.assertEqual(["exit-02"], rule["auth_user"])
         self.assertEqual("openvpn-exit-02", rule["outbound"])
 
+    def test_build_sing_box_config_with_ws_inbound(self):
+        identities = {
+            f"exit-{i:02d}": {
+                "slot_id": f"exit-{i:02d}",
+                "uuid": f"00000000-0000-0000-0000-{i:012d}",
+                "private_key": "privkeybase64testsample123456789012345678",
+                "public_key": "pubkeybase64testsample123456789012345678",
+                "short_id": "01234567",
+            }
+            for i in range(1, 4)
+        }
+
+        config = build_sing_box_config(
+            identities,
+            ws_port=8085,
+            ws_path="/vless",
+            cf_uuid="e799e3d5-6f8b-46cd-bb68-6dd38a20f2d0",
+        )
+
+        self.assertEqual(2, len(config["inbounds"]))
+        ws_inbound = next(inb for inb in config["inbounds"] if inb["tag"] == "vless-ws")
+        self.assertEqual(8085, ws_inbound["listen_port"])
+        self.assertEqual("/vless", ws_inbound["transport"]["path"])
+        user_names = [u["name"] for u in ws_inbound["users"]]
+        self.assertIn("cf-default", user_names)
+        self.assertIn("direct", [outb["tag"] for outb in config["outbounds"]])
+
     def test_build_public_nodes_manifest_no_secrets(self):
         identities = {
             "exit-01": {

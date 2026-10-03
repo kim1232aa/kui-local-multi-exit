@@ -157,6 +157,9 @@ def build_sing_box_config(
     sni: str = "dl.google.com",
     proxy_user: str = "vpn",
     proxy_password: str = "vpn",
+    ws_port: int | None = None,
+    ws_path: str = "/vless",
+    cf_uuid: str | None = None,
     **legacy: Any,
 ) -> dict[str, Any]:
     """Build one VLESS Reality inbound and route each authenticated UUID by name."""
@@ -187,36 +190,65 @@ def build_sing_box_config(
         }
         for slot_id in sorted_slots
     ]
-    rules = [
+    inbound_tags = ["xtls-reality"]
+    inbounds = [
         {
-            "inbound": ["xtls-reality"],
+            "type": "vless",
+            "tag": "xtls-reality",
+            "listen": "0.0.0.0",
+            "listen_port": int(reality_port),
+            "users": users,
+            "tls": {
+                "enabled": True,
+                "server_name": sni,
+                "reality": {
+                    "enabled": True,
+                    "handshake": {"server": sni, "server_port": 443},
+                    "private_key": str(first["private_key"]),
+                    "short_id": [str(first["short_id"])],
+                },
+            },
+        }
+    ]
+    rules = []
+    if ws_port is not None:
+        inbound_tags.append("vless-ws")
+        cf_default_uuid = str(cf_uuid or "e799e3d5-6f8b-46cd-bb68-6dd38a20f2d0")
+        ws_users = [{"name": slot_id, "uuid": str(identities[slot_id]["uuid"])} for slot_id in sorted_slots]
+        ws_users.append({"name": "cf-default", "uuid": cf_default_uuid})
+        inbounds.append({
+            "type": "vless",
+            "tag": "vless-ws",
+            "listen": "0.0.0.0",
+            "listen_port": int(ws_port),
+            "users": ws_users,
+            "transport": {
+                "type": "ws",
+                "path": ws_path or "/vless",
+            },
+        })
+        outbounds.append({
+            "type": "direct",
+            "tag": "direct",
+        })
+        rules.append({
+            "inbound": ["vless-ws"],
+            "auth_user": ["cf-default"],
+            "action": "route",
+            "outbound": "direct",
+        })
+
+    for slot_id in sorted_slots:
+        rules.append({
+            "inbound": list(inbound_tags),
             "auth_user": [slot_id],
             "action": "route",
             "outbound": f"openvpn-{slot_id}",
-        }
-        for slot_id in sorted_slots
-    ]
+        })
+
     return {
         "log": {"level": "info"},
-        "inbounds": [
-            {
-                "type": "vless",
-                "tag": "xtls-reality",
-                "listen": "0.0.0.0",
-                "listen_port": int(reality_port),
-                "users": users,
-                "tls": {
-                    "enabled": True,
-                    "server_name": sni,
-                    "reality": {
-                        "enabled": True,
-                        "handshake": {"server": sni, "server_port": 443},
-                        "private_key": str(first["private_key"]),
-                        "short_id": [str(first["short_id"])],
-                    },
-                },
-            }
-        ],
+        "inbounds": inbounds,
         "outbounds": outbounds,
         "route": {"rules": rules},
     }
@@ -338,6 +370,9 @@ def run_gateway(
     config_file = Path(os.environ.get("KUI_REALITY_CONFIG_FILE", str(data_dir / "config.json")))
     nodes_file = Path(os.environ.get("KUI_REALITY_NODES_FILE", "/run/kui-reality/public-nodes.json"))
     bin_name = sing_box_bin or os.environ.get("KUI_SING_BOX_BIN", "sing-box")
+    ws_port = _env_int("KUI_VLESS_WS_PORT", 0, minimum=0, maximum=65535) or None
+    cf_uuid = os.environ.get("KUI_CF_UUID", "e799e3d5-6f8b-46cd-bb68-6dd38a20f2d0").strip() or "e799e3d5-6f8b-46cd-bb68-6dd38a20f2d0"
+    ws_path = os.environ.get("KUI_CF_PATH", "/vless").strip() or "/vless"
 
     public_host = get_public_ip()
     identities = load_or_create_identities(identities_file, count=count)
@@ -349,6 +384,9 @@ def run_gateway(
         sni=sni,
         proxy_user=proxy_user,
         proxy_password=proxy_password,
+        ws_port=ws_port,
+        ws_path=ws_path,
+        cf_uuid=cf_uuid,
     )
     manifest_dict = build_public_nodes_manifest(
         identities,

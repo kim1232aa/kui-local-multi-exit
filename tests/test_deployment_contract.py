@@ -32,6 +32,7 @@ class DeploymentContractTest(unittest.TestCase):
         self.assertIn("kui-reality-gateway:", compose)
         self.assertIn("kui-reality-data:", compose)
         self.assertIn('"${KUI_REALITY_PORT:-8443}:${KUI_REALITY_PORT:-8443}/tcp"', compose)
+        self.assertIn('"${KUI_VLESS_WS_PORT:-8085}:${KUI_VLESS_WS_PORT:-8085}/tcp"', compose)
         self.assertIn("kui-socks5-bridge:", compose)
         self.assertIn('command: ["python3", "-m", "vps.socks5_bridge"]', compose)
         self.assertIn("7920-7953:7920-7953/tcp", compose)

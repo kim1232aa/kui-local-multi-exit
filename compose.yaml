@@ -53,6 +53,7 @@ services:
         condition: service_healthy
     ports:
       - "${KUI_REALITY_PORT:-8443}:${KUI_REALITY_PORT:-8443}/tcp"
+      - "${KUI_VLESS_WS_PORT:-8085}:${KUI_VLESS_WS_PORT:-8085}/tcp"
     environment:
       KUI_PUBLIC_HOST: ${KUI_PUBLIC_HOST:-}
       KUI_REALITY_NODES_FILE: /run/kui-reality/public-nodes.json
@@ -60,6 +61,7 @@ services:
       KUI_REALITY_SOCKS_HOST: kui-local-multi-exit
       KUI_REALITY_SOCKS_BASE_PORT: "7920"
       KUI_REALITY_PORT: ${KUI_REALITY_PORT:-8443}
+      KUI_VLESS_WS_PORT: ${KUI_VLESS_WS_PORT:-8085}
       KUI_SLOT_COUNT: ${KUI_SLOT_COUNT:-auto}
       KUI_REALITY_SNI: ${KUI_REALITY_SNI:-addons.mozilla.org}
       KUI_SING_BOX_BIN: /usr/local/bin/sing-box
