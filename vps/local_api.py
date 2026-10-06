@@ -1362,15 +1362,11 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 except OSError:
                     pass
         if not hostname:
-            req_host = self._request_proxy_host()
-            if req_host and not req_host.replace(".", "").isdigit():
-                hostname = req_host
+            pub = os.environ.get("KUI_PUBLIC_HOST", "").strip()
+            if pub and not pub.replace(".", "").isdigit():
+                hostname = pub
             else:
-                pub = os.environ.get("KUI_PUBLIC_HOST", "").strip()
-                if pub and not pub.replace(".", "").isdigit():
-                    hostname = pub
-                else:
-                    hostname = "mvp.alibb123.ccwu.cc"
+                hostname = "vps.alibb123.ccwu.cc"
 
         uuid_val = os.environ.get("KUI_CF_UUID", "").strip()
         if not uuid_val:
