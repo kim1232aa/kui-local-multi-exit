@@ -1511,6 +1511,42 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         })
         return f"vless://{uuid_val}@{domain}:{int(port)}?{qs}#{urllib.parse.quote(name)}"
 
+    @staticmethod
+    def _cf_slot_vless_node(
+        name: str, domain: str, slot_id: str, uuid_val: str, host: str, port: int = 443
+    ) -> str:
+        num = slot_id.split("-", 1)[-1] if "-" in slot_id else slot_id
+        path = f"/res-{int(num):02d}" if num.isdigit() else f"/res-{num}"
+        return "\n".join((
+            f"  - name: {json.dumps(name, ensure_ascii=False)}",
+            "    type: vless",
+            f"    server: {domain}",
+            f"    port: {int(port)}",
+            f"    uuid: {json.dumps(uuid_val)}",
+            "    network: ws",
+            "    tls: true",
+            f"    servername: {json.dumps(host, ensure_ascii=False)}",
+            '    client-fingerprint: "chrome"',
+            "    udp: true",
+            "    ws-opts:",
+            f"      path: {json.dumps(path)}",
+            "      headers:",
+            f"        Host: {json.dumps(host, ensure_ascii=False)}",
+        ))
+
+    @staticmethod
+    def _cf_domain_for_slot(slot_id: str, cdn_entries: list[tuple[str, int, str]]) -> tuple[str, int]:
+        if not cdn_entries:
+            return "vps.alibb123.ccwu.cc", 443
+        num = slot_id.split("-", 1)[-1] if "-" in slot_id else slot_id
+        if num.isdigit():
+            idx = (int(num) - 1) % len(cdn_entries)
+        else:
+            import zlib
+            idx = zlib.crc32(slot_id.encode()) % len(cdn_entries)
+        entry = cdn_entries[idx]
+        return entry[0], entry[1]
+
     def _clash_subscription_yaml(self, thirdparty_nodes: list[dict[str, Any]]) -> str:
         """Clash/Mihomo subscription in the cs-pa (Cloud Shell) layout:
         🚀 节点选择 / ⚡ 自动选择 / 🏠 住宅自动 + AI site groups + CN direct."""
@@ -1534,6 +1570,13 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             bucket.append(entry[0])
             return entry[0]
 
+        cf_cfg = self._cf_tunnel_config()
+        cf_hostname, cf_uuid, cf_path = cf_cfg if cf_cfg else ("", "", "")
+        cf_entries = self._cf_front_entries()
+        cdn_domains = [(d, p, n) for d, p, n in cf_entries if d != cf_hostname]
+        if not cdn_domains:
+            cdn_domains = [(d, 443, n) for d, n in CF_PREFERRED_DOMAINS if d != cf_hostname]
+
         publishable = {slot["id"]: slot for slot in self._publishable_slots()}
         for node in self._local_subscription_nodes():
             slot = publishable.get(str(node.get("_slot_id") or ""))
@@ -1543,10 +1586,20 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 if egress_type in {"residential", "unverified"}:
                     pure_names.append(added)
                 if egress_type == "residential":
-                    add(
-                        {**node, "name": f"{added}·链式", "dialer-proxy": "⚡ 自动选择"},
-                        chain_names,
+                    # Replace broken Reality dialer-proxy chain with direct CF VLESS+WS on assigned preferred domain
+                    cf_assigned_domain, cf_assigned_port = self._cf_domain_for_slot(str(slot["id"]), cdn_domains)
+                    cf_chain_name = f"{added}·CF"
+                    cf_chain_yaml = self._cf_slot_vless_node(
+                        cf_chain_name,
+                        cf_assigned_domain,
+                        str(slot["id"]),
+                        cf_uuid,
+                        cf_hostname,
+                        port=cf_assigned_port,
                     )
+                    proxies.append(cf_chain_yaml)
+                    chain_names.append(cf_chain_name)
+                    pure_names.append(cf_chain_name)
             else:
                 # tr-* slots are chained exits: first hop via the auto group.
                 add({**node, "dialer-proxy": "⚡ 自动选择"}, extra_names)
@@ -1567,12 +1620,10 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         for node in thirdparty_nodes:
             add(node, extra_names)
 
-        cf_cfg = self._cf_tunnel_config()
         cf_proxies: list[str] = []
         cf_names: list[str] = []
         if cf_cfg:
-            cf_hostname, cf_uuid, cf_path = cf_cfg
-            for domain, port, display_name in self._cf_front_entries():
+            for domain, port, display_name in cf_entries:
                 normalized = self._unique_clash_node({"name": display_name}, used_names)
                 node_yaml = self._cf_vless_node(normalized["name"], domain, cf_path, cf_uuid, cf_hostname, port=port)
                 cf_proxies.append(node_yaml)
@@ -1609,7 +1660,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
 
         # Mihomo removed relay groups. Each residential exit gets a chain
         # clone with a fixed first-hop dialer, so the chain remains valid.
-        chain_group_name = "VLESS-REALITY-链式" if chain_names else ""
+        chain_group_name = "🏠 住宅·CF" if chain_names else ""
         cf_group_name = "⚡ CF入口" if cf_names else ""
 
         groups = ["proxy-groups:"]
