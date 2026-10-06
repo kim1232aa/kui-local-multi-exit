@@ -1584,9 +1584,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 added = add({**node, "name": self._exit_clash_name(slot)}, direct_names)
                 egress_type = self._slot_egress_type_info(slot)[0] if added else ""
                 if egress_type in {"residential", "unverified"}:
-                    pure_names.append(added)
-                if egress_type == "residential":
-                    # Replace broken Reality dialer-proxy chain with direct CF VLESS+WS on assigned preferred domain
+                    # Generate direct CF VLESS+WS on assigned preferred domain (replaces broken reality dialer-proxy chain)
                     cf_assigned_domain, cf_assigned_port = self._cf_domain_for_slot(str(slot["id"]), cdn_domains)
                     cf_chain_name = f"{added}·CF"
                     cf_chain_yaml = self._cf_slot_vless_node(
@@ -1600,6 +1598,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     proxies.append(cf_chain_yaml)
                     chain_names.append(cf_chain_name)
                     pure_names.append(cf_chain_name)
+                    pure_names.append(added)
             else:
                 # tr-* slots are chained exits: first hop via the auto group.
                 add({**node, "dialer-proxy": "⚡ 自动选择"}, extra_names)
