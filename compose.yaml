@@ -1,6 +1,7 @@
 services:
   kui-local-multi-exit:
     build: .
+    image: kui-local-multi-exit:local
     container_name: kui-local-multi-exit
     restart: unless-stopped
     cap_add:
@@ -46,6 +47,7 @@ services:
 
   kui-reality-gateway:
     build: .
+    image: kui-local-multi-exit:local
     container_name: kui-reality-gateway
     restart: unless-stopped
     command: ["python3", "-m", "vps.reality_gateway"]
@@ -82,6 +84,7 @@ services:
 
   kui-socks5-bridge:
     build: .
+    image: kui-local-multi-exit:local
     container_name: kui-socks5-bridge
     restart: unless-stopped
     command: ["python3", "-m", "vps.socks5_bridge"]

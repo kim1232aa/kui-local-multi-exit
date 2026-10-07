@@ -388,7 +388,7 @@ def _check_residential_fallback(ip: str, timeout: int = 10):
     """Secondary classifier via ip-api.com when TestISP has no data for the IP."""
     try:
         req = urllib.request.Request(
-            f"http://ip-api.com/json/{ip}?fields=status,country,isp,org,as,asname,hosting,proxy,mobile,query",
+            f"http://ip-api.com/json/{ip}?fields=status,country,countryCode,isp,org,as,asname,hosting,proxy,mobile,query",
             headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
         )
         with direct_url_opener().open(req, timeout=timeout) as response:
@@ -423,7 +423,7 @@ def _check_residential_fallback(ip: str, timeout: int = 10):
     }
 
 
-def _check_geo_fallback(ip: str, timeout: int = 10) -> dict[str, Any] | None:
+def check_geo(ip: str, timeout: int = 10) -> dict[str, Any] | None:
     """Fetch geo (country/city/timezone) from ip-api when TestISP geo is missing."""
     try:
         req = urllib.request.Request(
@@ -477,7 +477,7 @@ def check_residential(ip: str, timeout: int = 10) -> tuple[bool, dict[str, Any]]
     geo_code = str(geo.get("country_code", "")).strip()
     if not geo_code or geo_code.lower() in {"unknown", "none", "null", "xx", "-"}:
         # TestISP 的地区引擎偶尔返回 Unknown；此时用 ip-api 补齐地理信息。
-        geo_fallback = _check_geo_fallback(ip, timeout=timeout)
+        geo_fallback = check_geo(ip, timeout=timeout)
         if geo_fallback:
             data = dict(data)
             data["geo"] = {

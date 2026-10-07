@@ -913,6 +913,7 @@ class ExitManagerTest(unittest.TestCase):
             "is_residential": False,
             "egress_type": "datacenter",
             "egress_type_label": "机房IP",
+            "raw": {"geo": {"country_code": "JP"}},
         }
         handled = []
         self.manager._handle_connection_failure = lambda slot_id, gen, err, endpoint_ip="": handled.append(err)
@@ -994,6 +995,8 @@ class ExitManagerTest(unittest.TestCase):
         ), patch(
             "vps.exit_manager.detect_egress", return_value="203.0.113.25"
         ), patch(
+            "vps.exit_manager.check_geo", return_value={"country_code": "JP"}
+        ), patch(
             "vps.exit_manager.check_residential"
         ) as residential, patch(
             "vps.exit_manager.probe_targets", return_value={"accepted": True}
@@ -1009,6 +1012,20 @@ class ExitManagerTest(unittest.TestCase):
         self.assertEqual("connectivity_only", slot.check_result["residential"]["validation_mode"])
         self.assertEqual("unverified", slot.check_result["residential"]["egress_type"])
         self.assertEqual("未验证IP", slot.check_result["residential"]["egress_type_label"])
+
+        # The country lock still applies to connectivity-only slots.
+        for geo, expected in (({"country_code": "MM"}, "not allowed"), (None, "country unknown")):
+            handled.clear()
+            with patch.object(self.manager, "_default_route", return_value=("172.18.0.1", "eth0")), patch.object(
+                self.manager, "_openvpn_command", return_value=["openvpn"]
+            ), patch.object(self.manager, "_health_loop", return_value=None), patch(
+                "vps.exit_manager.detect_egress", return_value="203.0.113.25"
+            ), patch("vps.exit_manager.check_geo", return_value=geo), patch(
+                "vps.exit_manager.probe_targets", return_value={"accepted": True}
+            ):
+                self.manager._connect_worker("exit-25", self.store.get_slot("exit-25").generation)
+            self.assertEqual(1, len(handled), geo)
+            self.assertIn(expected, handled[0])
 
     def test_unknown_testisp_fails_even_if_allow_non_residential_enabled(self):
         generation = self.store.get_slot("exit-01").generation
@@ -1050,6 +1067,46 @@ class ExitManagerTest(unittest.TestCase):
 
         self.assertEqual(1, len(handled))
         self.assertIn("TestISP check failed", handled[0])
+
+    def test_ip_api_fallback_country_is_enforced(self):
+        # ip-api fallback has no raw.geo; countryCode must still be checked, and a missing country must fail.
+        cases = [
+            ({"countryCode": "MM", "country": "Myanmar"}, "not allowed"),
+            ({"countryCode": "US", "country": "United States"}, "mismatch"),
+            ({"country": "Japan"}, "country unknown"),
+        ]
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                generation = self.store.get_slot("exit-01").generation
+                handled = []
+                self.manager._handle_connection_failure = lambda slot_id, gen, err, endpoint_ip="": handled.append(err)
+
+                class InitializedProcess:
+                    def poll(self): return None
+                    def terminate(self): pass
+                    def wait(self, timeout=None): return 0
+
+                self.manager.node_pool.replace([{"ip": "198.51.100.1", "country": "JP", "ping": 1, "score": 100, "config": ""}])
+                self.manager.config_dir.mkdir(parents=True, exist_ok=True)
+                self.manager.auth_file.write_text("vpn\nvpn\n", encoding="utf-8")
+                log_path = self.manager.workspace / "exit-01.log"
+
+                def populate_log(*_args, **_kwargs):
+                    log_path.write_text("Initialization Sequence Completed", encoding="utf-8")
+                    return InitializedProcess()
+
+                self.manager._popen = populate_log
+                self.manager.routing.install = lambda *_args: None
+                result = {"status": "checked", "egress_type": "residential", "source": "ip-api", "raw": raw}
+                with patch.object(self.manager, "_default_route", return_value=("172.18.0.1", "eth0")), patch.object(
+                    self.manager, "_openvpn_command", return_value=["openvpn"]
+                ), patch("vps.exit_manager.detect_egress", return_value="203.0.113.1"), patch(
+                    "vps.exit_manager.check_residential", return_value=(True, result)
+                ), patch("vps.exit_manager.probe_targets", return_value={"accepted": True}):
+                    self.manager._connect_worker("exit-01", generation)
+
+                self.assertEqual(1, len(handled))
+                self.assertIn(expected, handled[0])
 
     def _commit_ready_slot(self, slot_id="exit-01"):
         generation = self.store.get_slot(slot_id).generation
