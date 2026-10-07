@@ -1354,7 +1354,12 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         Returns None when no Cloudflare tunnel is configured."""
         hostname = os.environ.get("KUI_CF_HOSTNAME", "").strip()
         if not hostname:
-            for p in ("/run/cloudshell-secrets/cf-hostname", "/run/secrets/cf-hostname", "/run/origin/cf-hostname"):
+            for p in (
+                "/run/cloudshell-secrets/cf-hostname",
+                "/run/secrets/cf-hostname",
+                "/run/origin/cf-hostname",
+                "/opt/kui-local/cf-hostname",
+            ):
                 try:
                     hostname = Path(p).read_text(encoding="utf-8").strip()
                     if hostname:
@@ -1362,15 +1367,24 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 except OSError:
                     pass
         if not hostname:
-            pub = os.environ.get("KUI_PUBLIC_HOST", "").strip()
-            if pub and not pub.replace(".", "").isdigit():
-                hostname = pub
+            req_host = self._request_proxy_host()
+            if req_host and not req_host.replace(".", "").isdigit():
+                hostname = req_host
             else:
-                hostname = "vps.alibb123.ccwu.cc"
+                pub = os.environ.get("KUI_PUBLIC_HOST", "").strip()
+                if pub and not pub.replace(".", "").isdigit():
+                    hostname = pub
+                else:
+                    hostname = req_host or "localhost"
 
         uuid_val = os.environ.get("KUI_CF_UUID", "").strip()
         if not uuid_val:
-            for p in ("/run/cloudshell-secrets/uuid", "/run/secrets/uuid", "/run/origin/uuid"):
+            for p in (
+                "/run/cloudshell-secrets/uuid",
+                "/run/secrets/uuid",
+                "/run/origin/uuid",
+                "/opt/kui-local/uuid",
+            ):
                 try:
                     uuid_val = Path(p).read_text(encoding="utf-8").strip()
                     if uuid_val:
@@ -1378,7 +1392,12 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 except OSError:
                     pass
         if not uuid_val:
-            uuid_val = "e799e3d5-6f8b-46cd-bb68-6dd38a20f2d0"
+            for node in self._local_reality_nodes().values():
+                if node.get("uuid"):
+                    uuid_val = str(node["uuid"])
+                    break
+        if not uuid_val:
+            return None
 
         ws_path = os.environ.get("KUI_CF_PATH", "/vless").strip() or "/vless"
         return hostname, uuid_val, ws_path
@@ -1511,8 +1530,13 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
     def _cf_slot_vless_node(
         name: str, domain: str, slot_id: str, uuid_val: str, host: str, port: int = 443
     ) -> str:
+        # Dynamic path prefix from env KUI_CF_RES_PATH_PREFIX (default "/res-"),
+        # supporting arbitrary custom routing formats (e.g. /res-01, /exit-01, etc.)
+        prefix = os.environ.get("KUI_CF_RES_PATH_PREFIX", "/res-").strip()
+        if not prefix.startswith("/"):
+            prefix = f"/{prefix}"
         num = slot_id.split("-", 1)[-1] if "-" in slot_id else slot_id
-        path = f"/res-{int(num):02d}" if num.isdigit() else f"/res-{num}"
+        path = f"{prefix}{int(num):02d}" if num.isdigit() else f"{prefix}{num}"
         return "\n".join((
             f"  - name: {json.dumps(name, ensure_ascii=False)}",
             "    type: vless",
@@ -1531,9 +1555,9 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         ))
 
     @staticmethod
-    def _cf_domain_for_slot(slot_id: str, cdn_entries: list[tuple[str, int, str]]) -> tuple[str, int]:
+    def _cf_domain_for_slot(slot_id: str, cdn_entries: list[tuple[str, int, str]], default_host: str = "") -> tuple[str, int]:
         if not cdn_entries:
-            return "vps.alibb123.ccwu.cc", 443
+            return default_host or "127.0.0.1", 443
         num = slot_id.split("-", 1)[-1] if "-" in slot_id else slot_id
         if num.isdigit():
             idx = (int(num) - 1) % len(cdn_entries)
@@ -1581,7 +1605,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 egress_type = self._slot_egress_type_info(slot)[0] if added else ""
                 if egress_type in {"residential", "unverified"}:
                     # Generate direct CF VLESS+WS on assigned preferred domain (replaces broken reality dialer-proxy chain)
-                    cf_assigned_domain, cf_assigned_port = self._cf_domain_for_slot(str(slot["id"]), cdn_domains)
+                    cf_assigned_domain, cf_assigned_port = self._cf_domain_for_slot(str(slot["id"]), cdn_domains, default_host=cf_hostname)
                     cf_chain_name = f"{added}·CF"
                     cf_chain_yaml = self._cf_slot_vless_node(
                         cf_chain_name,
