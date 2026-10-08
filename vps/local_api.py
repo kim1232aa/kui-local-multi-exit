@@ -1354,7 +1354,12 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         Returns None when no Cloudflare tunnel is configured."""
         hostname = os.environ.get("KUI_CF_HOSTNAME", "").strip()
         if not hostname:
-            for p in ("/run/cloudshell-secrets/cf-hostname", "/run/secrets/cf-hostname", "/run/origin/cf-hostname"):
+            for p in (
+                "/run/cloudshell-secrets/cf-hostname",
+                "/run/secrets/cf-hostname",
+                "/run/origin/cf-hostname",
+                "/opt/kui-local/cf-hostname",
+            ):
                 try:
                     hostname = Path(p).read_text(encoding="utf-8").strip()
                     if hostname:
@@ -1370,11 +1375,16 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 if pub and not pub.replace(".", "").isdigit():
                     hostname = pub
                 else:
-                    hostname = "mvp.alibb123.ccwu.cc"
+                    hostname = req_host or "localhost"
 
         uuid_val = os.environ.get("KUI_CF_UUID", "").strip()
         if not uuid_val:
-            for p in ("/run/cloudshell-secrets/uuid", "/run/secrets/uuid", "/run/origin/uuid"):
+            for p in (
+                "/run/cloudshell-secrets/uuid",
+                "/run/secrets/uuid",
+                "/run/origin/uuid",
+                "/opt/kui-local/uuid",
+            ):
                 try:
                     uuid_val = Path(p).read_text(encoding="utf-8").strip()
                     if uuid_val:
@@ -1382,7 +1392,12 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 except OSError:
                     pass
         if not uuid_val:
-            uuid_val = "e799e3d5-6f8b-46cd-bb68-6dd38a20f2d0"
+            for node in self._local_reality_nodes().values():
+                if node.get("uuid"):
+                    uuid_val = str(node["uuid"])
+                    break
+        if not uuid_val:
+            return None
 
         ws_path = os.environ.get("KUI_CF_PATH", "/vless").strip() or "/vless"
         return hostname, uuid_val, ws_path
@@ -1511,6 +1526,47 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         })
         return f"vless://{uuid_val}@{domain}:{int(port)}?{qs}#{urllib.parse.quote(name)}"
 
+    @staticmethod
+    def _cf_slot_vless_node(
+        name: str, domain: str, slot_id: str, uuid_val: str, host: str, port: int = 443
+    ) -> str:
+        # Dynamic path prefix from env KUI_CF_RES_PATH_PREFIX (default "/res-"),
+        # supporting arbitrary custom routing formats (e.g. /res-01, /exit-01, etc.)
+        prefix = os.environ.get("KUI_CF_RES_PATH_PREFIX", "/res-").strip()
+        if not prefix.startswith("/"):
+            prefix = f"/{prefix}"
+        num = slot_id.split("-", 1)[-1] if "-" in slot_id else slot_id
+        path = f"{prefix}{int(num):02d}" if num.isdigit() else f"{prefix}{num}"
+        return "\n".join((
+            f"  - name: {json.dumps(name, ensure_ascii=False)}",
+            "    type: vless",
+            f"    server: {domain}",
+            f"    port: {int(port)}",
+            f"    uuid: {json.dumps(uuid_val)}",
+            "    network: ws",
+            "    tls: true",
+            f"    servername: {json.dumps(host, ensure_ascii=False)}",
+            '    client-fingerprint: "chrome"',
+            "    udp: true",
+            "    ws-opts:",
+            f"      path: {json.dumps(path)}",
+            "      headers:",
+            f"        Host: {json.dumps(host, ensure_ascii=False)}",
+        ))
+
+    @staticmethod
+    def _cf_domain_for_slot(slot_id: str, cdn_entries: list[tuple[str, int, str]], default_host: str = "") -> tuple[str, int]:
+        if not cdn_entries:
+            return default_host or "127.0.0.1", 443
+        num = slot_id.split("-", 1)[-1] if "-" in slot_id else slot_id
+        if num.isdigit():
+            idx = (int(num) - 1) % len(cdn_entries)
+        else:
+            import zlib
+            idx = zlib.crc32(slot_id.encode()) % len(cdn_entries)
+        entry = cdn_entries[idx]
+        return entry[0], entry[1]
+
     def _clash_subscription_yaml(self, thirdparty_nodes: list[dict[str, Any]]) -> str:
         """Clash/Mihomo subscription in the cs-pa (Cloud Shell) layout:
         🚀 节点选择 / ⚡ 自动选择 / 🏠 住宅自动 + AI site groups + CN direct."""
@@ -1534,6 +1590,13 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             bucket.append(entry[0])
             return entry[0]
 
+        cf_cfg = self._cf_tunnel_config()
+        cf_hostname, cf_uuid, cf_path = cf_cfg if cf_cfg else ("", "", "")
+        cf_entries = self._cf_front_entries()
+        cdn_domains = [(d, p, n) for d, p, n in cf_entries if d != cf_hostname]
+        if not cdn_domains:
+            cdn_domains = [(d, 443, n) for d, n in CF_PREFERRED_DOMAINS if d != cf_hostname]
+
         publishable = {slot["id"]: slot for slot in self._publishable_slots()}
         for node in self._local_subscription_nodes():
             slot = publishable.get(str(node.get("_slot_id") or ""))
@@ -1541,12 +1604,22 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 added = add({**node, "name": self._exit_clash_name(slot)}, direct_names)
                 egress_type = self._slot_egress_type_info(slot)[0] if added else ""
                 if egress_type in {"residential", "unverified"}:
-                    pure_names.append(added)
-                if egress_type == "residential":
-                    add(
-                        {**node, "name": f"{added}·链式", "dialer-proxy": "⚡ 自动选择"},
-                        chain_names,
+                    # Generate direct CF VLESS+WS on assigned preferred domain (replaces broken reality dialer-proxy chain)
+                    cf_assigned_domain, cf_assigned_port = self._cf_domain_for_slot(str(slot["id"]), cdn_domains, default_host=cf_hostname)
+                    cf_chain_name = f"{added}·CF"
+                    cf_chain_yaml = self._cf_slot_vless_node(
+                        cf_chain_name,
+                        cf_assigned_domain,
+                        str(slot["id"]),
+                        cf_uuid,
+                        cf_hostname,
+                        port=cf_assigned_port,
                     )
+                    proxies.append(cf_chain_yaml)
+                    chain_names.append(cf_chain_name)
+                    pure_names.append(cf_chain_name)
+                elif egress_type:
+                    pure_names.append(added)
             else:
                 # tr-* slots are chained exits: first hop via the auto group.
                 add({**node, "dialer-proxy": "⚡ 自动选择"}, extra_names)
@@ -1567,12 +1640,10 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         for node in thirdparty_nodes:
             add(node, extra_names)
 
-        cf_cfg = self._cf_tunnel_config()
         cf_proxies: list[str] = []
         cf_names: list[str] = []
         if cf_cfg:
-            cf_hostname, cf_uuid, cf_path = cf_cfg
-            for domain, port, display_name in self._cf_front_entries():
+            for domain, port, display_name in cf_entries:
                 normalized = self._unique_clash_node({"name": display_name}, used_names)
                 node_yaml = self._cf_vless_node(normalized["name"], domain, cf_path, cf_uuid, cf_hostname, port=port)
                 cf_proxies.append(node_yaml)
@@ -1587,7 +1658,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             items = [item for item in items if item]
             return "\n".join(f"      - {q(item)}" for item in items) if items else "      - DIRECT"
 
-        all_names = direct_names + extra_names
+        all_names = chain_names + direct_names + extra_names
         now = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
         lines = [
             f"# K-UI Local Multi-Exit subscription — generated {now} (dynamic)",
@@ -1609,7 +1680,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
 
         # Mihomo removed relay groups. Each residential exit gets a chain
         # clone with a fixed first-hop dialer, so the chain remains valid.
-        chain_group_name = "VLESS-REALITY-链式" if chain_names else ""
+        chain_group_name = "🏠 住宅·CF" if chain_names else ""
         cf_group_name = "⚡ CF入口" if cf_names else ""
 
         groups = ["proxy-groups:"]
@@ -1632,7 +1703,8 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 '    tolerance: 100\n'
                 '    proxies:\n' + lst(cf_names)
             )
-        auto_proxies = direct_names if direct_names else (cf_names or ["DIRECT"])
+        # Auto-selection pool: include CF-routed residential exits first, then direct exits as fallback
+        auto_proxies = [*chain_names, *direct_names] if (chain_names or direct_names) else (cf_names or ["DIRECT"])
         groups.append('  - name: "⚡ 自动选择"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 300\n    tolerance: 100\n    proxies:\n' + lst(auto_proxies))
         if pure_names:
             groups.append('  - name: "🏠 住宅自动"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 300\n    tolerance: 150\n    proxies:\n' + lst(pure_names))
