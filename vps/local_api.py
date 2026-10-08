@@ -1618,6 +1618,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     proxies.append(cf_chain_yaml)
                     chain_names.append(cf_chain_name)
                     pure_names.append(cf_chain_name)
+                elif egress_type:
                     pure_names.append(added)
             else:
                 # tr-* slots are chained exits: first hop via the auto group.
@@ -1657,7 +1658,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             items = [item for item in items if item]
             return "\n".join(f"      - {q(item)}" for item in items) if items else "      - DIRECT"
 
-        all_names = direct_names + extra_names
+        all_names = chain_names + direct_names + extra_names
         now = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
         lines = [
             f"# K-UI Local Multi-Exit subscription — generated {now} (dynamic)",
@@ -1702,7 +1703,8 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 '    tolerance: 100\n'
                 '    proxies:\n' + lst(cf_names)
             )
-        auto_proxies = direct_names if direct_names else (cf_names or ["DIRECT"])
+        # Auto-selection pool: include CF-routed residential exits first, then direct exits as fallback
+        auto_proxies = [*chain_names, *direct_names] if (chain_names or direct_names) else (cf_names or ["DIRECT"])
         groups.append('  - name: "⚡ 自动选择"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 300\n    tolerance: 100\n    proxies:\n' + lst(auto_proxies))
         if pure_names:
             groups.append('  - name: "🏠 住宅自动"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 300\n    tolerance: 150\n    proxies:\n' + lst(pure_names))
