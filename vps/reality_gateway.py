@@ -213,9 +213,9 @@ def build_sing_box_config(
     rules = []
     if ws_port is not None:
         inbound_tags.append("vless-ws")
-        cf_default_uuid = str(cf_uuid or "e799e3d5-6f8b-46cd-bb68-6dd38a20f2d0")
         ws_users = [{"name": slot_id, "uuid": str(identities[slot_id]["uuid"])} for slot_id in sorted_slots]
-        ws_users.append({"name": "cf-default", "uuid": cf_default_uuid})
+        if cf_uuid:
+            ws_users.append({"name": "cf-default", "uuid": str(cf_uuid)})
         inbounds.append({
             "type": "vless",
             "tag": "vless-ws",
@@ -227,16 +227,14 @@ def build_sing_box_config(
                 "path": ws_path or "/vless",
             },
         })
-        outbounds.append({
-            "type": "direct",
-            "tag": "direct",
-        })
-        rules.append({
-            "inbound": ["vless-ws"],
-            "auth_user": ["cf-default"],
-            "action": "route",
-            "outbound": "direct",
-        })
+        if cf_uuid:
+            outbounds.append({"type": "direct", "tag": "direct"})
+            rules.append({
+                "inbound": ["vless-ws"],
+                "auth_user": ["cf-default"],
+                "action": "route",
+                "outbound": "direct",
+            })
 
     for slot_id in sorted_slots:
         rules.append({
@@ -371,7 +369,7 @@ def run_gateway(
     nodes_file = Path(os.environ.get("KUI_REALITY_NODES_FILE", "/run/kui-reality/public-nodes.json"))
     bin_name = sing_box_bin or os.environ.get("KUI_SING_BOX_BIN", "sing-box")
     ws_port = _env_int("KUI_VLESS_WS_PORT", 0, minimum=0, maximum=65535) or None
-    cf_uuid = os.environ.get("KUI_CF_UUID", "e799e3d5-6f8b-46cd-bb68-6dd38a20f2d0").strip() or "e799e3d5-6f8b-46cd-bb68-6dd38a20f2d0"
+    cf_uuid = os.environ.get("KUI_CF_UUID", "").strip() or None
     ws_path = os.environ.get("KUI_CF_PATH", "/vless").strip() or "/vless"
 
     public_host = get_public_ip()

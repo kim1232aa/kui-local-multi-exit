@@ -1528,15 +1528,9 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _cf_slot_vless_node(
-        name: str, domain: str, slot_id: str, uuid_val: str, host: str, port: int = 443
+        name: str, domain: str, uuid_val: str, host: str, path: str, port: int = 443
     ) -> str:
-        # Dynamic path prefix from env KUI_CF_RES_PATH_PREFIX (default "/res-"),
-        # supporting arbitrary custom routing formats (e.g. /res-01, /exit-01, etc.)
-        prefix = os.environ.get("KUI_CF_RES_PATH_PREFIX", "/res-").strip()
-        if not prefix.startswith("/"):
-            prefix = f"/{prefix}"
-        num = slot_id.split("-", 1)[-1] if "-" in slot_id else slot_id
-        path = f"{prefix}{int(num):02d}" if num.isdigit() else f"{prefix}{num}"
+        # The gateway's VLESS-WS inbound routes by user UUID, so the slot's own UUID selects its exit.
         return "\n".join((
             f"  - name: {json.dumps(name, ensure_ascii=False)}",
             "    type: vless",
@@ -1571,7 +1565,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         """Clash/Mihomo subscription in the cs-pa (Cloud Shell) layout:
         🚀 节点选择 / ⚡ 自动选择 / 🏠 住宅自动 + AI site groups + CN direct."""
         used_names = {
-            "🚀 节点选择", "⚡ CF入口", "⚡ 自动选择", "🏠 住宅自动", "VLESS-REALITY-链式",
+            "🚀 节点选择", "⚡ CF入口", "⚡ 自动选择", "🏠 住宅自动", "🏠 住宅·CF",
             "🧠 Claude", "🤖 ChatGPT", "🔵 Google·Gemini",
             "🌐 其他流量", "🇨🇳 中国流量", "DIRECT",
         }
@@ -1597,28 +1591,30 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         if not cdn_domains:
             cdn_domains = [(d, 443, n) for d, n in CF_PREFERRED_DOMAINS if d != cf_hostname]
 
+        reality_nodes = self._local_reality_nodes()
         publishable = {slot["id"]: slot for slot in self._publishable_slots()}
         for node in self._local_subscription_nodes():
             slot = publishable.get(str(node.get("_slot_id") or ""))
             if slot is not None:
                 added = add({**node, "name": self._exit_clash_name(slot)}, direct_names)
                 egress_type = self._slot_egress_type_info(slot)[0] if added else ""
-                if egress_type in {"residential", "unverified"}:
-                    # Generate direct CF VLESS+WS on assigned preferred domain (replaces broken reality dialer-proxy chain)
+                slot_uuid = str(reality_nodes.get(str(slot["id"]), {}).get("uuid") or "")
+                if egress_type in {"residential", "unverified"} and cf_cfg and slot_uuid:
+                    # CF VLESS+WS on an assigned preferred domain; the slot UUID picks the exit in the gateway.
                     cf_assigned_domain, cf_assigned_port = self._cf_domain_for_slot(str(slot["id"]), cdn_domains, default_host=cf_hostname)
                     cf_chain_name = f"{added}·CF"
                     cf_chain_yaml = self._cf_slot_vless_node(
                         cf_chain_name,
                         cf_assigned_domain,
-                        str(slot["id"]),
-                        cf_uuid,
+                        slot_uuid,
                         cf_hostname,
+                        cf_path,
                         port=cf_assigned_port,
                     )
                     proxies.append(cf_chain_yaml)
                     chain_names.append(cf_chain_name)
                     pure_names.append(cf_chain_name)
-                elif egress_type:
+                elif egress_type in {"residential", "unverified"}:
                     pure_names.append(added)
             else:
                 # tr-* slots are chained exits: first hop via the auto group.
@@ -1708,10 +1704,10 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         groups.append('  - name: "⚡ 自动选择"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 300\n    tolerance: 100\n    proxies:\n' + lst(auto_proxies))
         if pure_names:
             groups.append('  - name: "🏠 住宅自动"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 300\n    tolerance: 150\n    proxies:\n' + lst(pure_names))
-        if chain_names:
-            groups.append(f'  - name: "{chain_group_name}"\n    type: select\n    proxies:\n' + lst(chain_names))
         else:
             groups.append('  - name: "🏠 住宅自动"\n    type: select\n    proxies:\n      - "🚀 节点选择"')
+        if chain_names:
+            groups.append(f'  - name: "{chain_group_name}"\n    type: select\n    proxies:\n' + lst(chain_names))
         for grp in ("🧠 Claude", "🤖 ChatGPT", "🔵 Google·Gemini"):
             groups.append(f'  - name: "{grp}"\n    type: select\n    proxies:\n' + lst(["🏠 住宅自动", "🚀 节点选择", *([cf_group_name] if cf_group_name else []), "⚡ 自动选择", chain_group_name, *pure_names, "DIRECT"]))
         groups.append(f'  - name: "🌐 其他流量"\n    type: select\n    proxies:\n' + lst(["🚀 节点选择", *([cf_group_name] if cf_group_name else []), "⚡ 自动选择", "🏠 住宅自动", chain_group_name, "DIRECT"]))

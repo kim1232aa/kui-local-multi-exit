@@ -809,14 +809,14 @@ class LocalAPITest(unittest.TestCase):
 
         request = urllib.request.Request(
             f"{self.base}/api/sub?user={data['mySubUser']}&token={token}&format=socks5",
-            headers={"Host": "vp.alibb123.ccwu.cc"},
+            headers={"Host": "vp.example.com"},
         )
         with urllib.request.urlopen(request, timeout=3) as response:
             links = base64.b64decode(response.read()).decode().splitlines()
 
         self.assertEqual(1, len(links))
         self.assertIn("@153.121.38.245:7920#JP_exit-01_", links[0])
-        self.assertNotIn("@vp.alibb123.ccwu.cc:7920", links[0])
+        self.assertNotIn("@vp.example.com:7920", links[0])
 
     def test_socks5_text_routes_require_subscription_token(self):
         self.manager.set_slot_ready("exit-01")
@@ -1161,7 +1161,8 @@ class LocalAPITest(unittest.TestCase):
         chain_proxy_name = "JP住宅·KDDI·exit-03·CF"
         chain_proxy_start = body.index(f'  - name: "{chain_proxy_name}"')
         chain_proxy_block = body[chain_proxy_start:body.index("\nproxy-groups:", chain_proxy_start)]
-        self.assertIn('path: "/res-03"', chain_proxy_block)
+        self.assertIn('path: "/vless"', chain_proxy_block)
+        self.assertIn('uuid: "11111111-1111-1111-1111-111111111111"', chain_proxy_block)
         self.assertIn('servername:', chain_proxy_block)
         self.assertIn(
             '  - name: "🏠 住宅·CF"\n    type: select\n'
@@ -1177,6 +1178,20 @@ class LocalAPITest(unittest.TestCase):
         self.assertIn("vless://11111111-1111-1111-1111-111111111111@153.121.38.245:8445", links)
         self.assertIn("JP-%E6%97%A5%E6%9C%AC%20%7C%20%E4%BD%8F%E5%AE%85IP%20%7C%20KDDI%20%7C%20203.0.113.30%20%7C%20exit-03", links)
         self.assertNotIn("socks5://", links)
+
+    def test_residential_exit_without_cf_config_has_no_cf_node(self):
+        self.manager.set_slot_ready("exit-01")
+        status, data = self.request("/api/data")
+        token = data["mySubToken"]
+        with patch.dict(os.environ, {"KUI_CF_HOSTNAME": "", "KUI_CF_UUID": ""}):
+            status, body = self.request(
+                f"/api/sub?user={data['mySubUser']}&token={token}&format=clash",
+                expect_json=False,
+            )
+        self.assertEqual(200, status)
+        self.assertNotIn("·CF", body)
+        self.assertNotIn('uuid: ""', body)
+        self.assertEqual(1, body.count('  - name: "🏠 住宅自动"'))
 
     def test_connectivity_only_exit_34_joins_residential_group_without_chain(self):
         self.store.initialize(slot_count=34)
@@ -1218,17 +1233,27 @@ class LocalAPITest(unittest.TestCase):
         status, data = self.request("/api/data")
         token = data["mySubToken"]
 
-        status, body = self.request(
-            f"/api/sub?user={data['mySubUser']}&token={token}&format=clash",
-            expect_json=False,
-        )
+        with patch.dict(os.environ, {
+            "KUI_CF_HOSTNAME": "cf.example.com",
+            "KUI_CF_UUID": "99999999-9999-9999-9999-999999999999",
+        }):
+            status, body = self.request(
+                f"/api/sub?user={data['mySubUser']}&token={token}&format=clash",
+                expect_json=False,
+            )
 
         self.assertEqual(200, status)
         node_name = "US未验证·RESI·exit-34"
         self.assertIn(f'name: "{node_name}"', body)
         residential_start = body.index('  - name: "🏠 住宅自动"')
         residential_block = body[residential_start:body.index("\n  - name:", residential_start + 1)]
-        self.assertIn(f'      - "{node_name}"', residential_block)
+        # The unverified exit joins 🏠 住宅自动 through its CF node, which uses the slot UUID on the shared WS path.
+        self.assertIn(f'      - "{node_name}·CF"', residential_block)
+        cf_start = body.index(f'  - name: "{node_name}·CF"')
+        cf_block = body[cf_start:body.index("\n  - name:", cf_start + 1)]
+        self.assertIn('uuid: "44444444-4444-4444-4444-444444444444"', cf_block)
+        self.assertIn('path: "/vless"', cf_block)
+        self.assertNotIn("/res-", body)
         self.assertNotIn(f'{node_name}·链式', body)
 
         manifest.write_text(
@@ -1384,7 +1409,11 @@ class LocalAPITest(unittest.TestCase):
         status, data = self.request("/api/data")
         token = data["mySubToken"]
 
-        with patch.dict(os.environ, {"KUI_CF_DOMAINS_SOURCE": str(custom_file)}):
+        with patch.dict(os.environ, {
+            "KUI_CF_DOMAINS_SOURCE": str(custom_file),
+            "KUI_CF_HOSTNAME": "cf.example.com",
+            "KUI_CF_UUID": "99999999-9999-9999-9999-999999999999",
+        }):
             status, body = self.request(
                 f"/api/sub?user={data['mySubUser']}&token={token}&format=clash",
                 expect_json=False,

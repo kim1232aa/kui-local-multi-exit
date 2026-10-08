@@ -149,7 +149,7 @@ class TestRealityGateway(unittest.TestCase):
             identities,
             ws_port=8085,
             ws_path="/vless",
-            cf_uuid="e799e3d5-6f8b-46cd-bb68-6dd38a20f2d0",
+            cf_uuid="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         )
 
         self.assertEqual(2, len(config["inbounds"]))
@@ -159,6 +159,20 @@ class TestRealityGateway(unittest.TestCase):
         user_names = [u["name"] for u in ws_inbound["users"]]
         self.assertIn("cf-default", user_names)
         self.assertIn("direct", [outb["tag"] for outb in config["outbounds"]])
+
+    def test_ws_inbound_without_cf_uuid_has_no_direct_user(self):
+        identities = {
+            "exit-01": {
+                "uuid": "00000000-0000-0000-0000-000000000001",
+                "private_key": "privkeybase64testsample123456789012345678",
+                "public_key": "pubkeybase64testsample123456789012345678",
+                "short_id": "01234567",
+            }
+        }
+        config = build_sing_box_config(identities, ws_port=8085)
+        ws_inbound = next(inb for inb in config["inbounds"] if inb["tag"] == "vless-ws")
+        self.assertEqual(["exit-01"], [u["name"] for u in ws_inbound["users"]])
+        self.assertNotIn("direct", [outb["tag"] for outb in config["outbounds"]])
 
     def test_build_public_nodes_manifest_no_secrets(self):
         identities = {
