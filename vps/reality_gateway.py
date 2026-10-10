@@ -99,7 +99,11 @@ def _write_identities(path: Path, identities: Mapping[str, Mapping[str, Any]]) -
     path.chmod(0o600)
 
 
-def load_or_create_identities(identities_file: Path | str, count: int = MAX_SLOT_COUNT) -> dict[str, dict[str, Any]]:
+def load_or_create_identities(
+    identities_file: Path | str,
+    count: int = MAX_SLOT_COUNT,
+    include_host: bool = False,
+) -> dict[str, dict[str, Any]]:
     """Keep all stored identities, returning only the requested managed slots.
 
     Existing per-slot keys are migrated to one shared Reality key pair by reusing
@@ -140,13 +144,30 @@ def load_or_create_identities(identities_file: Path | str, count: int = MAX_SLOT
             identities[slot_id] = replacement
             changed = True
 
+    if include_host:
+        current_host = identities.get("host", {})
+        host_uuid = str(current_host.get("uuid") or uuid.uuid4())
+        host_replacement = {
+            "slot_id": "host",
+            "uuid": host_uuid,
+            "private_key": private_key,
+            "public_key": public_key,
+            "short_id": short_id,
+        }
+        if current_host != host_replacement:
+            identities["host"] = host_replacement
+            changed = True
+
     if changed:
         _write_identities(identities_path, identities)
-    return {
+    result = {
         slot_id: identities[slot_id]
         for slot_id in sorted(identities, key=_slot_number)
         if 1 <= _slot_number(slot_id) <= int(count)
     }
+    if include_host and "host" in identities:
+        result["host"] = identities["host"]
+    return result
 
 
 def build_sing_box_config(
@@ -189,7 +210,13 @@ def build_sing_box_config(
             "password": proxy_password,
         }
         for slot_id in sorted_slots
+        if slot_id != "host"
     ]
+    if any(slot_id == "host" for slot_id in sorted_slots):
+        outbounds.append({
+            "type": "direct",
+            "tag": "direct",
+        })
     inbound_tags = ["xtls-reality"]
     inbounds = [
         {
@@ -227,10 +254,11 @@ def build_sing_box_config(
                 "path": ws_path or "/vless",
             },
         })
-        outbounds.append({
-            "type": "direct",
-            "tag": "direct",
-        })
+        if not any(ob.get("tag") == "direct" for ob in outbounds):
+            outbounds.append({
+                "type": "direct",
+                "tag": "direct",
+            })
         rules.append({
             "inbound": ["vless-ws"],
             "auth_user": ["cf-default"],
@@ -239,12 +267,20 @@ def build_sing_box_config(
         })
 
     for slot_id in sorted_slots:
-        rules.append({
-            "inbound": list(inbound_tags),
-            "auth_user": [slot_id],
-            "action": "route",
-            "outbound": f"openvpn-{slot_id}",
-        })
+        if slot_id == "host":
+            rules.append({
+                "inbound": list(inbound_tags),
+                "auth_user": ["host"],
+                "action": "route",
+                "outbound": "direct",
+            })
+        else:
+            rules.append({
+                "inbound": list(inbound_tags),
+                "auth_user": [slot_id],
+                "action": "route",
+                "outbound": f"openvpn-{slot_id}",
+            })
 
     return {
         "log": {"level": "info"},
@@ -272,11 +308,12 @@ def build_public_nodes_manifest(
         node_uuid = str(identity["uuid"])
         public_key = str(identity["public_key"])
         short_id = str(identity["short_id"])
+        tag = "直连·本机" if slot_id == "host" else f"KUI-XTLS-Reality-{slot_id}"
         link = (
             f"vless://{node_uuid}@{public_host}:{int(reality_port)}?"
             f"encryption=none&flow=xtls-rprx-vision&security=reality&"
             f"sni={sni}&fp=chrome&pbk={public_key}&sid={short_id}&"
-            f"type=tcp&headerType=none#KUI-XTLS-Reality-{slot_id}"
+            f"type=tcp&headerType=none#{tag}"
         )
         nodes.append(
             {
@@ -375,7 +412,8 @@ def run_gateway(
     ws_path = os.environ.get("KUI_CF_PATH", "/vless").strip() or "/vless"
 
     public_host = get_public_ip()
-    identities = load_or_create_identities(identities_file, count=count)
+    include_host = os.environ.get("KUI_REALITY_INCLUDE_HOST", "0").strip().lower() in ("1", "true", "yes")
+    identities = load_or_create_identities(identities_file, count=count, include_host=include_host)
     config_dict = build_sing_box_config(
         identities,
         socks_host=socks_host,

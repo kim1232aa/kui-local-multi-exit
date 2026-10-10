@@ -280,6 +280,48 @@ class TestRealityGateway(unittest.TestCase):
             nodes_mode = oct(nodes_file.stat().st_mode & 0o777)
             self.assertEqual("0o644", nodes_mode)
 
+    def test_run_gateway_with_host_identity(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_path = Path(tmpdir)
+            data_dir = temp_path / "data"
+            data_dir.mkdir()
+            nodes_file = temp_path / "public-nodes.json"
+            internal_workspace = temp_path / "workspace"
+            internal_workspace.mkdir()
+            (internal_workspace / "internal_proxy.json").write_text(
+                json.dumps({"username": "gateway", "password": "gateway-password"}),
+                encoding="utf-8",
+            )
+            env_vars = {
+                "KUI_SLOT_COUNT": "2",
+                "KUI_REALITY_DATA_DIR": str(data_dir),
+                "KUI_REALITY_NODES_FILE": str(nodes_file),
+                "KUI_PUBLIC_HOST": "198.51.100.42",
+                "KUI_INTERNAL_PROXY_WORKSPACE": str(internal_workspace),
+                "KUI_REALITY_INCLUDE_HOST": "1",
+            }
+
+            with patch.dict(os.environ, env_vars, clear=True), patch(
+                "vps.reality_gateway.generate_x25519_keypair",
+                return_value=("A" * 43, "B" * 43),
+            ), patch(
+                "vps.reality_gateway.shutil.which",
+                return_value="/usr/local/bin/sing-box",
+            ), patch("vps.reality_gateway.check_sing_box_config"):
+                res = run_gateway(do_exec=False)
+
+            self.assertEqual(3, len(res["identities"]))
+            self.assertIn("host", res["identities"])
+            manifest_nodes = res["manifest"]["nodes"]
+            self.assertEqual(3, len(manifest_nodes))
+            host_node = next(n for n in manifest_nodes if n["slot_id"] == "host")
+            self.assertEqual("host", host_node["slot_id"])
+            self.assertIn("#直连·本机", host_node["link"])
+            # verify routing rule
+            rules = res["config"]["route"]["rules"]
+            host_rule = next(r for r in rules if r.get("auth_user") == ["host"])
+            self.assertEqual("direct", host_rule["outbound"])
+
 
 if __name__ == "__main__":
     unittest.main()

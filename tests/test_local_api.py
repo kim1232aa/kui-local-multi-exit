@@ -1228,7 +1228,8 @@ class LocalAPITest(unittest.TestCase):
         self.assertIn(f'name: "{node_name}"', body)
         residential_start = body.index('  - name: "🏠 住宅自动"')
         residential_block = body[residential_start:body.index("\n  - name:", residential_start + 1)]
-        self.assertIn(f'      - "{node_name}"', residential_block)
+        expected_res_node = f"{node_name}·CF"
+        self.assertIn(f'      - "{expected_res_node}"', residential_block)
         self.assertNotIn(f'{node_name}·链式', body)
 
         manifest.write_text(
@@ -1372,6 +1373,60 @@ class LocalAPITest(unittest.TestCase):
         self.assertIn('  - name: "CF·本机"', body)
         self.assertIn('  - name: "CF优选·中国香港数码港"', body)
 
+    def test_clash_subscription_includes_direct_host_node(self):
+        self.manager.set_slot_ready("exit-01")
+        manifest = Path(self.tempdir.name) / "reality-nodes.json"
+        manifest.write_text(
+            json.dumps({
+                "version": 1,
+                "nodes": [
+                    {
+                        "slot_id": "host",
+                        "address": "198.51.100.1",
+                        "port": 8443,
+                        "uuid": "00000000-0000-0000-0000-000000000000",
+                        "sni": "dl.google.com",
+                        "public_key": "abcdefghijklmnopqrstuvwxyzABCDEFGH1234567_",
+                        "short_id": "1122334455667788",
+                    },
+                    {
+                        "slot_id": "exit-01",
+                        "address": "198.51.100.1",
+                        "port": 8443,
+                        "uuid": "11111111-1111-1111-1111-111111111111",
+                        "sni": "addons.mozilla.org",
+                        "public_key": "abcdefghijklmnopqrstuvwxyzABCDEFGH1234567_",
+                        "short_id": "1122334455667788",
+                    },
+                ],
+            }),
+            encoding="utf-8",
+        )
+        self.server.reality_nodes_file = manifest
+        status, data = self.request("/api/data")
+        token = data["mySubToken"]
+
+        status, body = self.request(
+            f"/api/sub?user={data['mySubUser']}&token={token}&format=clash",
+            expect_json=False,
+        )
+
+        self.assertEqual(200, status)
+        self.assertIn('  - name: "直连·本机"', body)
+        # Verify 直连·本机 has no dialer-proxy and uses direct Reality
+        host_start = body.index('  - name: "直连·本机"')
+        host_end = body.index("\n  - name:", host_start + 1)
+        host_block = body[host_start:host_end]
+        self.assertNotIn("dialer-proxy:", host_block)
+        self.assertIn("type: vless", host_block)
+        # Verify 直连·本机 is present in 🚀 节点选择 and ⚡ 自动选择
+        rocket_start = body.index('  - name: "🚀 节点选择"')
+        rocket_block = body[rocket_start:body.index("\n  - name:", rocket_start + 1)]
+        self.assertIn('      - "直连·本机"', rocket_block)
+        auto_start = body.index('  - name: "⚡ 自动选择"')
+        auto_block = body[auto_start:body.index("\n  - name:", auto_start + 1)]
+        self.assertIn('      - "直连·本机"', auto_block)
+
     def test_clash_subscription_parses_custom_ports_and_tags_from_front_domains_source(self):
         self.manager.set_slot_ready("exit-01")
         custom_file = Path(self.tempdir.name) / "custom-front.txt"
@@ -1384,7 +1439,11 @@ class LocalAPITest(unittest.TestCase):
         status, data = self.request("/api/data")
         token = data["mySubToken"]
 
-        with patch.dict(os.environ, {"KUI_CF_DOMAINS_SOURCE": str(custom_file)}):
+        with patch.dict(os.environ, {
+            "KUI_CF_DOMAINS_SOURCE": str(custom_file),
+            "KUI_CF_HOSTNAME": "cf.example.com",
+            "KUI_CF_UUID": "99999999-9999-9999-9999-999999999999",
+        }):
             status, body = self.request(
                 f"/api/sub?user={data['mySubUser']}&token={token}&format=clash",
                 expect_json=False,
