@@ -1423,9 +1423,19 @@ class LocalAPITest(unittest.TestCase):
         rocket_start = body.index('  - name: "🚀 节点选择"')
         rocket_block = body[rocket_start:body.index("\n  - name:", rocket_start + 1)]
         self.assertIn('      - "直连·本机"', rocket_block)
+        # Verify 直连·本机 is near the top of 🚀 节点选择 (before individual CF/exit nodes)
+        self.assertLess(rocket_block.index('      - "直连·本机"'), 250)
         auto_start = body.index('  - name: "⚡ 自动选择"')
         auto_block = body[auto_start:body.index("\n  - name:", auto_start + 1)]
         self.assertIn('      - "直连·本机"', auto_block)
+
+        # Verify AI groups contain exactly 6 selector entries and no individual exit nodes
+        for grp in ("🧠 Claude", "🤖 ChatGPT", "🔵 Google·Gemini"):
+            grp_start = body.index(f'  - name: "{grp}"')
+            grp_block = body[grp_start:body.index("\n  - name:", grp_start + 1) if "\n  - name:" in body[grp_start + 1:] else len(body)]
+            self.assertIn('      - "DIRECT"', grp_block)
+            self.assertIn('      - "🏠 住宅自动"', grp_block)
+            self.assertNotIn('exit-01', grp_block)
 
     def test_clash_subscription_parses_custom_ports_and_tags_from_front_domains_source(self):
         self.manager.set_slot_ready("exit-01")

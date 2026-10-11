@@ -1201,7 +1201,16 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         reality_nodes = self._local_reality_nodes()
         publishable = {slot["id"]: slot for slot in self._publishable_slots()}
         nodes = []
+        if "host" in reality_nodes:
+            nodes.append({
+                **reality_nodes["host"],
+                "name": "直连·本机",
+                "country": "JP",
+                "_slot_id": "host",
+            })
         for slot_id, node in reality_nodes.items():
+            if slot_id == "host":
+                continue
             if slot_id in publishable:
                 # Local OpenVPN slots are direct exits and never use a
                 # client-side dialer proxy.
@@ -1210,13 +1219,6 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     "name": self._friendly_slot_name(publishable[slot_id]),
                     "country": self._slot_country_code(publishable[slot_id]),
                     "_slot_id": slot_id,
-                })
-            elif slot_id == "host":
-                nodes.append({
-                    **node,
-                    "name": "直连·本机",
-                    "country": "JP",
-                    "_slot_id": "host",
                 })
             elif slot_id.startswith("tr-"):
                 # tr-01 already exits through the Turkish upstream proxy on
@@ -1704,14 +1706,20 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         chain_group_name = "🏠 住宅·CF" if chain_names else ""
         cf_group_name = "⚡ CF入口" if cf_names else ""
 
+        # Prioritize local host and CF machine nodes at the top of 🚀 节点选择
+        top_local_nodes = [n for n in ("直连·本机", "CF·本机") if n in all_names or n in cf_names]
+        remaining_cf = [n for n in cf_names if n not in top_local_nodes]
+        remaining_all = [n for n in all_names if n not in top_local_nodes]
+
         groups = ["proxy-groups:"]
         rocket_proxies = [
             *([cf_group_name] if cf_group_name else []),
             "⚡ 自动选择",
             "🏠 住宅自动",
             *([chain_group_name] if chain_group_name else []),
-            *cf_names,
-            *all_names,
+            *top_local_nodes,
+            *remaining_cf,
+            *remaining_all,
             "DIRECT",
         ]
         groups.append('  - name: "🚀 节点选择"\n    type: select\n    proxies:\n' + lst(rocket_proxies))
@@ -1733,9 +1741,25 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             groups.append('  - name: "🏠 住宅自动"\n    type: select\n    proxies:\n      - "🚀 节点选择"')
         if chain_names:
             groups.append(f'  - name: "{chain_group_name}"\n    type: select\n    proxies:\n' + lst(chain_names))
+
+        ai_proxies = [
+            "🏠 住宅自动",
+            *([chain_group_name] if chain_group_name else []),
+            "🚀 节点选择",
+            *([cf_group_name] if cf_group_name else []),
+            "⚡ 自动选择",
+            "DIRECT",
+        ]
         for grp in ("🧠 Claude", "🤖 ChatGPT", "🔵 Google·Gemini"):
-            groups.append(f'  - name: "{grp}"\n    type: select\n    proxies:\n' + lst(["🏠 住宅自动", "🚀 节点选择", *([cf_group_name] if cf_group_name else []), "⚡ 自动选择", chain_group_name, *pure_names, "DIRECT"]))
-        groups.append(f'  - name: "🌐 其他流量"\n    type: select\n    proxies:\n' + lst(["🚀 节点选择", *([cf_group_name] if cf_group_name else []), "⚡ 自动选择", "🏠 住宅自动", chain_group_name, "DIRECT"]))
+            groups.append(f'  - name: "{grp}"\n    type: select\n    proxies:\n' + lst(ai_proxies))
+        groups.append(f'  - name: "🌐 其他流量"\n    type: select\n    proxies:\n' + lst([
+            "🚀 节点选择",
+            *([cf_group_name] if cf_group_name else []),
+            "⚡ 自动选择",
+            "🏠 住宅自动",
+            *([chain_group_name] if chain_group_name else []),
+            "DIRECT",
+        ]))
         groups.append('  - name: "🇨🇳 中国流量"\n    type: select\n    proxies:\n' + lst(["DIRECT", "🚀 节点选择"]))
 
         rules = ["rules:"]
