@@ -990,7 +990,6 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual("text/yaml", content_type)
         self.assertIn("mixed-port: 7890", body)
         self.assertIn('  - name: "🚀 节点选择"', body)
-        self.assertIn('  - name: "⚡ 自动选择"', body)
         self.assertIn('  - name: "🏠 住宅自动"', body)
         self.assertIn('  - name: "🧠 Claude"', body)
         self.assertIn('  - name: "🇨🇳 中国流量"', body)
@@ -1228,8 +1227,10 @@ class LocalAPITest(unittest.TestCase):
         self.assertIn(f'name: "{node_name}"', body)
         residential_start = body.index('  - name: "🏠 住宅自动"')
         residential_block = body[residential_start:body.index("\n  - name:", residential_start + 1)]
-        expected_res_node = f"{node_name}·CF"
-        self.assertIn(f'      - "{expected_res_node}"', residential_block)
+        self.assertIn(f'      - "{node_name}"', residential_block)
+        cf_start = body.index('  - name: "🏠 住宅·CF"')
+        cf_block = body[cf_start:body.index("\n  - name:", cf_start + 1)]
+        self.assertIn(f'      - "{node_name}·CF"', cf_block)
         self.assertNotIn(f'{node_name}·链式', body)
 
         manifest.write_text(
@@ -1309,7 +1310,7 @@ class LocalAPITest(unittest.TestCase):
         direct_block = body[direct_start:chain_start]
         chain_block = body[chain_start:body.index("\nproxy-groups:", chain_start)]
         self.assertNotIn("dialer-proxy:", direct_block)
-        self.assertIn('dialer-proxy: "⚡ 自动选择"', chain_block)
+        self.assertIn('dialer-proxy: "⚡ CF入口"', chain_block)
         self.assertEqual(1, body.count("dialer-proxy:"))
         self.assertNotIn("链式节点", body)
         self.assertNotIn('  - name: PROXY', body)
@@ -1324,11 +1325,11 @@ class LocalAPITest(unittest.TestCase):
         self.assertNotIn("cathaypacific.com", body)
         self.assertIn('      - "⚡ CF入口"', rocket_block)
 
-        # 验证 ⚡ 自动选择 不与 CF入口 重复，只包含真实出口
-        auto_start = body.index('  - name: "⚡ 自动选择"')
-        auto_block = body[auto_start:body.index("\n  - name:", auto_start + 1)]
-        self.assertIn(f'      - "{direct_name}"', auto_block)
-        self.assertNotIn("CF·", auto_block)
+        # 验证 🏠 住宅自动 为纯直连住宅出口（不带 ·CF）
+        res_start = body.index('  - name: "🏠 住宅自动"')
+        res_block = body[res_start:body.index("\n  - name:", res_start + 1)]
+        self.assertIn(f'      - "{direct_name}"', res_block)
+        self.assertNotIn("·CF", res_block)
 
         # 验证 AI 分流组均包含 DIRECT 选项
         for grp in ("🧠 Claude", "🤖 ChatGPT", "🔵 Google·Gemini"):
@@ -1419,22 +1420,21 @@ class LocalAPITest(unittest.TestCase):
         host_block = body[host_start:host_end]
         self.assertNotIn("dialer-proxy:", host_block)
         self.assertIn("type: vless", host_block)
-        # Verify 直连·本机 is present in 🚀 节点选择 and ⚡ 自动选择
+        # Verify 直连·本机 is present in 🚀 节点选择
         rocket_start = body.index('  - name: "🚀 节点选择"')
         rocket_block = body[rocket_start:body.index("\n  - name:", rocket_start + 1)]
         self.assertIn('      - "直连·本机"', rocket_block)
         # Verify 直连·本机 is near the top of 🚀 节点选择 (before individual CF/exit nodes)
         self.assertLess(rocket_block.index('      - "直连·本机"'), 250)
-        auto_start = body.index('  - name: "⚡ 自动选择"')
-        auto_block = body[auto_start:body.index("\n  - name:", auto_start + 1)]
-        self.assertIn('      - "直连·本机"', auto_block)
+        self.assertNotIn('⚡ 自动选择', body)
 
-        # Verify AI groups contain exactly 6 selector entries and no individual exit nodes
+        # Verify AI groups contain exactly 6 selector entries and include 直连·本机
         for grp in ("🧠 Claude", "🤖 ChatGPT", "🔵 Google·Gemini"):
             grp_start = body.index(f'  - name: "{grp}"')
             grp_block = body[grp_start:body.index("\n  - name:", grp_start + 1) if "\n  - name:" in body[grp_start + 1:] else len(body)]
             self.assertIn('      - "DIRECT"', grp_block)
             self.assertIn('      - "🏠 住宅自动"', grp_block)
+            self.assertIn('      - "直连·本机"', grp_block)
             self.assertNotIn('exit-01', grp_block)
 
     def test_clash_subscription_parses_custom_ports_and_tags_from_front_domains_source(self):

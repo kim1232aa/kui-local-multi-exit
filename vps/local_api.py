@@ -1592,9 +1592,9 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
 
     def _clash_subscription_yaml(self, thirdparty_nodes: list[dict[str, Any]]) -> str:
         """Clash/Mihomo subscription in the cs-pa (Cloud Shell) layout:
-        🚀 节点选择 / ⚡ 自动选择 / 🏠 住宅自动 + AI site groups + CN direct."""
+        🚀 节点选择 / ⚡ CF入口 / 🏠 住宅自动 / 🏠 住宅·CF + AI site groups + CN direct."""
         used_names = {
-            "🚀 节点选择", "⚡ CF入口", "⚡ 自动选择", "🏠 住宅自动", "VLESS-REALITY-链式",
+            "🚀 节点选择", "⚡ CF入口", "🏠 住宅自动", "🏠 住宅·CF", "VLESS-REALITY-链式",
             "🧠 Claude", "🤖 ChatGPT", "🔵 Google·Gemini",
             "🌐 其他流量", "🇨🇳 中国流量", "DIRECT",
         }
@@ -1617,6 +1617,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         cf_hostname, cf_uuid, cf_path = cf_cfg if cf_cfg else ("", "", "")
         cf_entries = self._cf_front_entries()
         cdn_domains = [(d, p, n) for d, p, n in cf_entries if d != cf_hostname] or cf_entries
+        cf_group_name = "⚡ CF入口" if (cf_cfg and cf_entries) else ""
 
         publishable = {slot["id"]: slot for slot in self._publishable_slots()}
         for node in self._local_subscription_nodes():
@@ -1638,14 +1639,15 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     )
                     proxies.append(cf_chain_yaml)
                     chain_names.append(cf_chain_name)
-                    pure_names.append(cf_chain_name)
+                    pure_names.append(added)
                 elif egress_type:
                     pure_names.append(added)
             elif str(node.get("_slot_id")) == "host":
                 add(node, direct_names)
             else:
-                # tr-* slots are chained exits: first hop via the auto group.
-                add({**node, "dialer-proxy": "⚡ 自动选择"}, extra_names)
+                # tr-* slots are chained exits: first hop via CF entrance or rocket group.
+                dialer = cf_group_name or "🚀 节点选择"
+                add({**node, "dialer-proxy": dialer}, extra_names)
 
         for bridge in self._bridge_nodes():
             if bridge.get("_source_kind", "manual") == "manual":
@@ -1658,7 +1660,8 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 if hint in {"TR", "VN", "TH", "PH"} and not raw_name.startswith(hint + "-")
                 else f"自动链式 | {raw_name}"
             )
-            add({**bridge, "name": name, "dialer-proxy": "⚡ 自动选择"}, extra_names)
+            dialer = cf_group_name or "🚀 节点选择"
+            add({**bridge, "name": name, "dialer-proxy": dialer}, extra_names)
 
         for node in thirdparty_nodes:
             add(node, extra_names)
@@ -1704,7 +1707,8 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         # Mihomo removed relay groups. Each residential exit gets a chain
         # clone with a fixed first-hop dialer, so the chain remains valid.
         chain_group_name = "🏠 住宅·CF" if chain_names else ""
-        cf_group_name = "⚡ CF入口" if cf_names else ""
+        if not cf_names:
+            cf_group_name = ""
 
         # Prioritize local host and CF machine nodes at the top of 🚀 节点选择
         top_local_nodes = [n for n in ("直连·本机", "CF·本机") if n in all_names or n in cf_names]
@@ -1714,7 +1718,6 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         groups = ["proxy-groups:"]
         rocket_proxies = [
             *([cf_group_name] if cf_group_name else []),
-            "⚡ 自动选择",
             "🏠 住宅自动",
             *([chain_group_name] if chain_group_name else []),
             *top_local_nodes,
@@ -1732,22 +1735,21 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 '    tolerance: 100\n'
                 '    proxies:\n' + lst(cf_names)
             )
-        # Auto-selection pool: include CF-routed residential exits first, then direct exits as fallback
-        auto_proxies = [*chain_names, *direct_names] if (chain_names or direct_names) else (cf_names or ["DIRECT"])
-        groups.append('  - name: "⚡ 自动选择"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 300\n    tolerance: 100\n    proxies:\n' + lst(auto_proxies))
+        # Scheme A: 🏠 住宅自动 contains pure direct residential exits (no CF), url-test
         if pure_names:
             groups.append('  - name: "🏠 住宅自动"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 300\n    tolerance: 150\n    proxies:\n' + lst(pure_names))
         else:
             groups.append('  - name: "🏠 住宅自动"\n    type: select\n    proxies:\n      - "🚀 节点选择"')
+        # Scheme A: 🏠 住宅·CF contains CF-routed residential exits, select
         if chain_names:
             groups.append(f'  - name: "{chain_group_name}"\n    type: select\n    proxies:\n' + lst(chain_names))
 
         ai_proxies = [
-            "🏠 住宅自动",
             *([chain_group_name] if chain_group_name else []),
-            "🚀 节点选择",
+            "🏠 住宅自动",
             *([cf_group_name] if cf_group_name else []),
-            "⚡ 自动选择",
+            *([n for n in ("直连·本机",) if n in all_names]),
+            "🚀 节点选择",
             "DIRECT",
         ]
         for grp in ("🧠 Claude", "🤖 ChatGPT", "🔵 Google·Gemini"):
@@ -1755,9 +1757,9 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         groups.append(f'  - name: "🌐 其他流量"\n    type: select\n    proxies:\n' + lst([
             "🚀 节点选择",
             *([cf_group_name] if cf_group_name else []),
-            "⚡ 自动选择",
-            "🏠 住宅自动",
             *([chain_group_name] if chain_group_name else []),
+            "🏠 住宅自动",
+            *([n for n in ("直连·本机",) if n in all_names]),
             "DIRECT",
         ]))
         groups.append('  - name: "🇨🇳 中国流量"\n    type: select\n    proxies:\n' + lst(["DIRECT", "🚀 节点选择"]))
