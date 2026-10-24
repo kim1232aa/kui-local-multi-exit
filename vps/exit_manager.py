@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import socket
 import subprocess
 import threading
 import time
+import traceback
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +21,7 @@ from .proxy_server import ProxyListener
 from .routing import RouteManager
 from .slot_config import is_connectivity_only_slot
 from .store import LocalStore
-from .vpngate import STREAM_URLS, NodePool, check_geo, check_residential, detect_egress, probe_204, probe_targets
+from .vpngate import STREAM_URLS, NodePool, check_geo, check_residential, detect_egress, probe_health_reference, probe_targets
 
 
 @dataclass
@@ -31,13 +33,21 @@ class SlotRuntime:
     stop: threading.Event | None = None
     lock: threading.RLock | None = None
     preferred_node_ip: str = ""
-    last_verify: float = 0.0
+    dial_started: float = 0.0
+    health_heartbeat: tuple[int, float] | None = None
+    health_check_requested: bool = False
 
 
 COUNTRY_FALLBACK_AFTER_FAILURES = 2
 COUNTRY_SLOT_FAILURE_LIMIT = 5
-HEALTH_VERIFY_INTERVAL_SECONDS = 180
-STALE_SLOT_AFTER_SECONDS = 1800
+RECOVERY_INTERVAL_SECONDS = 15
+HEALTH_INTERVAL_SECONDS = 300
+HEALTH_RETRY_INTERVAL_SECONDS = 30
+HEALTH_BACKOFF_SECONDS = (60, 120, 300)
+HEALTH_STAGGER_SECONDS = 30
+HEALTH_PROBE_WORKERS = 2
+STALE_SLOT_AFTER_SECONDS = 180
+DIAL_TIMEOUT_SECONDS = 300
 
 
 class ExitManager:
@@ -90,9 +100,14 @@ class ExitManager:
         if not 1 <= dial_workers <= slot_count:
             raise ValueError(f"dial_workers must be between 1 and {slot_count}")
         self._dial_slots = threading.BoundedSemaphore(dial_workers)
+        self._health_slots = threading.BoundedSemaphore(HEALTH_PROBE_WORKERS)
         self._selection_lock = threading.RLock()
         self._reserved_nodes: dict[str, str] = {}
         self._refresh_thread: threading.Thread | None = None
+        self._recovery_thread: threading.Thread | None = None
+        self._reference_lock = threading.Lock()
+        self._reference_expires = 0.0
+        self._reference_result: dict[str, Any] = {}
 
     @property
     def managed_slot_ids(self) -> tuple[str, ...]:
@@ -127,6 +142,8 @@ class ExitManager:
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.config_dir.mkdir(parents=True, exist_ok=True)
         for slot in self.store.list_slots():
+            if slot.enabled and self.is_managed_slot(slot.id):
+                self.runtime(slot.id).preferred_node_ip = slot.entry_ip or self.store.last_connected_entry_ip(slot.id)
             self.routing.cleanup(slot)
             if slot.state not in {"idle", "disabled"}:
                 self.store.set_runtime(slot.id, state="idle", entry_ip="", egress_ip="", current_node={}, check_result={})
@@ -138,6 +155,9 @@ class ExitManager:
         for slot in self._managed_slots():
             if slot.enabled:
                 self.start_slot(slot.id)
+        if self.start_workers:
+            self._recovery_thread = threading.Thread(target=self._recovery_loop, name="slot-recovery", daemon=True)
+            self._recovery_thread.start()
 
     def refresh_nodes(self) -> int:
         report: dict[str, Any] = {}
@@ -171,88 +191,151 @@ class ExitManager:
         self.store.record_event(None, "openvpn_refresh_empty", "all OpenVPN sources returned no usable nodes")
         return 0
 
+    def _report_recovery_error(self, slot_id: str | None, operation: str) -> None:
+        message = f"{operation}: {traceback.format_exc().strip()}"
+        logging.getLogger(__name__).exception("%s failed for %s", operation, slot_id or "node pool")
+        try:
+            self.store.record_event(slot_id, "recovery_error", message)
+        except Exception:
+            logging.getLogger(__name__).exception("could not persist recovery error")
+
     def _refresh_loop(self) -> None:
-        """Periodically refresh node pool and try to recover disabled slots."""
-        refresh_interval = 600
-        recovery_interval = 60
-        next_refresh = time.time() + refresh_interval
-        while not self._shutdown.wait(recovery_interval):
-            self._try_recover_auto_disabled_slots()
-            self._try_recover_idle_slots()
-            self._try_recover_stale_slots()
-            if time.time() >= next_refresh:
-                count = self.refresh_nodes()
-                if count > 0:
-                    self._try_recover_auto_disabled_slots()
-                next_refresh = time.time() + refresh_interval
+        """Refresh providers without blocking the independent recovery watchdog."""
+        while not self._shutdown.wait(600):
+            try:
+                self.refresh_nodes()
+            except Exception:
+                self._report_recovery_error(None, "node refresh")
+
+    def _recovery_loop(self) -> None:
+        while not self._shutdown.wait(RECOVERY_INTERVAL_SECONDS):
+            for operation, recover in (
+                ("disabled slot recovery", self._try_recover_auto_disabled_slots),
+                ("orphan recovery", self._try_recover_idle_slots),
+                ("stale slot recovery", self._try_recover_stale_slots),
+            ):
+                try:
+                    recover()
+                except Exception:
+                    self._report_recovery_error(None, operation)
 
     def _try_recover_idle_slots(self) -> None:
-        """Recover enabled managed slots that have no active worker or retry timer.
-
-        If a slot is enabled but left in 'idle' or an orphaned state without an
-        active connection worker or scheduled retry, restart it automatically so
-        transient races or deadlocks never cause slots to stay dead silently.
-        """
+        """Restart orphaned slots, ignoring retry timers that have already ended."""
         for slot in self._managed_slots():
-            if not slot.enabled or slot.state == "ready":
-                continue
-            runtime = self.runtime(slot.id)
-            assert runtime.lock is not None
-            with runtime.lock:
-                worker_active = runtime.worker is not None and runtime.worker.is_alive()
-                has_timer = runtime.retry_timer is not None
-            if not worker_active and not has_timer:
-                self.store.record_event(
-                    slot.id,
-                    "auto_recovery",
-                    "idle slot restarted by self-healing loop",
-                )
-                self.start_slot(slot.id)
+            try:
+                if not slot.enabled or slot.state in {"ready", "degraded"}:
+                    continue
+                runtime = self.runtime(slot.id)
+                assert runtime.lock is not None
+                with runtime.lock:
+                    worker_active = runtime.worker is not None and runtime.worker.is_alive()
+                    if runtime.retry_timer is not None and not runtime.retry_timer.is_alive():
+                        runtime.retry_timer = None
+                    has_timer = runtime.retry_timer is not None
+                if not worker_active and not has_timer:
+                    self.store.record_event(slot.id, "auto_recovery", "orphaned slot restarted by watchdog")
+                    self.start_slot(slot.id)
+            except Exception:
+                self._report_recovery_error(slot.id, "orphan recovery")
+
+    def _repair_listener(self, slot_id: str, generation: int) -> bool:
+        """Repair a dead local listener without tearing down its live VPN tunnel."""
+        runtime = self.runtime(slot_id)
+        assert runtime.lock is not None and runtime.stop is not None
+        with runtime.lock:
+            if self._worker_is_stale(slot_id, generation, runtime.stop):
+                return False
+            if runtime.process is None or runtime.process.poll() is not None:
+                return False
+            current = self.store.get_slot(slot_id)
+            if self.listener_ready(slot_id):
+                return True
+            self._update_health(slot_id, generation, {"ok": False, "status": "local_listener", "error": "SOCKS listener restarting"})
+            if runtime.listener:
+                runtime.listener.stop()
+                runtime.listener = None
+            listener = self.listener_factory(current.id, "0.0.0.0", current.proxy_port, current.tunnel_name, current.mark)
+            try:
+                listener.start(timeout=3)
+                if self._worker_is_stale(slot_id, generation, runtime.stop):
+                    listener.stop()
+                    return False
+                runtime.listener = listener
+                runtime.health_check_requested = True
+            except Exception:
+                listener.stop()
+                raise
+            self.store.record_event(slot_id, "auto_recovery", "SOCKS listener restarted; VPN retained; awaiting path verification")
+            return True
 
     def _try_recover_stale_slots(self) -> None:
-        """Re-dial slots whose runtime record stopped making progress.
-
-        A dead health thread leaves the slot in ``ready`` forever, so the
-        record itself is the last-resort liveness signal: when a ready slot
-        has not been touched for ``STALE_SLOT_AFTER_SECONDS`` while other
-        slots still commit, force a redial.
-        """
-        stale_after = STALE_SLOT_AFTER_SECONDS
-        with self._selection_lock:
-            slots = self._managed_slots()
-        any_recent = any(slot.updated_at > time.time() - stale_after for slot in slots)
-        for slot in slots:
-            if slot.state != "ready" or not slot.enabled:
-                continue
-            if not any_recent or time.time() - slot.updated_at < stale_after:
-                continue
-            self.store.record_event(slot.id, "auto_recovery", "ready slot went stale; forcing redial")
-            self.redial_slot(slot.id)
+        """Recover dead runtimes, repairing local listeners without changing VPNs."""
+        for slot in self._managed_slots():
+            try:
+                if not slot.enabled:
+                    continue
+                runtime = self.runtime(slot.id)
+                assert runtime.lock is not None
+                reason = ""
+                with runtime.lock:
+                    if slot.state in {"ready", "degraded"}:
+                        if runtime.worker is None or not runtime.worker.is_alive():
+                            reason = "ready slot health worker stopped"
+                        elif runtime.process is None or runtime.process.poll() is not None:
+                            returncode = runtime.process.poll() if runtime.process is not None else "missing"
+                            reason = f"active slot OpenVPN process stopped (returncode={returncode})"
+                        elif not self.listener_ready(slot.id):
+                            self._repair_listener(slot.id, slot.generation)
+                            continue
+                        else:
+                            heartbeat = runtime.health_heartbeat
+                            if heartbeat is not None and heartbeat[0] == slot.generation:
+                                age = time.monotonic() - heartbeat[1]
+                            else:
+                                age = time.time() - slot.updated_at
+                            if age >= STALE_SLOT_AFTER_SECONDS:
+                                reason = "ready slot heartbeat expired"
+                    elif slot.state == "connecting" and runtime.dial_started:
+                        if time.monotonic() - runtime.dial_started >= DIAL_TIMEOUT_SECONDS:
+                            reason = "connection worker exceeded dial deadline"
+                if reason:
+                    current = self.store.get_slot(slot.id)
+                    if current.enabled and current.generation == slot.generation:
+                        self.store.record_event(slot.id, "auto_recovery", f"{reason}; forcing redial")
+                        self.redial_slot(slot.id, automatic=True)
+            except Exception:
+                self._report_recovery_error(slot.id, "stale slot recovery")
 
     def _try_recover_auto_disabled_slots(self) -> None:
-        """Recover only managed slots that have an eligible unreserved node."""
-        recoverable: list[str] = []
+        """Recover automatically disabled slots only when same-country nodes exist."""
+        recoverable: list[ExitSlotSnapshot] = []
         with self._selection_lock:
             excluded = set(self._reserved_nodes.values())
             excluded.update(slot.entry_ip for slot in self._managed_slots() if slot.entry_ip)
             for slot in self._managed_slots():
-                if slot.enabled or slot.disabled_reason != "automatic_failure_limit":
-                    continue
-                node = self._select_node(slot.country, excluded)
-                if node is None:
-                    for fb in ("JP", "KR", "US"):
-                        if fb != slot.country:
-                            node = self._select_node(fb, excluded)
-                            if node is not None:
-                                break
-                if node is None:
-                    continue
-                recoverable.append(slot.id)
-                excluded.add(str(node["ip"]))
-        for slot_id in recoverable:
-            updated = self.store.enable_slot(slot_id)
-            self.store.record_event(slot_id, "auto_recovery", "eligible node became available")
-            self.start_slot(updated.id)
+                try:
+                    if slot.enabled or slot.disabled_reason != "automatic_failure_limit":
+                        continue
+                    node = self._select_node(slot.country, excluded)
+                    if node is None:
+                        continue
+                    recoverable.append(slot)
+                    excluded.add(str(node["ip"]))
+                except Exception:
+                    self._report_recovery_error(slot.id, "candidate recovery")
+        for slot in recoverable:
+            try:
+                runtime = self.runtime(slot.id)
+                assert runtime.lock is not None
+                with runtime.lock:
+                    current = self.store.get_slot(slot.id)
+                    if current.generation != slot.generation or current.disabled_reason != "automatic_failure_limit":
+                        continue
+                    updated = self.store.enable_slot(slot.id)
+                self.store.record_event(slot.id, "auto_recovery", "eligible same-country node became available")
+                self.start_slot(updated.id)
+            except Exception:
+                self._report_recovery_error(slot.id, "disabled slot recovery")
 
     def active_entry_ips(self, excluding: str | None = None) -> set[str]:
         with self._selection_lock:
@@ -280,7 +363,7 @@ class ExitManager:
         old_worker = None
         with runtime.lock:
             if runtime.worker is not None:
-                if runtime.worker.is_alive() and not runtime.stop.is_set() and slot.state in {"connecting", "ready"}:
+                if runtime.worker.is_alive() and not runtime.stop.is_set() and slot.state in {"connecting", "ready", "degraded"}:
                     return slot
                 old_worker = runtime.worker
 
@@ -295,7 +378,7 @@ class ExitManager:
                 runtime.worker is not None
                 and runtime.worker.is_alive()
                 and not runtime.stop.is_set()
-                and current_slot.state in {"connecting", "ready"}
+                and current_slot.state in {"connecting", "ready", "degraded"}
             ):
                 return current_slot
             runtime.worker = None
@@ -306,6 +389,9 @@ class ExitManager:
                 runtime.listener.stop()
                 runtime.listener = None
             runtime.stop.clear()
+            runtime.dial_started = 0.0
+            runtime.health_heartbeat = None
+            runtime.health_check_requested = False
             slot = self.store.set_runtime(slot_id, state="connecting", last_error="")
             if self.start_workers:
                 generation = slot.generation
@@ -361,18 +447,26 @@ class ExitManager:
                 if runtime.worker is worker and not worker.is_alive():
                     runtime.worker = None
 
-    def redial_slot(self, slot_id: str) -> ExitSlotSnapshot:
+    def redial_slot(self, slot_id: str, *, automatic: bool = False) -> ExitSlotSnapshot:
         self._require_managed_slot(slot_id)
         slot = self.store.get_slot(slot_id)
+        if automatic and not slot.enabled:
+            return slot
+        if automatic and slot.state in {"ready", "degraded"} and slot.entry_ip:
+            runtime = self.runtime(slot_id)
+            assert runtime.lock is not None
+            with runtime.lock:
+                runtime.preferred_node_ip = slot.entry_ip
         if slot.entry_ip:
             self.node_pool.penalize(slot.entry_ip, 3000)
         self.stop_slot(slot_id, stop_listener=False)
         updated = self.store.get_slot(slot_id)
         if not updated.enabled:
-            # A manual redial is an explicit recovery request: lift any
-            # automatic disable instead of returning a dead slot.
+            if automatic:
+                return updated
+            # Only an explicit manual request can lift a disabled slot.
             updated = self.store.enable_slot(slot_id)
-        self.store.record_event(slot_id, "redial", "manual redial requested")
+        self.store.record_event(slot_id, "redial", "watchdog redial requested" if automatic else "manual redial requested")
         return self.start_slot(updated.id)
 
     def connect_slot(self, slot_id: str, node_ip: str) -> ExitSlotSnapshot:
@@ -395,7 +489,7 @@ class ExitManager:
     def enable_slot(self, slot_id: str) -> ExitSlotSnapshot:
         self._require_managed_slot(slot_id)
         current = self.store.get_slot(slot_id)
-        if current.enabled and current.state in {"connecting", "ready"}:
+        if current.enabled and current.state in {"connecting", "ready", "degraded"}:
             return current
         slot = self.store.enable_slot(slot_id)
         return self.start_slot(slot.id)
@@ -472,6 +566,10 @@ class ExitManager:
             current = self.store.get_slot(slot_id)
             if not current.enabled or current.generation != generation:
                 return current
+            if current.state in {"ready", "degraded"} and current.entry_ip:
+                # One explicit retry of the just-working peer, then ordinary
+                # same-country selection/cooldown if that handshake also fails.
+                runtime.preferred_node_ip = current.entry_ip
             max_failures = COUNTRY_SLOT_FAILURE_LIMIT if current.country != "ANY" else 3
             failed = self.fail_slot(slot_id, error, max_failures=max_failures)
         if endpoint_ip:
@@ -497,6 +595,7 @@ class ExitManager:
         egress_ip: str,
         node: dict[str, Any],
         check_result: dict[str, Any],
+        prepared_listener: ProxyListener | None = None,
     ) -> bool:
         current = self.store.get_slot(slot_id)
         node_country = str(node.get("country") or "").upper()
@@ -510,7 +609,7 @@ class ExitManager:
         assert runtime.lock is not None and runtime.stop is not None
         if self._shutdown.is_set() or runtime.stop.is_set():
             return False
-        listener = self.listener_factory(
+        listener = prepared_listener or self.listener_factory(
             current.id,
             "0.0.0.0",
             current.proxy_port,
@@ -523,15 +622,17 @@ class ExitManager:
                 listener.stop()
                 return False
             self.store.append_check_result(slot_id, generation, check_result)
+            health = check_result.get("health", {})
+            verified = health.get("ok", True)
             updated = self.store.set_runtime_if_generation(
                 slot_id,
                 generation,
-                state="ready",
+                state="ready" if verified else "degraded",
                 entry_ip=entry_ip,
                 egress_ip=egress_ip,
                 current_node=node,
                 check_result=check_result,
-                last_error="",
+                last_error="" if verified else json.dumps(health, ensure_ascii=False),
                 failure_streak=0,
             )
             if updated is None:
@@ -646,6 +747,9 @@ class ExitManager:
     @staticmethod
     def _prepare_runtime_log(path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size:
+            path.chmod(0o600)
+            path.replace(path.with_suffix(path.suffix + ".previous"))
         path.touch(mode=0o600, exist_ok=True)
         path.chmod(0o600)
 
@@ -733,6 +837,7 @@ class ExitManager:
                 return
             try:
                 with runtime.lock:
+                    runtime.dial_started = time.monotonic()
                     preferred_ip = runtime.preferred_node_ip
                     runtime.preferred_node_ip = ""
                 node = self._reserve_node(
@@ -880,15 +985,26 @@ class ExitManager:
                     self.record_failed_check(slot_id, generation, check_result)
                     self.node_pool.penalize(endpoint_ip, 3000)
                     raise RuntimeError("target probes failed")
-                if not self.commit_ready(
-                    slot_id,
-                    generation,
-                    entry_ip=endpoint_ip,
-                    egress_ip=egress_ip,
-                    node={key: value for key, value in node.items() if key != "config"},
-                    check_result=check_result,
-                ):
-                    raise RuntimeError("slot configuration changed during dial")
+                listener = self.listener_factory(slot.id, "0.0.0.0", slot.proxy_port, slot.tunnel_name, slot.mark)
+                try:
+                    listener.start(timeout=3)
+                    health = self._check_client_targets(slot)
+                    if not health["ok"]:
+                        self.record_failed_check(slot_id, generation, {**check_result, "health": health})
+                    check_result["health"] = {**health, "checked_at": int(time.time())}
+                    if not self.commit_ready(
+                        slot_id,
+                        generation,
+                        entry_ip=endpoint_ip,
+                        egress_ip=egress_ip,
+                        node={key: value for key, value in node.items() if key != "config"},
+                        check_result=check_result,
+                        prepared_listener=listener,
+                    ):
+                        raise RuntimeError("slot configuration changed during dial")
+                except Exception:
+                    listener.stop()
+                    raise
             finally:
                 self._dial_slots.release()
             self._health_loop(slot_id, generation)
@@ -898,7 +1014,7 @@ class ExitManager:
         finally:
             current = self.store.get_slot(slot_id)
             owns_generation = current.generation == generation
-            if owns_generation and current.state != "ready":
+            if owns_generation and current.state not in {"ready", "degraded"}:
                 if process is not None:
                     self._terminate_process(runtime, process)
                 self._release_node(slot_id)
@@ -913,6 +1029,74 @@ class ExitManager:
                 if runtime.worker is threading.current_thread():
                     runtime.worker = None
 
+    def _handle_probe_failure(self, slot_id: str, generation: int, error: str) -> bool:
+        """Return True only when a slot-local failure is sent through retry handling."""
+        runtime = self.runtime(slot_id)
+        assert runtime.stop is not None
+        if self._worker_is_stale(slot_id, generation, runtime.stop):
+            return False
+        # A host/DNS/health-target outage must not tear down every live tunnel.
+        # Serialize this diagnostic so many failed slots share one bounded probe.
+        with self._reference_lock:
+            if time.monotonic() >= self._reference_expires:
+                self._reference_result = probe_health_reference(self._run)
+                self._reference_expires = time.monotonic() + 15
+            reference = dict(self._reference_result)
+        current = self.store.get_slot(slot_id)
+        if self._worker_is_stale(slot_id, generation, runtime.stop):
+            return False
+        if reference.get("ok") or runtime.process is None or runtime.process.poll() is not None:
+            self.store.record_event(slot_id, "health_check_failed", f"{error}, triggering retry")
+            self._handle_connection_failure(slot_id, generation, error, current.entry_ip)
+            return True
+        detail = f"{error}; shared health reference unavailable: {json.dumps(reference, ensure_ascii=False)}; retaining existing tunnel"
+        check_result = {**current.check_result, "health": {
+            **current.check_result.get("health", {}),
+            "ok": False, "status": "shared_unavailable", "error": error, "reference": reference,
+            "checked_at": int(time.time()),
+        }}
+        updated = self.store.set_runtime_if_generation(
+            slot_id, generation, state="degraded", last_error=detail, check_result=check_result,
+        )
+        if updated is not None and (current.state != "degraded" or current.last_error != detail):
+            self.store.record_event(slot_id, "shared_probe_unavailable", detail)
+        return False
+
+    def _wait_for_health_check(
+        self, slot_id: str, generation: int, stop_event: threading.Event, delay: float,
+    ) -> bool:
+        """Keep worker liveness separate from infrequent successful network checks."""
+        runtime = self.runtime(slot_id)
+        deadline = time.monotonic() + delay
+        while not self._worker_is_stale(slot_id, generation, stop_event):
+            now = time.monotonic()
+            runtime.health_heartbeat = (generation, now)
+            if runtime.health_check_requested:
+                runtime.health_check_requested = False
+                return True
+            remaining = deadline - now
+            if remaining <= 0:
+                return True
+            if stop_event.wait(min(RECOVERY_INTERVAL_SECONDS, remaining)):
+                return False
+        return False
+
+    def _acquire_health_slot(
+        self, slot_id: str, generation: int, stop_event: threading.Event,
+    ) -> bool:
+        runtime = self.runtime(slot_id)
+        while not self._worker_is_stale(slot_id, generation, stop_event):
+            runtime.health_heartbeat = (generation, time.monotonic())
+            if self._health_slots.acquire(timeout=1):
+                valid = False
+                try:
+                    valid = not self._worker_is_stale(slot_id, generation, stop_event)
+                    return valid
+                finally:
+                    if not valid:
+                        self._health_slots.release()
+        return False
+
     def _health_loop(
         self,
         slot_id: str,
@@ -923,87 +1107,158 @@ class ExitManager:
         if stop_event is None:
             assert runtime.stop is not None
             stop_event = runtime.stop
+        phase = (self._managed_slot_ids.index(slot_id) + 1) / len(self._managed_slot_ids)
+        delay = HEALTH_RETRY_INTERVAL_SECONDS if self.store.get_slot(slot_id).state == "degraded" else HEALTH_INTERVAL_SECONDS * phase
         failures = 0
-        while True:
-            if self._shutdown.is_set() or stop_event.wait(60):
-                return
+        while self._wait_for_health_check(slot_id, generation, stop_event, delay):
             current = self.store.get_slot(slot_id)
-            if not current.enabled or current.generation != generation or runtime.process is None:
+            if self._worker_is_stale(slot_id, generation, stop_event):
                 return
-            if runtime.process.poll() is not None:
-                self._handle_connection_failure(slot_id, generation, "OpenVPN process exited", current.entry_ip)
+            returncode = runtime.process.poll() if runtime.process is not None else "missing"
+            if returncode is not None:
+                error = f"OpenVPN process exited (returncode={returncode})"
+                self._handle_connection_failure(slot_id, generation, error, current.entry_ip)
                 return
             if not self.routing.is_installed(current):
                 self._handle_connection_failure(slot_id, generation, "policy route disappeared", current.entry_ip)
                 return
-            if probe_204(current.tunnel_name, self._run):
-                failures = 0
-                now = time.time()
-                self.store.touch_slot(slot_id, generation)
-                if now - runtime.last_verify >= HEALTH_VERIFY_INTERVAL_SECONDS:
-                    runtime.last_verify = now
-                    self._verify_client_path(slot_id, current, generation)
-                continue
-            failures += 1
-            if failures >= 2:
-                error = "HTTP 204 probe failed twice consecutively"
-                self.store.record_event(
-                    slot_id,
-                    "health_check_failed",
-                    f"{error}, triggering retry",
-                )
-                # This loop runs inside the connection worker, so it must defer
-                # redial through failure handling instead of restarting itself.
-                self._handle_connection_failure(slot_id, generation, error, current.entry_ip)
+            if not self._acquire_health_slot(slot_id, generation, stop_event):
                 return
+            try:
+                healthy = self._verify_client_path(slot_id, current, generation)
+                if self._worker_is_stale(slot_id, generation, stop_event):
+                    return
+                if healthy:
+                    failures = 0
+                else:
+                    failures += 1
+                    if failures >= 2 and self._diagnose_client_failure(slot_id, generation):
+                        return
+                if failures == 1:
+                    delay = HEALTH_RETRY_INTERVAL_SECONDS
+                elif failures >= 2:
+                    delay = HEALTH_BACKOFF_SECONDS[min(failures - 2, len(HEALTH_BACKOFF_SECONDS) - 1)]
+                else:
+                    delay = HEALTH_INTERVAL_SECONDS + HEALTH_STAGGER_SECONDS * phase
+            finally:
+                self._health_slots.release()
 
-    def _verify_client_path(
-        self,
-        slot_id: str,
-        slot: ExitSlotSnapshot,
-        generation: int,
-    ) -> None:
-        """Fail the slot when its local SOCKS listener stops serving clients.
-
-        probe_204 only exercises the tunnel itself. A stuck listener serves
-        nothing even though the tunnel is healthy, so the check runs through
-        the client entry (127.0.0.1:proxy_port) with listener credentials.
-        """
-        runtime = self.runtime(slot_id)
-        assert runtime.lock is not None
-        with runtime.lock:
-            listener = runtime.listener
-        if listener is None:
-            return
+    def _probe_target(self, slot: ExitSlotSnapshot, url: str, *, via_socks: bool = True) -> dict[str, Any]:
+        """One bounded request, with no recovery side effects or credential-bearing errors."""
+        secrets = []
+        if via_socks:
+            try:
+                username, password = load_internal_proxy_credentials(str(self.workspace))
+            except (RuntimeError, ValueError):
+                return {"url": url, "ok": False, "transport_ok": False,
+                        "classification": "local_configuration", "error": "internal proxy credentials unavailable"}
+            secrets = [username, password, urllib.parse.quote(username, safe=""), urllib.parse.quote(password, safe="")]
+            proxy = f"socks5h://{urllib.parse.quote(username, safe='')}:{urllib.parse.quote(password, safe='')}@127.0.0.1:{slot.proxy_port}"
+            route = ["-x", proxy, "--noproxy", ""]
+        else:
+            route = ["--interface", slot.tunnel_name, "--noproxy", "*",
+                     "--doh-url", "https://cloudflare-dns.com/dns-query",
+                     "--resolve", "cloudflare-dns.com:443:1.1.1.1"]
+        command = ["curl", "-o", "/dev/null", "-sS", "-w", "%{http_code}",
+                   "--connect-timeout", "5", "--max-time", "10", *route, url]
+        started = time.monotonic()
         try:
-            username, password = load_internal_proxy_credentials(str(self.workspace))
-        except (RuntimeError, ValueError) as error:
-            self.store.record_event(slot_id, "health_check_skip", str(error))
-            return
-        failures = 0
-        while failures < 2 and not self._worker_is_stale(slot_id, generation, runtime.stop):
-            result = self._run(
-                [
-                    "curl",
-                    "-o", "/dev/null",
-                    "-s", "-w", "%{http_code}",
-                    "-m", "10",
-                    "-x", f"socks5h://{username}:{password}@127.0.0.1:{slot.proxy_port}",
-                    "https://www.gstatic.com/generate_204",
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if result.returncode == 0 and _probe_status_ok(getattr(result, "stdout", "")):
-                self.store.touch_slot(slot_id, generation)
-                return
-            failures += 1
-            if failures < 2:
-                self._sleep(2)
-        error = "SOCKS listener not serving clients"
-        self.store.record_event(slot_id, "health_check_failed", f"{error}, triggering retry")
-        self._handle_connection_failure(slot_id, generation, error, slot.entry_ip)
+            result = self._run(command, capture_output=True, text=True, check=False, timeout=12)
+            code = str(getattr(result, "stdout", "") or "").strip()
+            returncode = result.returncode
+            error = str(getattr(result, "stderr", "") or "").strip()
+        except (OSError, subprocess.TimeoutExpired) as caught:
+            code, returncode = "000", -1
+            # TimeoutExpired includes the full argv, including proxy credentials.
+            error = type(caught).__name__
+        for secret in secrets:
+            if secret:
+                error = error.replace(secret, "[redacted]")
+        transport_ok = returncode == 0 and re.fullmatch(r"[2-5][0-9]{2}", code) is not None and code != "407"
+        ok = transport_ok and (code == "204" if url.endswith("/generate_204") else 200 <= int(code) < 400)
+        classification = "checked" if ok else "target_error" if transport_ok else "transport_error"
+        if via_socks and (returncode == 67 or re.search(r"authentication|user was rejected|no acceptable auth", error, re.I)):
+            classification = "local_configuration"
+        return {"url": url, "ok": bool(ok), "transport_ok": transport_ok,
+                "classification": classification, "code": code, "returncode": returncode,
+                "elapsed_ms": round((time.monotonic() - started) * 1000), "error": error[:500]}
+
+    def _check_client_targets(self, slot: ExitSlotSnapshot) -> dict[str, Any]:
+        runtime = self.runtime(slot.id)
+        assert runtime.stop is not None
+        if self._worker_is_stale(slot.id, slot.generation, runtime.stop):
+            return {"ok": False, "status": "cancelled", "attempts": []}
+        primary = self._probe_target(slot, "https://www.gstatic.com/generate_204")
+        attempts = [primary]
+        if self._worker_is_stale(slot.id, slot.generation, runtime.stop):
+            return {"ok": False, "status": "cancelled", "attempts": attempts}
+        if primary["ok"]:
+            return {"ok": True, "status": "checked", "attempts": attempts}
+        if primary["classification"] == "local_configuration":
+            return {"ok": False, "status": "local_configuration", "attempts": attempts}
+        alternate = next((url for url in STREAM_URLS if "google" not in url and "gstatic" not in url), None)
+        if alternate:
+            attempts.append(self._probe_target(slot, alternate))
+        if any(attempt["classification"] == "local_configuration" for attempt in attempts):
+            return {"ok": False, "status": "local_configuration", "attempts": attempts}
+        reachable = any(attempt["transport_ok"] for attempt in attempts)
+        # A verified HTTPS 403/5xx is evidence of a live transport, not AI unlock.
+        return {"ok": reachable, "status": "target_error" if reachable else "transport_error", "attempts": attempts}
+
+    def _update_health(self, slot_id: str, generation: int, health: dict[str, Any]) -> bool:
+        runtime = self.runtime(slot_id)
+        assert runtime.stop is not None
+        if self._worker_is_stale(slot_id, generation, runtime.stop):
+            return False
+        current = self.store.get_slot(slot_id)
+        ok = bool(health.get("ok"))
+        health = {**health, "checked_at": int(time.time())}
+        detail = "" if ok else json.dumps(health, ensure_ascii=False)
+        updated = self.store.set_runtime_if_generation(
+            slot_id, generation, state="ready" if ok else "degraded", last_error=detail,
+            check_result={**current.check_result, "health": health},
+        )
+        if updated is None:
+            return False
+        previous_status = current.check_result.get("health", {}).get("status")
+        if ok and current.state == "degraded":
+            self.store.record_event(slot_id, "health_recovered", "original SOCKS path recovered; existing tunnel retained")
+        if health["status"] != previous_status and health["status"] != "checked":
+            self.store.record_event(slot_id, "health_probe_detail", json.dumps(health, ensure_ascii=False))
+        return ok
+
+    def _verify_client_path(self, slot_id: str, slot: ExitSlotSnapshot, generation: int) -> bool:
+        """Check the actual SOCKS path once; diagnosing and redialing are separate."""
+        runtime = self.runtime(slot_id)
+        assert runtime.stop is not None
+        if self._worker_is_stale(slot_id, generation, runtime.stop):
+            return False
+        if not self.listener_ready(slot_id):
+            health = {"ok": False, "status": "local_listener", "attempts": [], "error": "SOCKS listener missing"}
+        else:
+            health = self._check_client_targets(slot)
+        return self._update_health(slot_id, generation, health)
+
+    def _diagnose_client_failure(self, slot_id: str, generation: int) -> bool:
+        runtime = self.runtime(slot_id)
+        assert runtime.stop is not None
+        if self._worker_is_stale(slot_id, generation, runtime.stop):
+            return False
+        current = self.store.get_slot(slot_id)
+        health = current.check_result.get("health", {})
+        if health.get("status") in {"local_configuration", "local_listener"}:
+            return False
+        if len(health.get("attempts", [])) < 2:
+            return False
+        tunnel = self._probe_target(current, "https://www.gstatic.com/generate_204", via_socks=False)
+        if self._worker_is_stale(slot_id, generation, runtime.stop):
+            return False
+        health = {**health, "tunnel": tunnel}
+        if tunnel["transport_ok"]:
+            self._update_health(slot_id, generation, {**health, "ok": False, "status": "local_proxy_path"})
+            return False
+        self._update_health(slot_id, generation, {**health, "ok": False, "status": "exit_path_unavailable"})
+        return self._handle_probe_failure(slot_id, generation, "SOCKS and TUN transport failed after confirmation")
 
     def snapshot(self) -> list[dict[str, Any]]:
         return [slot.as_dict() for slot in self._managed_slots()]
@@ -1015,13 +1270,3 @@ class ExitManager:
         self._shutdown.set()
         for slot_id in self._managed_slot_ids:
             self.stop_slot(slot_id)
-
-
-def _probe_status_ok(stdout: Any) -> bool:
-    code = str(stdout or "").strip()
-    if not re.fullmatch(r"[0-9]{3}", code):
-        return False
-    if code == "000":
-        return False
-    status = int(code)
-    return 200 <= status < 300 or 400 <= status < 500 and status != 407

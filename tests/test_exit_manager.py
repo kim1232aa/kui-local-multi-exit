@@ -4,10 +4,11 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from vps.exit_manager import ExitManager
 from vps.store import LocalStore
+from vps.vpngate import NodePool
 
 
 class FakeRouting:
@@ -56,6 +57,9 @@ class FakeProcess:
 
 class ExitManagerTest(unittest.TestCase):
     def setUp(self):
+        reference = patch("vps.exit_manager.probe_health_reference", return_value={"ok": True})
+        reference.start()
+        self.addCleanup(reference.stop)
         self.tempdir = tempfile.TemporaryDirectory()
         self.store = LocalStore(Path(self.tempdir.name) / "state.db")
         self.store.initialize()
@@ -66,6 +70,15 @@ class ExitManagerTest(unittest.TestCase):
             listener_factory=FakeListener,
             workspace=Path(self.tempdir.name),
             start_workers=False,
+        )
+        health_wait = patch.object(
+            self.manager, "_wait_for_health_check",
+            side_effect=lambda _sid, _gen, stop, delay: not stop.wait(delay),
+        )
+        health_wait.start()
+        self.addCleanup(health_wait.stop)
+        (self.manager.workspace / "internal_proxy.json").write_text(
+            '{"version":1,"username":"kui-gateway","password":"pw"}', encoding="utf-8"
         )
 
     def tearDown(self):
@@ -769,7 +782,7 @@ class ExitManagerTest(unittest.TestCase):
         )
         waits = iter([False])
         runtime.stop.wait = lambda _timeout: next(waits, True)
-        with patch("vps.exit_manager.probe_204") as probe:
+        with patch("vps.exit_manager.ExitManager._verify_client_path") as probe:
             self.manager._health_loop("exit-01", generation)
 
         probe.assert_not_called()
@@ -791,9 +804,9 @@ class ExitManagerTest(unittest.TestCase):
         runtime = self.manager.runtime("exit-01")
         runtime.process = type("RunningProcess", (), {"poll": lambda self: None})()
         self.manager.routing.is_installed = lambda _slot: True
-        self.manager._run = lambda command, capture_output=True, text=True, check=False: type(
-            "CmdResult", (), {"returncode": 0, "stdout": "500"}
-        )()
+        self.manager._run = Mock(return_value=type(
+            "CmdResult", (), {"returncode": 28, "stdout": "000", "stderr": "transport timeout"}
+        )())
 
         scheduled = []
         self.manager.start_workers = True
@@ -810,7 +823,7 @@ class ExitManagerTest(unittest.TestCase):
         self.assertTrue(failed.enabled)
         self.assertEqual("failed", failed.state)
         self.assertEqual(1, failed.failure_streak)
-        self.assertEqual("HTTP 204 probe failed twice consecutively", failed.last_error)
+        self.assertEqual("SOCKS and TUN transport failed after confirmation", failed.last_error)
         self.assertEqual([("exit-01", failed.generation, 5)], scheduled)
         self.assertTrue(runtime.stop.is_set())
 
@@ -826,15 +839,17 @@ class ExitManagerTest(unittest.TestCase):
                 return 0
 
         self.manager.routing.is_installed = lambda _slot: True
-        self.manager._run = lambda command, capture_output=True, text=True, check=False: type(
-            "CmdResult", (), {"returncode": 0, "stdout": "500"}
-        )()
+        self.manager._run = Mock(return_value=type(
+            "CmdResult", (), {"returncode": 28, "stdout": "000", "stderr": "transport timeout"}
+        )())
         self.manager.start_workers = False
 
         for attempt in range(5):
             generation = self.store.get_slot("exit-01").generation
             runtime = self.manager.runtime("exit-01")
             runtime.process = RunningProcess()
+            runtime.listener = FakeListener("exit-01", "0.0.0.0", 7920, "tun0", 200)
+            runtime.listener.start()
             waits = iter([False, False])
             runtime.stop.wait = lambda _timeout, waits=waits: next(waits, True)
             self.manager._health_loop("exit-01", generation)
@@ -863,11 +878,12 @@ class ExitManagerTest(unittest.TestCase):
         runtime.process = type("RunningProcess", (), {"poll": lambda self: None})()
         self.manager.routing.is_installed = lambda _slot: True
 
-        # First run fails, second run succeeds (204).
-        probe_responses = iter(["500", "204"])
-        self.manager._run = lambda command, capture_output=True, text=True, check=False: type(
-            "CmdResult", (), {"returncode": 0, "stdout": next(probe_responses)}
-        )()
+        # Both targets fail in the first round; the next round succeeds (204).
+        self.manager._run = Mock(side_effect=[
+            Mock(returncode=28, stdout="000", stderr="timeout"),
+            Mock(returncode=28, stdout="000", stderr="timeout"),
+            Mock(returncode=0, stdout="204", stderr=""),
+        ])
         self.manager.redial_slot = lambda _slot_id: self.fail("a successful probe must not redial")
 
         waits = iter([False, False])
@@ -891,7 +907,7 @@ class ExitManagerTest(unittest.TestCase):
         runtime.process = type("RunningProcess", (), {"poll": lambda self: None})()
         runtime.stop.set()
         with patch.object(self.manager.routing, "is_installed", create=True) as route_check, patch(
-            "vps.exit_manager.probe_204"
+            "vps.exit_manager.ExitManager._verify_client_path"
         ) as probe:
             self.manager._health_loop("exit-01", generation)
 
@@ -941,6 +957,8 @@ class ExitManagerTest(unittest.TestCase):
             self.manager, "_openvpn_command", return_value=["openvpn"]
         ), patch.object(
             self.manager, "_health_loop", return_value=None
+        ), patch.object(
+            self.manager, "_check_client_targets", return_value={"ok": True, "status": "checked", "attempts": []}
         ), patch(
             "vps.exit_manager.detect_egress", return_value="203.0.113.1"
         ), patch(
@@ -992,6 +1010,8 @@ class ExitManagerTest(unittest.TestCase):
             self.manager, "_openvpn_command", return_value=["openvpn"]
         ), patch.object(
             self.manager, "_health_loop", return_value=None
+        ), patch.object(
+            self.manager, "_check_client_targets", return_value={"ok": True, "status": "checked", "attempts": []}
         ), patch(
             "vps.exit_manager.detect_egress", return_value="203.0.113.25"
         ), patch(
@@ -1015,6 +1035,10 @@ class ExitManagerTest(unittest.TestCase):
 
         # The country lock still applies to connectivity-only slots.
         for geo, expected in (({"country_code": "MM"}, "not allowed"), (None, "country unknown")):
+            self.manager.node_pool = NodePool()
+            self.manager.node_pool.replace([
+                {"ip": "198.51.100.25", "country": "JP", "ping": 1, "score": 100, "config": ""}
+            ])
             handled.clear()
             with patch.object(self.manager, "_default_route", return_value=("172.18.0.1", "eth0")), patch.object(
                 self.manager, "_openvpn_command", return_value=["openvpn"]
@@ -1077,6 +1101,7 @@ class ExitManagerTest(unittest.TestCase):
         ]
         for raw, expected in cases:
             with self.subTest(raw=raw):
+                self.manager.node_pool = NodePool()
                 generation = self.store.get_slot("exit-01").generation
                 handled = []
                 self.manager._handle_connection_failure = lambda slot_id, gen, err, endpoint_ip="": handled.append(err)
@@ -1126,57 +1151,51 @@ class ExitManagerTest(unittest.TestCase):
         )
         return generation, runtime
 
-    def test_verify_client_path_fails_slot_when_listener_stops_serving(self):
+    def test_verify_client_path_marks_degraded_before_confirming_exit_failure(self):
         generation, runtime = self._commit_ready_slot()
         self.manager.start_workers = True
         scheduled = []
         self.manager._schedule_retry = lambda slot_id, failed_generation, delay: scheduled.append(
             (slot_id, failed_generation, delay)
         )
-        self.manager.redial_slot = lambda _slot_id: self.fail("health worker must not redial itself")
-        results = iter([
-            type("CmdResult", (), {"returncode": 28, "stdout": "000"})(),
-            type("CmdResult", (), {"returncode": 28, "stdout": "000"})(),
-        ])
-        self.manager._run = lambda command, capture_output=True, text=True, check=False: next(results)
-        self.manager._sleep = lambda _seconds: None
+        self.manager.redial_slot = lambda _slot_id: self.fail("single probe must not redial")
+        self.manager._run = Mock(return_value=Mock(returncode=28, stdout="000", stderr="timeout"))
 
-        self.manager._verify_client_path("exit-01", self.store.get_slot("exit-01"), generation)
+        self.assertFalse(self.manager._verify_client_path("exit-01", self.store.get_slot("exit-01"), generation))
 
         failed = self.store.get_slot("exit-01")
         self.assertTrue(failed.enabled)
-        self.assertEqual("failed", failed.state)
-        self.assertEqual(1, failed.failure_streak)
-        self.assertEqual("SOCKS listener not serving clients", failed.last_error)
-        self.assertEqual([("exit-01", failed.generation, 5)], scheduled)
-        self.assertTrue(runtime.stop.is_set())
+        self.assertEqual("degraded", failed.state)
+        self.assertEqual(0, failed.failure_streak)
+        self.assertEqual(2, len(failed.check_result["health"]["attempts"]))
+        self.assertEqual([], scheduled)
+        self.assertFalse(runtime.stop.is_set())
 
     def test_verify_client_path_accepts_working_listener(self):
         generation, _runtime = self._commit_ready_slot()
         handled = []
         self.manager._handle_connection_failure = lambda *args, **kwargs: handled.append(args)
-        self.manager._run = lambda command, capture_output=True, text=True, check=False: type(
-            "CmdResult", (), {"returncode": 0, "stdout": "204"}
-        )()
-        self.manager._sleep = lambda _seconds: None
+        self.manager._run = Mock(return_value=Mock(returncode=0, stdout="204", stderr=""))
 
-        self.manager._verify_client_path("exit-01", self.store.get_slot("exit-01"), generation)
+        self.assertTrue(self.manager._verify_client_path("exit-01", self.store.get_slot("exit-01"), generation))
 
         self.assertEqual([], handled)
         self.assertEqual("ready", self.store.get_slot("exit-01").state)
+        self.manager._run.assert_called_once()
 
-    def test_verify_client_path_skips_without_listener_credentials(self):
+    def test_verify_client_path_marks_configuration_error_without_external_request(self):
         generation, _runtime = self._commit_ready_slot()
         handled = []
         self.manager._handle_connection_failure = lambda *args, **kwargs: handled.append(args)
         self.manager._run = lambda *_args, **_kwargs: self.fail("probe must not run without credentials")
 
         with patch("vps.exit_manager.load_internal_proxy_credentials", side_effect=RuntimeError("unavailable")):
-            self.manager._verify_client_path("exit-01", self.store.get_slot("exit-01"), generation)
+            self.assertFalse(self.manager._verify_client_path("exit-01", self.store.get_slot("exit-01"), generation))
 
         self.assertEqual([], handled)
-        kinds = [event["kind"] for event in self.store.list_events(50)]
-        self.assertIn("health_check_skip", kinds)
+        health = self.store.get_slot("exit-01").check_result["health"]
+        self.assertEqual("local_configuration", health["status"])
+        self.assertEqual("degraded", self.store.get_slot("exit-01").state)
 
     def test_redial_revives_auto_disabled_slot(self):
         generation = self.store.get_slot("exit-01").generation
@@ -1206,7 +1225,7 @@ class ExitManagerTest(unittest.TestCase):
                 ("198.51.100.1", stale_time, slot_id),
             )
         redialed = []
-        self.manager.redial_slot = lambda slot: redialed.append(slot)
+        self.manager.redial_slot = lambda slot, **_kwargs: redialed.append(slot)
         self.manager._shutdown = threading.Event()
 
         self.manager._try_recover_stale_slots()
@@ -1214,13 +1233,10 @@ class ExitManagerTest(unittest.TestCase):
         self.assertEqual([slot_id], redialed)
 
     def test_refresh_loop_leaves_fresh_slots_alone(self):
-        with self.store._lock, self.store._connect() as db:
-            db.execute(
-                "UPDATE exit_slots SET state = 'ready', enabled = 1, entry_ip = ?, updated_at = ? WHERE id = 'exit-01'",
-                ("198.51.100.1", int(time.time())),
-            )
+        _generation, runtime = self._commit_ready_slot()
+        runtime.worker = type("RunningWorker", (), {"is_alive": lambda self: True})()
         redialed = []
-        self.manager.redial_slot = lambda slot: redialed.append(slot)
+        self.manager.redial_slot = lambda slot, **_kwargs: redialed.append(slot)
 
         self.manager._try_recover_stale_slots()
 
@@ -1237,11 +1253,13 @@ class ExitManagerTest(unittest.TestCase):
         runtime = self.manager.runtime(slot_id)
         runtime.process = FakeProcess()
         runtime.stop = threading.Event()
+        runtime.listener = FakeListener(slot_id, "0.0.0.0", 7920, "tun0", 200)
+        runtime.listener.start()
         self.manager.routing.is_installed = lambda _s: True
+        self.manager._run = Mock(return_value=Mock(returncode=0, stdout="204", stderr=""))
 
         with patch.object(runtime.stop, "wait", side_effect=[False, True]):
-            with patch("vps.exit_manager.probe_204", return_value=True):
-                self.manager._health_loop(slot_id, generation, stop_event=runtime.stop)
+            self.manager._health_loop(slot_id, generation, stop_event=runtime.stop)
 
         refreshed = self.store.get_slot(slot_id)
         self.assertGreater(refreshed.updated_at, old_time)

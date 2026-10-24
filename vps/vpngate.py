@@ -266,6 +266,7 @@ class NodePool:
         self._lock = threading.RLock()
         self._nodes: dict[str, dict[str, Any]] = {}
         self._penalties: dict[str, int] = {}
+        self._retry_after: dict[str, float] = {}
 
     def replace(self, nodes: list[dict[str, Any]]) -> None:
         with self._lock:
@@ -283,18 +284,33 @@ class NodePool:
     def penalize(self, ip: str, amount: int) -> None:
         with self._lock:
             self._penalties[ip] = self._penalties.get(ip, 0) + amount
+            self._retry_after[ip] = time.monotonic() + 120
+
+    def _priority(self, node: dict[str, Any], now: float) -> tuple[int, int, int]:
+        age = max(0, now - float(node.get("harvested_at") or 0))
+        freshness = 0 if age <= 3600 else 1 if age <= 86400 else 2
+        penalty = self._penalties.get(node["ip"], 0)
+        # Freshness is a preference, not permission to loop forever over recent
+        # failures while leaving older same-country candidates untried.
+        return freshness + min(penalty // 10000, 3), node["ping"] + penalty, -node["score"]
 
     def select(self, country: str, excluded: set[str]) -> dict[str, Any] | None:
         with self._lock:
+            now = time.time()
+            monotonic_now = time.monotonic()
             candidates = [
                 node
                 for node in self._nodes.values()
-                if (country == "ANY" or node["country"] == country) and node["ip"] not in excluded
+                if (country == "ANY" or node["country"] == country)
+                and node["ip"] not in excluded
+                and self._retry_after.get(node["ip"], 0) <= monotonic_now
             ]
-            candidates.sort(key=lambda node: (node["ping"] + self._penalties.get(node["ip"], 0), -node["score"]))
+            candidates.sort(key=lambda node: self._priority(node, now))
             return dict(candidates[0]) if candidates else None
 
     def get(self, ip: str, country: str = "ANY") -> dict[str, Any] | None:
+        # Explicit selection (including one retry of a known working node) may
+        # bypass cooldown, but never bypasses the slot's country check.
         with self._lock:
             node = self._nodes.get(ip)
             if not node or (country != "ANY" and node.get("country") != country):
@@ -310,12 +326,13 @@ class NodePool:
 
     def list_nodes(self, country: str = "ANY") -> list[dict[str, Any]]:
         with self._lock:
+            now = time.time()
             candidates = [
                 node
                 for node in self._nodes.values()
                 if country == "ANY" or node["country"] == country
             ]
-            candidates.sort(key=lambda node: (node["ping"] + self._penalties.get(node["ip"], 0), -node["score"]))
+            candidates.sort(key=lambda node: self._priority(node, now))
             return [{key: value for key, value in node.items() if key != "config"} for node in candidates]
 
 
@@ -557,6 +574,28 @@ def probe_204(interface: str, run: Callable[..., Any] = subprocess.run) -> bool:
     result = run(command, capture_output=True, text=True, check=False)
     code = (getattr(result, "stdout", "") or "").strip()
     return getattr(result, "returncode", -1) == 0 and _probe_accepts(url, code)
+
+
+def probe_health_reference(run: Callable[..., Any] = subprocess.run) -> dict[str, Any]:
+    """Check the same health target over the VPS route, never as a traffic fallback."""
+    command = [
+        "curl", "-o", "/dev/null", "-sS", "-w", "%{http_code}",
+        "--noproxy", "*", "--connect-timeout", "3", "--max-time", "5",
+        "--doh-url", "https://cloudflare-dns.com/dns-query",
+        "--resolve", "cloudflare-dns.com:443:1.1.1.1", DEFAULT_STREAM_URL,
+    ]
+    try:
+        result = run(command, capture_output=True, text=True, check=False, timeout=7)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {"ok": False, "url": DEFAULT_STREAM_URL, "error": str(error)}
+    code = str(getattr(result, "stdout", "") or "").strip()
+    return {
+        "ok": result.returncode == 0 and code == "204",
+        "url": DEFAULT_STREAM_URL,
+        "code": code,
+        "returncode": result.returncode,
+        "error": str(getattr(result, "stderr", "") or "").strip()[:500],
+    }
 
 
 def _probe_accepts(url: str, code: str) -> bool:

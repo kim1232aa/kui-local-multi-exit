@@ -1439,6 +1439,23 @@ class LocalAPITest(unittest.TestCase):
         links = base64.b64decode(encoded).decode()
         self.assertNotIn(":7920#JP_exit-01_", links)
 
+    def test_degraded_slot_is_visible_but_not_published_as_healthy(self):
+        self.manager.set_slot_ready("exit-01")
+        self.store.set_runtime("exit-01", state="degraded", last_error="shared health reference unavailable")
+        status, data = self.request("/api/data")
+        self.assertEqual(200, status)
+        token = data["mySubToken"]
+        status, body = self.request(
+            f"/socks5.txt?user={data['mySubUser']}&token={token}", expect_json=False,
+        )
+        self.assertEqual(200, status)
+        self.assertNotIn(":7920#", body)
+        status, slots = self.request("/api/local/exits")
+        self.assertEqual(200, status)
+        slot = next(slot for slot in slots["exits"] if slot["id"] == "exit-01")
+        self.assertEqual("degraded", slot["state"])
+        self.assertIn("shared health reference unavailable", slot["last_error"])
+
     def test_proxy_switch_delegates_to_explicit_slot_redial(self):
         status, result = self.request("/api/proxy/switch", method="POST", body={"slot_id": "exit-01"})
         self.assertEqual(202, status)

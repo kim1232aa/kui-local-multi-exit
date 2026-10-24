@@ -579,6 +579,18 @@ class LocalStore:
                 (slot_id, kind[:100], message[:2000], int(time.time())),
             )
 
+    def last_connected_entry_ip(self, slot_id: str) -> str:
+        """Recover the last successful peer even after shutdown clears runtime fields."""
+        with self._lock, self._connect() as db:
+            row = db.execute(
+                "SELECT message FROM events WHERE slot_id = ? AND kind = 'connected' ORDER BY id DESC LIMIT 1",
+                (slot_id,),
+            ).fetchone()
+        if row is None:
+            return ""
+        entry_ip, separator, _egress_ip = row["message"].partition(" -> ")
+        return entry_ip if separator else ""
+
     def list_events(self, limit: int = 100) -> list[dict[str, Any]]:
         bounded_limit = max(1, min(int(limit), 500))
         with self._lock, self._connect() as db:
