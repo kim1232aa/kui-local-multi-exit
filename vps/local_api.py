@@ -35,26 +35,33 @@ MAX_GITHUB_PROBE_DATA_BYTES = 4 * 1024 * 1024
 MAX_SUBSCRIPTION_BYTES = 4 * 1024 * 1024
 
 
-CF_PREFERRED_DOMAINS = [
-    ("saas.sin.fan", "CF优选·MIYU"),
-    ("cyberport.hk", "CF优选·中国香港数码港"),
-    ("jebsen.com", "CF优选·中国香港捷成"),
-    ("transunion.hk", "CF优选·中国香港环联"),
-    ("www.aeon.info", "CF优选·中国香港永旺"),
-    ("hongkongairport.com", "CF优选·香港机场"),
-    ("foodpanda.hk", "CF优选·香港富胖达"),
-    ("sasa.com", "CF优选·中国香港莎莎"),
-    ("citysuper.com.hk", "CF优选·中国香港CitySuper"),
-    ("yesstyle.com", "CF优选·中国香港YesStyle"),
-    ("hk.jobsdb.com", "CF优选·中国香港JobsDB"),
-    ("yata.hk", "CF优选·中国香港一田百货"),
-    ("pfizer.com.hk", "CF优选·中国香港辉瑞"),
-    ("advantech.tw", "CF优选·中国台湾研华"),
-    ("deepin.org", "CF优选·中国深度系统"),
-    ("fossil.com", "CF优选·中国Fossil"),
-    ("cf.090227.xyz", "CF优选·090227"),
-    ("bestcf.030101.xyz", "CF优选·移动"),
-    ("time.is", "CF优选·TimeIs"),
+# BestCF community pool (cmliu/CF-Pages-BestCF). Used as-is, no liveness
+# probe: TLS SNI/Host stay on our own tunnel hostname, so any CF-fronted
+# domain routes to this origin. First CF_DOMAINS_LIMIT entries only.
+BESTCF_DOMAINS_URL = "https://raw.githubusercontent.com/cmliu/CF-Pages-BestCF/main/cf_domains.txt"
+CF_DOMAINS_LIMIT = 40
+_BESTCF_CACHE: dict = {"at": 0.0, "text": ""}
+
+CF_PREFERRED_DOMAINS: list[tuple[str, int, str]] = [
+    ("saas.sin.fan", 443, "CF优选·MIYU"),
+    ("cyberport.hk", 443, "CF优选·中国香港数码港"),
+    ("jebsen.com", 443, "CF优选·中国香港捷成"),
+    ("transunion.hk", 443, "CF优选·中国香港环联"),
+    ("www.aeon.info", 443, "CF优选·中国香港永旺"),
+    ("hongkongairport.com", 443, "CF优选·香港机场"),
+    ("foodpanda.hk", 443, "CF优选·香港富胖达"),
+    ("sasa.com", 443, "CF优选·中国香港莎莎"),
+    ("citysuper.com.hk", 443, "CF优选·中国香港CitySuper"),
+    ("yesstyle.com", 443, "CF优选·中国香港YesStyle"),
+    ("hk.jobsdb.com", 443, "CF优选·中国香港JobsDB"),
+    ("yata.hk", 443, "CF优选·中国香港一田百货"),
+    ("pfizer.com.hk", 443, "CF优选·中国香港辉瑞"),
+    ("advantech.tw", 443, "CF优选·中国台湾研华"),
+    ("deepin.org", 443, "CF优选·中国深度系统"),
+    ("fossil.com", 443, "CF优选·中国Fossil"),
+    ("cf.090227.xyz", 443, "CF优选·090227"),
+    ("bestcf.030101.xyz", 443, "CF优选·移动"),
+    ("time.is", 443, "CF优选·TimeIs"),
 ]
 
 class UnsupportedField(ValueError):
@@ -999,7 +1006,8 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 continue
             if not (
-                re.fullmatch(r"exit-(?:0[1-9]|1[0-9]|2[0-9]|3[0-4])", slot_id)
+                slot_id == "host"
+                or re.fullmatch(r"exit-(?:0[1-9]|1[0-9]|2[0-9]|3[0-4])", slot_id)
                 or re.fullmatch(r"tr-\d+", slot_id)
             ):
                 continue
@@ -1193,7 +1201,16 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         reality_nodes = self._local_reality_nodes()
         publishable = {slot["id"]: slot for slot in self._publishable_slots()}
         nodes = []
+        if "host" in reality_nodes:
+            nodes.append({
+                **reality_nodes["host"],
+                "name": "直连·本机",
+                "country": "JP",
+                "_slot_id": "host",
+            })
         for slot_id, node in reality_nodes.items():
+            if slot_id == "host":
+                continue
             if slot_id in publishable:
                 # Local OpenVPN slots are direct exits and never use a
                 # client-side dialer proxy.
@@ -1439,55 +1456,61 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             tag = f"{domain}:{port}" if port != 443 else domain
         return domain, port, tag
 
+    def _bestcf_text(self) -> str:
+        """BestCF domain list, cached 1h. Empty string on fetch failure."""
+        now = time.time()
+        src = os.environ.get("KUI_CF_DOMAINS_SOURCE", "").strip() or BESTCF_DOMAINS_URL
+        if _BESTCF_CACHE.get("src") == src and _BESTCF_CACHE.get("text") and now - _BESTCF_CACHE.get("at", 0) < 3600:
+            return _BESTCF_CACHE["text"]
+        text = ""
+        try:
+            if src.startswith(("http://", "https://")):
+                req = urllib.request.Request(src, headers={"User-Agent": "curl/7.68.0"})
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    text = resp.read(1024 * 1024).decode("utf-8", errors="replace")
+            else:
+                text = Path(src).read_text(encoding="utf-8")
+        except Exception:
+            return ""
+        if text.strip():
+            _BESTCF_CACHE.update(at=now, text=text, src=src)
+        return text
+
     def _cf_front_entries(self) -> list[tuple[str, int, str]]:
-        """Returns list of (server_domain_or_ip, port, display_name)."""
-        cfg = self._cf_tunnel_config()
-        if not cfg:
+        """(domain, port, display name) from BestCF or custom source, capped."""
+        cf_cfg = self._cf_tunnel_config()
+        if not cf_cfg:
             return []
-        hostname, _, _ = cfg
-        custom_entries: list[tuple[str, int, str]] = []
+        hostname = cf_cfg[0]
+        try:
+            limit = int(os.environ.get("KUI_CF_DOMAINS_LIMIT", "") or CF_DOMAINS_LIMIT)
+        except ValueError:
+            limit = CF_DOMAINS_LIMIT
 
-        # Check explicit source URL or local path
-        src_env = os.environ.get("KUI_CF_DOMAINS_SOURCE", "").strip()
-        if src_env.startswith(("http://", "https://")):
-            try:
-                req = urllib.request.Request(src_env, headers={"User-Agent": "curl/7.68.0"})
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    text = resp.read().decode("utf-8", errors="replace")
-                    for line in text.splitlines():
-                        parsed = self._parse_front_domain_line(line)
-                        if parsed:
-                            custom_entries.append(parsed)
-            except Exception:
-                pass
-        elif src_env:
-            try:
-                for line in Path(src_env).read_text(encoding="utf-8").splitlines():
-                    parsed = self._parse_front_domain_line(line)
-                    if parsed:
-                        custom_entries.append(parsed)
-            except OSError:
-                pass
+        raw_text = self._bestcf_text()
+        entries: list[tuple[str, int, str]] = []
+        seen: set[str] = set()
+        if hostname:
+            entries.append((hostname, 443, "CF·本机"))
+            seen.add(hostname)
+
+        if raw_text.strip():
+            for line in raw_text.splitlines():
+                parsed = self._parse_front_domain_line(line)
+                if not parsed or parsed[0] in seen:
+                    continue
+                seen.add(parsed[0])
+                entries.append(parsed)
+                if len(entries) >= max(1, limit):
+                    break
         else:
-            for p in ("/opt/kui-local/front-domains.txt", "/run/kui-reality/front-domains.txt"):
-                try:
-                    for line in Path(p).read_text(encoding="utf-8").splitlines():
-                        parsed = self._parse_front_domain_line(line)
-                        if parsed:
-                            custom_entries.append(parsed)
-                    if custom_entries:
+            for domain, port, name in CF_PREFERRED_DOMAINS:
+                if domain not in seen:
+                    seen.add(domain)
+                    entries.append((domain, port, name))
+                    if len(entries) >= max(1, limit):
                         break
-                except OSError:
-                    pass
-
-        if custom_entries:
-            return custom_entries
-
-        res = [(hostname, 443, "CF·本机")]
-        for domain, name in CF_PREFERRED_DOMAINS:
-            if domain != hostname:
-                res.append((domain, 443, name))
-        return res
+        return entries
 
     @staticmethod
     def _cf_vless_node(name: str, domain: str, path: str, uuid_val: str, host: str, port: int = 443) -> str:
@@ -1563,9 +1586,9 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
 
     def _clash_subscription_yaml(self, thirdparty_nodes: list[dict[str, Any]]) -> str:
         """Clash/Mihomo subscription in the cs-pa (Cloud Shell) layout:
-        🚀 节点选择 / ⚡ 自动选择 / 🏠 住宅自动 + AI site groups + CN direct."""
+        🚀 节点选择 / ⚡ CF入口 / 🏠 住宅自动 / 🏠 住宅·CF + AI site groups + CN direct."""
         used_names = {
-            "🚀 节点选择", "⚡ CF入口", "⚡ 自动选择", "🏠 住宅自动", "🏠 住宅·CF",
+            "🚀 节点选择", "⚡ CF入口", "🏠 住宅自动", "🏠 住宅·CF", "VLESS-REALITY-链式",
             "🧠 Claude", "🤖 ChatGPT", "🔵 Google·Gemini",
             "🌐 其他流量", "🇨🇳 中国流量", "DIRECT",
         }
@@ -1587,9 +1610,8 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         cf_cfg = self._cf_tunnel_config()
         cf_hostname, cf_uuid, cf_path = cf_cfg if cf_cfg else ("", "", "")
         cf_entries = self._cf_front_entries()
-        cdn_domains = [(d, p, n) for d, p, n in cf_entries if d != cf_hostname]
-        if not cdn_domains:
-            cdn_domains = [(d, 443, n) for d, n in CF_PREFERRED_DOMAINS if d != cf_hostname]
+        cdn_domains = [(d, p, n) for d, p, n in cf_entries if d != cf_hostname] or cf_entries
+        cf_group_name = "⚡ CF入口" if (cf_cfg and cf_entries) else ""
 
         reality_nodes = self._local_reality_nodes()
         publishable = {slot["id"]: slot for slot in self._publishable_slots()}
@@ -1613,12 +1635,15 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     )
                     proxies.append(cf_chain_yaml)
                     chain_names.append(cf_chain_name)
-                    pure_names.append(cf_chain_name)
-                elif egress_type in {"residential", "unverified"}:
                     pure_names.append(added)
+                elif egress_type:
+                    pure_names.append(added)
+            elif str(node.get("_slot_id")) == "host":
+                add(node, direct_names)
             else:
-                # tr-* slots are chained exits: first hop via the auto group.
-                add({**node, "dialer-proxy": "⚡ 自动选择"}, extra_names)
+                # tr-* slots are chained exits: first hop via CF entrance or rocket group.
+                dialer = cf_group_name or "🚀 节点选择"
+                add({**node, "dialer-proxy": dialer}, extra_names)
 
         for bridge in self._bridge_nodes():
             if bridge.get("_source_kind", "manual") == "manual":
@@ -1631,7 +1656,8 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 if hint in {"TR", "VN", "TH", "PH"} and not raw_name.startswith(hint + "-")
                 else f"自动链式 | {raw_name}"
             )
-            add({**bridge, "name": name, "dialer-proxy": "⚡ 自动选择"}, extra_names)
+            dialer = cf_group_name or "🚀 节点选择"
+            add({**bridge, "name": name, "dialer-proxy": dialer}, extra_names)
 
         for node in thirdparty_nodes:
             add(node, extra_names)
@@ -1677,16 +1703,22 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         # Mihomo removed relay groups. Each residential exit gets a chain
         # clone with a fixed first-hop dialer, so the chain remains valid.
         chain_group_name = "🏠 住宅·CF" if chain_names else ""
-        cf_group_name = "⚡ CF入口" if cf_names else ""
+        if not cf_names:
+            cf_group_name = ""
+
+        # Prioritize local host and CF machine nodes at the top of 🚀 节点选择
+        top_local_nodes = [n for n in ("直连·本机", "CF·本机") if n in all_names or n in cf_names]
+        remaining_cf = [n for n in cf_names if n not in top_local_nodes]
+        remaining_all = [n for n in all_names if n not in top_local_nodes]
 
         groups = ["proxy-groups:"]
         rocket_proxies = [
             *([cf_group_name] if cf_group_name else []),
-            "⚡ 自动选择",
             "🏠 住宅自动",
             *([chain_group_name] if chain_group_name else []),
-            *cf_names,
-            *all_names,
+            *top_local_nodes,
+            *remaining_cf,
+            *remaining_all,
             "DIRECT",
         ]
         groups.append('  - name: "🚀 节点选择"\n    type: select\n    proxies:\n' + lst(rocket_proxies))
@@ -1699,18 +1731,33 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 '    tolerance: 100\n'
                 '    proxies:\n' + lst(cf_names)
             )
-        # Auto-selection pool: include CF-routed residential exits first, then direct exits as fallback
-        auto_proxies = [*chain_names, *direct_names] if (chain_names or direct_names) else (cf_names or ["DIRECT"])
-        groups.append('  - name: "⚡ 自动选择"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 300\n    tolerance: 100\n    proxies:\n' + lst(auto_proxies))
+        # Scheme A: 🏠 住宅自动 contains pure direct residential exits (no CF), url-test
         if pure_names:
             groups.append('  - name: "🏠 住宅自动"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 300\n    tolerance: 150\n    proxies:\n' + lst(pure_names))
         else:
             groups.append('  - name: "🏠 住宅自动"\n    type: select\n    proxies:\n      - "🚀 节点选择"')
+        # Scheme A: 🏠 住宅·CF contains CF-routed residential exits, select
         if chain_names:
             groups.append(f'  - name: "{chain_group_name}"\n    type: select\n    proxies:\n' + lst(chain_names))
+
+        ai_proxies = [
+            *([chain_group_name] if chain_group_name else []),
+            "🏠 住宅自动",
+            *([cf_group_name] if cf_group_name else []),
+            *([n for n in ("直连·本机",) if n in all_names]),
+            "🚀 节点选择",
+            "DIRECT",
+        ]
         for grp in ("🧠 Claude", "🤖 ChatGPT", "🔵 Google·Gemini"):
-            groups.append(f'  - name: "{grp}"\n    type: select\n    proxies:\n' + lst(["🏠 住宅自动", "🚀 节点选择", *([cf_group_name] if cf_group_name else []), "⚡ 自动选择", chain_group_name, *pure_names, "DIRECT"]))
-        groups.append(f'  - name: "🌐 其他流量"\n    type: select\n    proxies:\n' + lst(["🚀 节点选择", *([cf_group_name] if cf_group_name else []), "⚡ 自动选择", "🏠 住宅自动", chain_group_name, "DIRECT"]))
+            groups.append(f'  - name: "{grp}"\n    type: select\n    proxies:\n' + lst(ai_proxies))
+        groups.append(f'  - name: "🌐 其他流量"\n    type: select\n    proxies:\n' + lst([
+            "🚀 节点选择",
+            *([cf_group_name] if cf_group_name else []),
+            *([chain_group_name] if chain_group_name else []),
+            "🏠 住宅自动",
+            *([n for n in ("直连·本机",) if n in all_names]),
+            "DIRECT",
+        ]))
         groups.append('  - name: "🇨🇳 中国流量"\n    type: select\n    proxies:\n' + lst(["DIRECT", "🚀 节点选择"]))
 
         rules = ["rules:"]

@@ -990,7 +990,6 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual("text/yaml", content_type)
         self.assertIn("mixed-port: 7890", body)
         self.assertIn('  - name: "🚀 节点选择"', body)
-        self.assertIn('  - name: "⚡ 自动选择"', body)
         self.assertIn('  - name: "🏠 住宅自动"', body)
         self.assertIn('  - name: "🧠 Claude"', body)
         self.assertIn('  - name: "🇨🇳 中国流量"', body)
@@ -1247,13 +1246,10 @@ class LocalAPITest(unittest.TestCase):
         self.assertIn(f'name: "{node_name}"', body)
         residential_start = body.index('  - name: "🏠 住宅自动"')
         residential_block = body[residential_start:body.index("\n  - name:", residential_start + 1)]
-        # The unverified exit joins 🏠 住宅自动 through its CF node, which uses the slot UUID on the shared WS path.
-        self.assertIn(f'      - "{node_name}·CF"', residential_block)
-        cf_start = body.index(f'  - name: "{node_name}·CF"')
+        self.assertIn(f'      - "{node_name}"', residential_block)
+        cf_start = body.index('  - name: "🏠 住宅·CF"')
         cf_block = body[cf_start:body.index("\n  - name:", cf_start + 1)]
-        self.assertIn('uuid: "44444444-4444-4444-4444-444444444444"', cf_block)
-        self.assertIn('path: "/vless"', cf_block)
-        self.assertNotIn("/res-", body)
+        self.assertIn(f'      - "{node_name}·CF"', cf_block)
         self.assertNotIn(f'{node_name}·链式', body)
 
         manifest.write_text(
@@ -1333,7 +1329,7 @@ class LocalAPITest(unittest.TestCase):
         direct_block = body[direct_start:chain_start]
         chain_block = body[chain_start:body.index("\nproxy-groups:", chain_start)]
         self.assertNotIn("dialer-proxy:", direct_block)
-        self.assertIn('dialer-proxy: "⚡ 自动选择"', chain_block)
+        self.assertIn('dialer-proxy: "⚡ CF入口"', chain_block)
         self.assertEqual(1, body.count("dialer-proxy:"))
         self.assertNotIn("链式节点", body)
         self.assertNotIn('  - name: PROXY', body)
@@ -1348,11 +1344,11 @@ class LocalAPITest(unittest.TestCase):
         self.assertNotIn("cathaypacific.com", body)
         self.assertIn('      - "⚡ CF入口"', rocket_block)
 
-        # 验证 ⚡ 自动选择 不与 CF入口 重复，只包含真实出口
-        auto_start = body.index('  - name: "⚡ 自动选择"')
-        auto_block = body[auto_start:body.index("\n  - name:", auto_start + 1)]
-        self.assertIn(f'      - "{direct_name}"', auto_block)
-        self.assertNotIn("CF·", auto_block)
+        # 验证 🏠 住宅自动 为纯直连住宅出口（不带 ·CF）
+        res_start = body.index('  - name: "🏠 住宅自动"')
+        res_block = body[res_start:body.index("\n  - name:", res_start + 1)]
+        self.assertIn(f'      - "{direct_name}"', res_block)
+        self.assertNotIn("·CF", res_block)
 
         # 验证 AI 分流组均包含 DIRECT 选项
         for grp in ("🧠 Claude", "🤖 ChatGPT", "🔵 Google·Gemini"):
@@ -1396,6 +1392,69 @@ class LocalAPITest(unittest.TestCase):
         self.assertIn('  - name: "⚡ CF入口"', body)
         self.assertIn('  - name: "CF·本机"', body)
         self.assertIn('  - name: "CF优选·中国香港数码港"', body)
+
+    def test_clash_subscription_includes_direct_host_node(self):
+        self.manager.set_slot_ready("exit-01")
+        manifest = Path(self.tempdir.name) / "reality-nodes.json"
+        manifest.write_text(
+            json.dumps({
+                "version": 1,
+                "nodes": [
+                    {
+                        "slot_id": "host",
+                        "address": "198.51.100.1",
+                        "port": 8443,
+                        "uuid": "00000000-0000-0000-0000-000000000000",
+                        "sni": "dl.google.com",
+                        "public_key": "abcdefghijklmnopqrstuvwxyzABCDEFGH1234567_",
+                        "short_id": "1122334455667788",
+                    },
+                    {
+                        "slot_id": "exit-01",
+                        "address": "198.51.100.1",
+                        "port": 8443,
+                        "uuid": "11111111-1111-1111-1111-111111111111",
+                        "sni": "addons.mozilla.org",
+                        "public_key": "abcdefghijklmnopqrstuvwxyzABCDEFGH1234567_",
+                        "short_id": "1122334455667788",
+                    },
+                ],
+            }),
+            encoding="utf-8",
+        )
+        self.server.reality_nodes_file = manifest
+        status, data = self.request("/api/data")
+        token = data["mySubToken"]
+
+        status, body = self.request(
+            f"/api/sub?user={data['mySubUser']}&token={token}&format=clash",
+            expect_json=False,
+        )
+
+        self.assertEqual(200, status)
+        self.assertIn('  - name: "直连·本机"', body)
+        # Verify 直连·本机 has no dialer-proxy and uses direct Reality
+        host_start = body.index('  - name: "直连·本机"')
+        host_end = body.index("\n  - name:", host_start + 1)
+        host_block = body[host_start:host_end]
+        self.assertNotIn("dialer-proxy:", host_block)
+        self.assertIn("type: vless", host_block)
+        # Verify 直连·本机 is present in 🚀 节点选择
+        rocket_start = body.index('  - name: "🚀 节点选择"')
+        rocket_block = body[rocket_start:body.index("\n  - name:", rocket_start + 1)]
+        self.assertIn('      - "直连·本机"', rocket_block)
+        # Verify 直连·本机 is near the top of 🚀 节点选择 (before individual CF/exit nodes)
+        self.assertLess(rocket_block.index('      - "直连·本机"'), 250)
+        self.assertNotIn('⚡ 自动选择', body)
+
+        # Verify AI groups contain exactly 6 selector entries and include 直连·本机
+        for grp in ("🧠 Claude", "🤖 ChatGPT", "🔵 Google·Gemini"):
+            grp_start = body.index(f'  - name: "{grp}"')
+            grp_block = body[grp_start:body.index("\n  - name:", grp_start + 1) if "\n  - name:" in body[grp_start + 1:] else len(body)]
+            self.assertIn('      - "DIRECT"', grp_block)
+            self.assertIn('      - "🏠 住宅自动"', grp_block)
+            self.assertIn('      - "直连·本机"', grp_block)
+            self.assertNotIn('exit-01', grp_block)
 
     def test_clash_subscription_parses_custom_ports_and_tags_from_front_domains_source(self):
         self.manager.set_slot_ready("exit-01")
