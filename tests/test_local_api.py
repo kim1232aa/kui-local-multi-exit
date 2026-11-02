@@ -1274,6 +1274,61 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertNotIn("exit-35", body)
 
+    def test_datacenter_exit_stays_out_of_residential_groups(self):
+        self.store.initialize(slot_count=34)
+        self.manager.set_slot_ready("exit-23")
+        self.store.set_runtime(
+            "exit-23",
+            state="ready",
+            entry_ip="198.51.100.23",
+            egress_ip="203.0.113.23",
+            current_node={"ip": "198.51.100.23", "country": "US", "source": "vpngate"},
+            check_result={
+                "residential": {
+                    "status": "checked",
+                    "egress_type": "datacenter",
+                    "egress_type_label": "机房IP",
+                    "is_residential": False,
+                },
+                "targets": {"accepted": True},
+            },
+        )
+        manifest = Path(self.tempdir.name) / "public-nodes.json"
+        manifest.write_text(
+            json.dumps({
+                "version": 1,
+                "nodes": [{
+                    "slot_id": "exit-23",
+                    "address": "153.121.38.245",
+                    "port": 8477,
+                    "uuid": "23232323-2323-2323-2323-232323232323",
+                    "sni": "addons.mozilla.org",
+                    "public_key": "abcdefghijklmnopqrstuvwxyzABCDEFGH1234567_",
+                    "short_id": "aabbccddeeff0011",
+                }],
+            }),
+            encoding="utf-8",
+        )
+        self.server.reality_nodes_file = manifest
+        status, data = self.request("/api/data")
+        token = data["mySubToken"]
+
+        with patch.dict(os.environ, {
+            "KUI_CF_HOSTNAME": "cf.example.com",
+            "KUI_CF_UUID": "99999999-9999-9999-9999-999999999999",
+        }):
+            status, body = self.request(
+                f"/api/sub?user={data['mySubUser']}&token={token}&format=clash",
+                expect_json=False,
+            )
+
+        self.assertEqual(200, status)
+        self.assertIn('name: "US机房·RESI·exit-23"', body)
+        residential_start = body.index('  - name: "🏠 住宅自动"')
+        residential_block = body[residential_start:body.index("\n  - name:", residential_start + 1)]
+        self.assertNotIn("exit-23", residential_block)
+        self.assertNotIn("exit-23·CF", body)
+
     def test_reality_clash_subscription_exposes_direct_and_cloudflare_entries(self):
         self.manager.set_slot_ready("exit-01")
         manifest = Path(self.tempdir.name) / "public-nodes.json"

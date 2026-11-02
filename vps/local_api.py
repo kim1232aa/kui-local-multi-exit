@@ -1636,7 +1636,8 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     proxies.append(cf_chain_yaml)
                     chain_names.append(cf_chain_name)
                     pure_names.append(added)
-                elif egress_type:
+                elif egress_type and egress_type not in {"datacenter", "enterprise"}:
+                    # Known non-residential exits stay out of 🏠 住宅自动; they remain selectable in 🚀 节点选择.
                     pure_names.append(added)
             elif str(node.get("_slot_id")) == "host":
                 add(node, direct_names)
