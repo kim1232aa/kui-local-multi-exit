@@ -7,6 +7,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from typing import Any
 from pathlib import Path
 from unittest.mock import patch
 
@@ -67,6 +68,73 @@ class FakeManager:
 
     def list_nodes(self, country="ANY"):
         return []
+
+
+def _simple_parse_clash_yaml(body: str) -> dict[str, list[dict[str, Any]]]:
+    try:
+        import yaml
+        return yaml.safe_load(body)
+    except ImportError:
+        pass
+    proxies: list[dict[str, Any]] = []
+    proxy_groups: list[dict[str, Any]] = []
+    current_section = ""
+    current_item: dict[str, Any] | None = None
+    in_proxies_list = False
+
+    for line in body.splitlines():
+        if line.startswith("proxies:"):
+            current_section = "proxies"
+            current_item = None
+            in_proxies_list = False
+            continue
+        elif line.startswith("proxy-groups:"):
+            current_section = "proxy-groups"
+            current_item = None
+            in_proxies_list = False
+            continue
+        elif line.startswith("rules:"):
+            current_section = "rules"
+            current_item = None
+            in_proxies_list = False
+            continue
+
+        if current_section == "proxies":
+            if line.startswith("  - name:"):
+                raw_name = line.split(":", 1)[1].strip()
+                name = json.loads(raw_name) if raw_name.startswith('"') else raw_name
+                current_item = {"name": name}
+                proxies.append(current_item)
+            elif current_item is not None and line.startswith("    "):
+                stripped = line.strip()
+                if ":" in stripped:
+                    k, v = stripped.split(":", 1)
+                    k, v = k.strip(), v.strip()
+                    if v.startswith('"') and v.endswith('"'):
+                        try:
+                            v = json.loads(v)
+                        except json.JSONDecodeError:
+                            pass
+                    current_item[k] = v
+
+        elif current_section == "proxy-groups":
+            if line.startswith("  - name:"):
+                raw_name = line.split(":", 1)[1].strip()
+                name = json.loads(raw_name) if raw_name.startswith('"') else raw_name
+                current_item = {"name": name, "proxies": []}
+                proxy_groups.append(current_item)
+                in_proxies_list = False
+            elif current_item is not None:
+                if line.strip() == "proxies:":
+                    in_proxies_list = True
+                elif in_proxies_list and line.startswith("      - "):
+                    raw_p = line.split("-", 1)[1].strip()
+                    p = json.loads(raw_p) if raw_p.startswith('"') else raw_p
+                    current_item["proxies"].append(p)
+                elif not line.startswith("      "):
+                    in_proxies_list = False
+
+    return {"proxies": proxies, "proxy-groups": proxy_groups}
 
 
 class LocalAPITest(unittest.TestCase):
@@ -1542,7 +1610,6 @@ class LocalAPITest(unittest.TestCase):
         self.assertIn('uuid: "00000000-0000-0000-0000-0000000000aa"', cf_block)
 
     def test_clash_subscription_has_no_cycles_or_duplicate_names_in_edge_topologies(self):
-        import yaml
         manifest = Path(self.tempdir.name) / "reality-nodes.json"
         common = {
             "address": "198.51.100.1", "port": 8443, "sni": "dl.google.com",
@@ -1565,7 +1632,7 @@ class LocalAPITest(unittest.TestCase):
         }
 
         def assert_acyclic_and_unique(body: str) -> None:
-            parsed = yaml.safe_load(body)
+            parsed = _simple_parse_clash_yaml(body)
             proxy_names = [item["name"] for item in parsed["proxies"]]
             self.assertEqual(len(proxy_names), len(set(proxy_names)))
             edges: dict[str, list[str]] = {}
@@ -1753,8 +1820,7 @@ class LocalAPITest(unittest.TestCase):
             status, body2 = self.request(f"/api/sub?user={data['mySubUser']}&token={token}&format=clash", expect_json=False)
 
         self.assertEqual(200, status)
-        import yaml
-        d1 = yaml.safe_load(body1)
+        d1 = _simple_parse_clash_yaml(body1)
         slot_nodes1 = [p for p in d1["proxies"] if p["name"].endswith("·CF")]
         self.assertEqual(3, len(slot_nodes1))
         # Servers must come from the pool
