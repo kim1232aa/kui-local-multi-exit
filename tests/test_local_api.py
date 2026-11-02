@@ -1764,7 +1764,7 @@ class LocalAPITest(unittest.TestCase):
         # Residential ·CF node and ⚡ CF入口 node must share identical TLS/UDP settings.
         slot_cf_start = body.index('  - name: "JP住宅·RESI·exit-01·CF"')
         slot_cf_block = body[slot_cf_start:body.index("\n  - name:", slot_cf_start + 1)]
-        self.assertIn("    udp: false", slot_cf_block)
+        self.assertIn("    udp: true", slot_cf_block)
         self.assertIn("    skip-cert-verify: true", slot_cf_block)
 
         # Empty local front-domains.txt falls back to built-in CF_PREFERRED_DOMAINS with zero remote HTTP fetches.

@@ -1565,7 +1565,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             f"    uuid: {json.dumps(uuid_val)}",
             "    network: ws",
             "    tls: true",
-            "    udp: false",
+            "    udp: true",
             "    skip-cert-verify: true",
             f"    servername: {json.dumps(host, ensure_ascii=False)}",
             '    client-fingerprint: "chrome"',
@@ -1777,13 +1777,14 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 f'  - name: "{cf_group_name}"\n'
                 '    type: url-test\n'
                 '    url: "http://www.gstatic.com/generate_204"\n'
-                '    interval: 300\n'
+                '    interval: 60\n'
                 '    tolerance: 100\n'
+                '    lazy: false\n'
                 '    proxies:\n' + lst(cf_names)
             )
         # Scheme A: 🏠 住宅自动 contains pure direct residential exits (no CF), url-test
         if pure_names:
-            groups.append('  - name: "🏠 住宅自动"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 300\n    tolerance: 150\n    proxies:\n' + lst(pure_names))
+            groups.append('  - name: "🏠 住宅自动"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 60\n    tolerance: 150\n    lazy: false\n    proxies:\n' + lst(pure_names))
         else:
             # Never point back to 🚀 节点选择 (which contains 🏠 住宅自动): Mihomo rejects group cycles.
             fallback_proxies = [
