@@ -35,12 +35,8 @@ MAX_GITHUB_PROBE_DATA_BYTES = 4 * 1024 * 1024
 MAX_SUBSCRIPTION_BYTES = 4 * 1024 * 1024
 
 
-# BestCF community pool (cmliu/CF-Pages-BestCF). Used as-is, no liveness
-# probe: TLS SNI/Host stay on our own tunnel hostname, so any CF-fronted
-# domain routes to this origin. First CF_DOMAINS_LIMIT entries only.
-BESTCF_DOMAINS_URL = "https://raw.githubusercontent.com/cmliu/CF-Pages-BestCF/main/cf_domains.txt"
 CF_DOMAINS_LIMIT = 40
-_BESTCF_CACHE: dict = {"at": 0.0, "text": ""}
+_CF_DOMAINS_CACHE: dict = {"at": 0.0, "text": "", "src": ""}
 
 CF_PREFERRED_DOMAINS: list[tuple[str, int, str]] = [
     ("saas.sin.fan", 443, "CF优选·MIYU"),
@@ -1471,12 +1467,14 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             tag = f"{domain}:{port}" if port != 443 else domain
         return domain, port, tag
 
-    def _bestcf_text(self) -> str:
-        """BestCF domain list, cached 1h. Empty string on fetch failure."""
+    @staticmethod
+    def _configured_front_domains_text(src: str) -> str:
+        """Read an explicitly configured KUI_CF_DOMAINS_SOURCE (path or URL), cached 1h."""
+        if not src:
+            return ""
         now = time.time()
-        src = os.environ.get("KUI_CF_DOMAINS_SOURCE", "").strip() or BESTCF_DOMAINS_URL
-        if _BESTCF_CACHE.get("src") == src and _BESTCF_CACHE.get("text") and now - _BESTCF_CACHE.get("at", 0) < 3600:
-            return _BESTCF_CACHE["text"]
+        if _CF_DOMAINS_CACHE.get("src") == src and _CF_DOMAINS_CACHE.get("text") and now - _CF_DOMAINS_CACHE.get("at", 0) < 3600:
+            return _CF_DOMAINS_CACHE["text"]
         text = ""
         try:
             if src.startswith(("http://", "https://")):
@@ -1488,12 +1486,12 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         except Exception:
             return ""
         if text.strip():
-            _BESTCF_CACHE.update(at=now, text=text, src=src)
+            _CF_DOMAINS_CACHE.update(at=now, text=text, src=src)
         return text
 
     @staticmethod
     def _local_front_domains_text() -> str:
-        """User-maintained speed-test list; takes priority over BestCF."""
+        """User-maintained client-side speed-test list."""
         for p in ("/opt/kui-local/front-domains.txt", "/run/kui-reality/front-domains.txt"):
             try:
                 text = Path(p).read_text(encoding="utf-8")
@@ -1504,43 +1502,48 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         return ""
 
     def _cf_front_entries(self) -> list[tuple[str, int, str]]:
-        """(domain, port, display name): local front-domains.txt, else BestCF/custom source (capped), else built-ins."""
+        """(domain, port, display name): explicit source, else local front-domains.txt, else built-ins."""
         cf_cfg = self._cf_tunnel_config()
         if not cf_cfg:
             return []
         hostname = cf_cfg[0]
+        limit_env = os.environ.get("KUI_CF_DOMAINS_LIMIT", "").strip()
         try:
-            limit = int(os.environ.get("KUI_CF_DOMAINS_LIMIT", "") or CF_DOMAINS_LIMIT)
+            explicit_limit = int(limit_env) if limit_env else None
         except ValueError:
-            limit = CF_DOMAINS_LIMIT
+            explicit_limit = CF_DOMAINS_LIMIT
 
-        raw_text = ""
-        if not os.environ.get("KUI_CF_DOMAINS_SOURCE", "").strip():
+        src = os.environ.get("KUI_CF_DOMAINS_SOURCE", "").strip()
+        if src:
+            raw_text = self._configured_front_domains_text(src)
+            limit = explicit_limit if explicit_limit is not None else CF_DOMAINS_LIMIT
+        else:
             raw_text = self._local_front_domains_text()
-            if raw_text:
-                # The user's own list is used in full, not capped.
-                limit = 1 << 30
-        if not raw_text:
-            raw_text = self._bestcf_text()
+            limit = explicit_limit if explicit_limit is not None else (1 << 30 if raw_text else CF_DOMAINS_LIMIT)
+
         entries: list[tuple[str, int, str]] = []
-        seen: set[str] = set()
+        seen: set[tuple[str, int]] = set()
         if hostname:
             entries.append((hostname, 443, "CF·本机"))
-            seen.add(hostname)
+            seen.add((hostname.lower(), 443))
 
         if raw_text.strip():
             for line in raw_text.splitlines():
                 parsed = self._parse_front_domain_line(line)
-                if not parsed or parsed[0] in seen:
+                if not parsed:
                     continue
-                seen.add(parsed[0])
+                key = (parsed[0].lower(), int(parsed[1]))
+                if key in seen:
+                    continue
+                seen.add(key)
                 entries.append(parsed)
                 if len(entries) >= max(1, limit):
                     break
         else:
             for domain, port, name in CF_PREFERRED_DOMAINS:
-                if domain not in seen:
-                    seen.add(domain)
+                key = (domain.lower(), int(port))
+                if key not in seen:
+                    seen.add(key)
                     entries.append((domain, port, name))
                     if len(entries) >= max(1, limit):
                         break
@@ -1583,27 +1586,13 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         })
         return f"vless://{uuid_val}@{domain}:{int(port)}?{qs}#{urllib.parse.quote(name)}"
 
-    @staticmethod
+    @classmethod
     def _cf_slot_vless_node(
-        name: str, domain: str, uuid_val: str, host: str, path: str, port: int = 443
+        cls, name: str, domain: str, uuid_val: str, host: str, path: str, port: int = 443
     ) -> str:
-        # The gateway's VLESS-WS inbound routes by user UUID, so the slot's own UUID selects its exit.
-        return "\n".join((
-            f"  - name: {json.dumps(name, ensure_ascii=False)}",
-            "    type: vless",
-            f"    server: {domain}",
-            f"    port: {int(port)}",
-            f"    uuid: {json.dumps(uuid_val)}",
-            "    network: ws",
-            "    tls: true",
-            f"    servername: {json.dumps(host, ensure_ascii=False)}",
-            '    client-fingerprint: "chrome"',
-            "    udp: true",
-            "    ws-opts:",
-            f"      path: {json.dumps(path)}",
-            "      headers:",
-            f"        Host: {json.dumps(host, ensure_ascii=False)}",
-        ))
+        # The gateway's VLESS-WS inbound routes by user UUID, so the slot's own UUID selects its exit;
+        # transport/TLS/UDP settings match _cf_vless_node (UDP over slot SOCKS is disabled).
+        return cls._cf_vless_node(name, domain, path, uuid_val, host, port=port)
 
     @staticmethod
     def _cf_domain_for_slot(slot_id: str, cdn_entries: list[tuple[str, int, str]], default_host: str = "") -> tuple[str, int]:

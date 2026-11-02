@@ -1636,10 +1636,26 @@ class LocalAPITest(unittest.TestCase):
         self.assertIn('  - name: "plain.example.com:2096"', body)
         self.assertIn("    server: plain.example.com\n    port: 2096", body)
 
-    def test_local_front_domains_file_takes_priority_over_bestcf_and_is_not_capped(self):
+    def test_local_front_domains_file_keeps_multi_port_entries_and_is_not_capped(self):
         self.manager.set_slot_ready("exit-01")
-        local_text = "cf.example.com:443#CF·本机\n" + "".join(
-            f"front{i}.example.net:{2053 if i % 2 else 8443}#优选{i}\n" for i in range(50)
+        self.store.set_runtime("exit-01", state="ready", egress_ip="203.0.113.1", check_result={"residential": {"is_residential": True}})
+        manifest = Path(self.tempdir.name) / "reality-nodes.json"
+        manifest.write_text(
+            json.dumps({"version": 1, "nodes": [{
+                "slot_id": "exit-01", "address": "198.51.100.1", "port": 8443,
+                "uuid": "11111111-1111-1111-1111-111111111111", "sni": "dl.google.com",
+                "public_key": "abcdefghijklmnopqrstuvwxyzABCDEFGH1234567_", "short_id": "1122334455667788",
+            }]}),
+            encoding="utf-8",
+        )
+        self.server.reality_nodes_file = manifest
+        local_text = (
+            "cf.example.com:443#重复本机443\n"
+            "CF.EXAMPLE.COM:2096#本机2096\n"
+            "saas.sin.fan:443#MIYU-443\n"
+            "saas.sin.fan:2096#MIYU-2096\n"
+            "SAAS.SIN.FAN:2096#重复MIYU-2096\n"
+            + "".join(f"front{i}.example.net:{2053 if i % 2 else 8443}#优选{i}\n" for i in range(50))
         )
         status, data = self.request("/api/data")
         token = data["mySubToken"]
@@ -1649,9 +1665,17 @@ class LocalAPITest(unittest.TestCase):
             "KUI_CF_HOSTNAME": "cf.example.com",
             "KUI_CF_UUID": "99999999-9999-9999-9999-999999999999",
         }
+        real_urlopen = urllib.request.urlopen
+
+        def local_only_urlopen(req, *args, **kwargs):
+            target = req.full_url if hasattr(req, "full_url") else str(req)
+            if not target.startswith("http://127.0.0.1:"):
+                raise AssertionError(f"unexpected external fetch: {target}")
+            return real_urlopen(req, *args, **kwargs)
+
         with patch.dict(os.environ, env), \
                 patch.object(LocalAPIHandler, "_local_front_domains_text", return_value=local_text), \
-                patch.object(LocalAPIHandler, "_bestcf_text", side_effect=AssertionError("BestCF must not be fetched")):
+                patch("urllib.request.urlopen", side_effect=local_only_urlopen):
             status, body = self.request(
                 f"/api/sub?user={data['mySubUser']}&token={token}&format=clash",
                 expect_json=False,
@@ -1659,12 +1683,33 @@ class LocalAPITest(unittest.TestCase):
 
         self.assertEqual(200, status)
         self.assertEqual(1, body.count('  - name: "CF·本机"'))
+        self.assertNotIn("重复本机443", body)
+        self.assertIn('  - name: "本机2096"', body)
+        self.assertIn('  - name: "MIYU-443"', body)
+        self.assertIn('  - name: "MIYU-2096"', body)
+        self.assertNotIn("重复MIYU-2096", body)
         self.assertIn('  - name: "优选49"', body)
-        self.assertIn("    server: front49.example.net\n    port: 2053", body)
-        self.assertIn("    server: front48.example.net\n    port: 8443", body)
         cf_start = body.index('  - name: "⚡ CF入口"')
         cf_block = body[cf_start:body.index("\n  - name:", cf_start + 1)]
-        self.assertEqual(51, cf_block.count("\n      - "))
+        # CF·本机 + 本机2096 + MIYU-443 + MIYU-2096 + 50 front entries = 54
+        self.assertEqual(54, cf_block.count("\n      - "))
+
+        # Residential ·CF node and ⚡ CF入口 node must share identical TLS/UDP settings.
+        slot_cf_start = body.index('  - name: "JP住宅·RESI·exit-01·CF"')
+        slot_cf_block = body[slot_cf_start:body.index("\n  - name:", slot_cf_start + 1)]
+        self.assertIn("    udp: false", slot_cf_block)
+        self.assertIn("    skip-cert-verify: true", slot_cf_block)
+
+        # Empty local front-domains.txt falls back to built-in CF_PREFERRED_DOMAINS with zero remote HTTP fetches.
+        with patch.dict(os.environ, env), \
+                patch.object(LocalAPIHandler, "_local_front_domains_text", return_value=""), \
+                patch("urllib.request.urlopen", side_effect=local_only_urlopen):
+            status, fallback_body = self.request(
+                f"/api/sub?user={data['mySubUser']}&token={token}&format=clash",
+                expect_json=False,
+            )
+        self.assertEqual(200, status)
+        self.assertIn('  - name: "CF优选·中国香港数码港"', fallback_body)
 
     def test_subscription_excludes_disabled_local_exit_socks5_nodes(self):
         self.request("/api/local/exits/exit-01/disable", method="POST", body={})
