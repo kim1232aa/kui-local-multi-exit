@@ -1228,7 +1228,7 @@ class LocalAPITest(unittest.TestCase):
         chain_proxy_name = "JP住宅·KDDI·exit-03·CF"
         chain_proxy_start = body.index(f'  - name: "{chain_proxy_name}"')
         chain_proxy_block = body[chain_proxy_start:body.index("\nproxy-groups:", chain_proxy_start)]
-        self.assertIn('path: "/vless"', chain_proxy_block)
+        self.assertIn('path: "/res-03"', chain_proxy_block)
         self.assertIn('uuid: "11111111-1111-1111-1111-111111111111"', chain_proxy_block)
         self.assertIn('servername:', chain_proxy_block)
         self.assertIn(

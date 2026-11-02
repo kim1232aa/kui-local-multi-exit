@@ -1594,10 +1594,13 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
 
     @classmethod
     def _cf_slot_vless_node(
-        cls, name: str, domain: str, uuid_val: str, host: str, path: str, port: int = 443
+        cls, name: str, domain: str, slot_id: str, uuid_val: str, host: str, port: int = 443
     ) -> str:
-        # The gateway's VLESS-WS inbound routes by user UUID, so the slot's own UUID selects its exit;
-        # transport/TLS/UDP settings match _cf_vless_node (UDP over slot SOCKS is disabled).
+        prefix = os.environ.get("KUI_CF_RES_PATH_PREFIX", "/res-").strip()
+        if not prefix.startswith("/"):
+            prefix = f"/{prefix}"
+        num = slot_id.split("-", 1)[-1] if "-" in slot_id else slot_id
+        path = f"{prefix}{int(num):02d}" if num.isdigit() else f"{prefix}{num}"
         return cls._cf_vless_node(name, domain, path, uuid_val, host, port=port)
 
     @staticmethod
@@ -1663,9 +1666,8 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             if slot is not None:
                 added = add({**node, "name": self._exit_clash_name(slot)}, direct_names)
                 egress_type = self._slot_egress_type_info(slot)[0] if added else ""
-                slot_uuid = str(reality_nodes.get(str(slot["id"]), {}).get("uuid") or "")
-                if egress_type in {"residential", "unverified"} and cf_cfg and slot_uuid:
-                    # CF VLESS+WS on a randomly shuffled preferred domain; the slot UUID picks the exit in the gateway.
+                if egress_type in {"residential", "unverified"} and cf_cfg and cf_uuid:
+                    # CF VLESS+WS on a randomly shuffled preferred domain; routes via /res-NN to the slot's SOCKS exit.
                     cf_assigned_domain, cf_assigned_port = self._cf_domain_for_slot(
                         str(slot["id"]),
                         shuffled_cdn_domains,
@@ -1676,9 +1678,9 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     cf_chain_yaml = self._cf_slot_vless_node(
                         cf_chain_name,
                         cf_assigned_domain,
-                        slot_uuid,
+                        str(slot["id"]),
+                        cf_uuid,
                         cf_hostname,
-                        cf_path,
                         port=cf_assigned_port,
                     )
                     proxies.append(cf_chain_yaml)
