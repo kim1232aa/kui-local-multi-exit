@@ -19,6 +19,7 @@ RUN case "$TARGETARCH" in amd64|arm64) ;; *) echo "unsupported architecture: $TA
 WORKDIR /app
 COPY vps /app/vps
 COPY index.html /app/web/index.html
+COPY front-domains.txt /app/front-domains.txt
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

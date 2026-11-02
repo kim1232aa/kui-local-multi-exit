@@ -1491,8 +1491,14 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _local_front_domains_text() -> str:
-        """User-maintained client-side speed-test list."""
-        for p in ("/opt/kui-local/front-domains.txt", "/run/kui-reality/front-domains.txt"):
+        """User-maintained client-side speed-test list, falling back to bundled default."""
+        candidates = (
+            "/opt/kui-local/front-domains.txt",
+            "/run/kui-reality/front-domains.txt",
+            "/app/front-domains.txt",
+            str(Path(__file__).resolve().parent.parent / "front-domains.txt"),
+        )
+        for p in candidates:
             try:
                 text = Path(p).read_text(encoding="utf-8")
             except OSError:
