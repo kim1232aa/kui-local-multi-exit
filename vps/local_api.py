@@ -1595,9 +1595,19 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         return cls._cf_vless_node(name, domain, path, uuid_val, host, port=port)
 
     @staticmethod
-    def _cf_domain_for_slot(slot_id: str, cdn_entries: list[tuple[str, int, str]], default_host: str = "") -> tuple[str, int]:
+    def _cf_domain_for_slot(
+        slot_id: str,
+        cdn_entries: list[tuple[str, int, str]],
+        default_host: str = "",
+        *,
+        randomize: bool = True,
+    ) -> tuple[str, int]:
         if not cdn_entries:
             return default_host or "127.0.0.1", 443
+        if randomize:
+            import random
+            entry = random.choice(cdn_entries)
+            return entry[0], entry[1]
         num = slot_id.split("-", 1)[-1] if "-" in slot_id else slot_id
         if num.isdigit():
             idx = (int(num) - 1) % len(cdn_entries)
@@ -1634,6 +1644,10 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         cf_hostname, cf_uuid, cf_path = cf_cfg if cf_cfg else ("", "", "")
         cf_entries = self._cf_front_entries()
         cdn_domains = [(d, p, n) for d, p, n in cf_entries if d != cf_hostname] or cf_entries
+        # Shuffle domain pool per subscription export to distribute residential exits randomly across preferred domains
+        import random
+        shuffled_cdn_domains = list(cdn_domains)
+        random.shuffle(shuffled_cdn_domains)
         cf_group_name = "⚡ CF入口" if (cf_cfg and cf_entries) else ""
 
         reality_nodes = self._local_reality_nodes()
@@ -1645,8 +1659,13 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 egress_type = self._slot_egress_type_info(slot)[0] if added else ""
                 slot_uuid = str(reality_nodes.get(str(slot["id"]), {}).get("uuid") or "")
                 if egress_type in {"residential", "unverified"} and cf_cfg and slot_uuid:
-                    # CF VLESS+WS on an assigned preferred domain; the slot UUID picks the exit in the gateway.
-                    cf_assigned_domain, cf_assigned_port = self._cf_domain_for_slot(str(slot["id"]), cdn_domains, default_host=cf_hostname)
+                    # CF VLESS+WS on a randomly shuffled preferred domain; the slot UUID picks the exit in the gateway.
+                    cf_assigned_domain, cf_assigned_port = self._cf_domain_for_slot(
+                        str(slot["id"]),
+                        shuffled_cdn_domains,
+                        default_host=cf_hostname,
+                        randomize=False,
+                    )
                     cf_chain_name = self._unique_clash_node({"name": f"{added}·CF"}, used_names)["name"]
                     cf_chain_yaml = self._cf_slot_vless_node(
                         cf_chain_name,

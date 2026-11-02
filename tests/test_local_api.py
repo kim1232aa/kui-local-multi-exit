@@ -1711,6 +1711,57 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertIn('  - name: "CF优选·中国香港数码港"', fallback_body)
 
+    def test_cf_residential_slots_receive_randomized_preferred_domains(self):
+        self.store.initialize(slot_count=5)
+        for i in range(1, 4):
+            sid = f"exit-{i:02d}"
+            self.manager.set_slot_ready(sid)
+            self.store.set_runtime(sid, state="ready", egress_ip=f"203.0.113.{i}", check_result={"residential": {"is_residential": True}})
+
+        manifest = Path(self.tempdir.name) / "reality-nodes.json"
+        manifest.write_text(
+            json.dumps({"version": 1, "nodes": [
+                {
+                    "slot_id": f"exit-{i:02d}", "address": "198.51.100.1", "port": 8443,
+                    "uuid": f"{i}{i}{i}{i}{i}{i}{i}{i}-{i}{i}{i}{i}-{i}{i}{i}{i}-{i}{i}{i}{i}-{i*12:012d}",
+                    "sni": "dl.google.com", "public_key": "abcdefghijklmnopqrstuvwxyzABCDEFGH1234567_",
+                    "short_id": "1122334455667788",
+                }
+                for i in range(1, 4)
+            ]}),
+            encoding="utf-8",
+        )
+        self.server.reality_nodes_file = manifest
+        status, data = self.request("/api/data")
+        token = data["mySubToken"]
+
+        local_text = (
+            "rand1.example.com:2053\n"
+            "rand2.example.com:2083\n"
+            "rand3.example.com:2087\n"
+            "rand4.example.com:2096\n"
+            "rand5.example.com:8443\n"
+        )
+        env = {
+            "KUI_CF_DOMAINS_SOURCE": "",
+            "KUI_CF_HOSTNAME": "cf.example.com",
+            "KUI_CF_UUID": "99999999-9999-9999-9999-999999999999",
+        }
+        with patch.dict(os.environ, env), \
+                patch.object(LocalAPIHandler, "_local_front_domains_text", return_value=local_text):
+            status, body1 = self.request(f"/api/sub?user={data['mySubUser']}&token={token}&format=clash", expect_json=False)
+            status, body2 = self.request(f"/api/sub?user={data['mySubUser']}&token={token}&format=clash", expect_json=False)
+
+        self.assertEqual(200, status)
+        import yaml
+        d1 = yaml.safe_load(body1)
+        slot_nodes1 = [p for p in d1["proxies"] if p["name"].endswith("·CF")]
+        self.assertEqual(3, len(slot_nodes1))
+        # Servers must come from the pool
+        pool_domains = {"rand1.example.com", "rand2.example.com", "rand3.example.com", "rand4.example.com", "rand5.example.com"}
+        for node in slot_nodes1:
+            self.assertIn(node["server"], pool_domains)
+
     def test_subscription_excludes_disabled_local_exit_socks5_nodes(self):
         self.request("/api/local/exits/exit-01/disable", method="POST", body={})
         status, data = self.request("/api/data")
