@@ -1541,6 +1541,36 @@ class LocalAPITest(unittest.TestCase):
         self.assertIn('  - name: "plain.example.com:2096"', body)
         self.assertIn("    server: plain.example.com\n    port: 2096", body)
 
+    def test_local_front_domains_file_takes_priority_over_bestcf_and_is_not_capped(self):
+        self.manager.set_slot_ready("exit-01")
+        local_text = "cf.example.com:443#CF·本机\n" + "".join(
+            f"front{i}.example.net:{2053 if i % 2 else 8443}#优选{i}\n" for i in range(50)
+        )
+        status, data = self.request("/api/data")
+        token = data["mySubToken"]
+
+        env = {
+            "KUI_CF_DOMAINS_SOURCE": "",
+            "KUI_CF_HOSTNAME": "cf.example.com",
+            "KUI_CF_UUID": "99999999-9999-9999-9999-999999999999",
+        }
+        with patch.dict(os.environ, env), \
+                patch.object(LocalAPIHandler, "_local_front_domains_text", return_value=local_text), \
+                patch.object(LocalAPIHandler, "_bestcf_text", side_effect=AssertionError("BestCF must not be fetched")):
+            status, body = self.request(
+                f"/api/sub?user={data['mySubUser']}&token={token}&format=clash",
+                expect_json=False,
+            )
+
+        self.assertEqual(200, status)
+        self.assertEqual(1, body.count('  - name: "CF·本机"'))
+        self.assertIn('  - name: "优选49"', body)
+        self.assertIn("    server: front49.example.net\n    port: 2053", body)
+        self.assertIn("    server: front48.example.net\n    port: 8443", body)
+        cf_start = body.index('  - name: "⚡ CF入口"')
+        cf_block = body[cf_start:body.index("\n  - name:", cf_start + 1)]
+        self.assertEqual(51, cf_block.count("\n      - "))
+
     def test_subscription_excludes_disabled_local_exit_socks5_nodes(self):
         self.request("/api/local/exits/exit-01/disable", method="POST", body={})
         status, data = self.request("/api/data")

@@ -1205,7 +1205,6 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             nodes.append({
                 **reality_nodes["host"],
                 "name": "直连·本机",
-                "country": "JP",
                 "_slot_id": "host",
             })
         for slot_id, node in reality_nodes.items():
@@ -1476,8 +1475,20 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             _BESTCF_CACHE.update(at=now, text=text, src=src)
         return text
 
+    @staticmethod
+    def _local_front_domains_text() -> str:
+        """User-maintained speed-test list; takes priority over BestCF."""
+        for p in ("/opt/kui-local/front-domains.txt", "/run/kui-reality/front-domains.txt"):
+            try:
+                text = Path(p).read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if text.strip():
+                return text
+        return ""
+
     def _cf_front_entries(self) -> list[tuple[str, int, str]]:
-        """(domain, port, display name) from BestCF or custom source, capped."""
+        """(domain, port, display name): local front-domains.txt, else BestCF/custom source (capped), else built-ins."""
         cf_cfg = self._cf_tunnel_config()
         if not cf_cfg:
             return []
@@ -1487,7 +1498,14 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         except ValueError:
             limit = CF_DOMAINS_LIMIT
 
-        raw_text = self._bestcf_text()
+        raw_text = ""
+        if not os.environ.get("KUI_CF_DOMAINS_SOURCE", "").strip():
+            raw_text = self._local_front_domains_text()
+            if raw_text:
+                # The user's own list is used in full, not capped.
+                limit = 1 << 30
+        if not raw_text:
+            raw_text = self._bestcf_text()
         entries: list[tuple[str, int, str]] = []
         seen: set[str] = set()
         if hostname:
