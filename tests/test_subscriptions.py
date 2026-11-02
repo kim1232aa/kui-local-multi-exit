@@ -187,6 +187,11 @@ class SubscriptionParserTest(unittest.TestCase):
         tags = [outbound["tag"] for outbound in outbounds]
         self.assertEqual(len(tags), len(set(tags)))
         self.assertNotIn("dns", {outbound["type"] for outbound in outbounds})
+        # hijack-dns is final; it must only match sniffed DNS, never all traffic.
+        rules = config["route"]["rules"]
+        self.assertEqual({"action": "sniff"}, rules[0])
+        hijack = [rule for rule in rules if rule.get("action") == "hijack-dns"]
+        self.assertEqual([{"protocol": "dns", "action": "hijack-dns"}], hijack)
 
         known_tags = set(tags)
         for outbound in outbounds:

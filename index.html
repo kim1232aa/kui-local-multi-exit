@@ -1691,7 +1691,8 @@ body.theme11 #app, body.theme13 #app, body.theme14 #app, body.theme15 #app, body
                     }
                 };
                 const openProbeEditModal = (s) => { editingProbeNode.value = JSON.parse(JSON.stringify(s)); if(!editingProbeNode.value.is_hidden) editingProbeNode.value.is_hidden = 'false'; if(!editingProbeNode.value.reset_day) editingProbeNode.value.reset_day = '1'; probeEditModalOpen.value = true; };
-                const saveProbeEdit = async () => { await fetchApi('/api/probe/admin/server', { method: 'PUT', body: JSON.stringify(editingProbeNode.value) }); probeEditModalOpen.value = false; refreshData(); fetchProbeData(); };
+                const PROBE_EDIT_FIELDS = ['id', 'name', 'server_group', 'is_hidden', 'price', 'expire_date', 'bandwidth', 'traffic_limit', 'reset_day'];
+                const saveProbeEdit = async () => { const payload = Object.fromEntries(PROBE_EDIT_FIELDS.filter(k => editingProbeNode.value[k] !== undefined).map(k => [k, editingProbeNode.value[k]])); await fetchApi('/api/probe/admin/server', { method: 'PUT', body: JSON.stringify(payload) }); probeEditModalOpen.value = false; refreshData(); fetchProbeData(); };
                 const deleteProbeNode = async (id) => { if (!confirm("恢复该固定出口槽位的默认展示信息？槽位和运行状态不会删除。")) return; await fetchApi(`/api/probe/admin/server?id=${id}`, { method: 'DELETE' }); refreshData(); fetchProbeData(); };
                 
                 const loadThirdPartySubscriptions = async () => {
@@ -2185,16 +2186,18 @@ body.theme11 #app, body.theme13 #app, body.theme14 #app, body.theme15 #app, body
                 const res = await fetch(`/api/proxy/nodes?t=${Date.now()}`, { cache: 'no-store' });
                 if (!res.ok) throw new Error(`HTTP ${res.status}`);
                 const servers = await res.json();
+                // The nodes table was removed from the card layout; the event log
+                // terminal and IP score section must keep updating without it.
                 const tbody = document.getElementById('pc-nodes-table');
                 const terminal = document.getElementById('pc-terminal-output');
-                if (!tbody) return;
 
                 if (!servers || servers.length === 0) {
+                    if (!tbody) return;
                     tbody.innerHTML = '<tr><td colspan="4" class="py-12 text-center text-slate-500 flex-col items-center justify-center"><svg class="w-12 h-12 mx-auto text-slate-700 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>未检测到在线母机，请在 VPS 运行纳管命令接入</td></tr>';
                     return;
                 }
 
-                tbody.innerHTML = servers.map(server => {
+                if (tbody) tbody.innerHTML = servers.map(server => {
                     const details = JSON.parse(server.details || '[]');
                     const timeAgo = Math.floor((Date.now() - server.last_seen) / 1000);
 

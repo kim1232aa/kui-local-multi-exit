@@ -854,6 +854,10 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                     f"    servername: {json.dumps(str(node.get('servername') or node.get('sni') or address_value))}",
                     f"    client-fingerprint: {json.dumps(str(node.get('client-fingerprint') or extra.get('fingerprint') or 'chrome'))}",
                 ))
+                # Plain VLESS-TLS servers using Vision need the flow too, not only Reality ones.
+                flow = str(node.get("flow") or "")
+                if flow and network == "tcp":
+                    lines.append(f"    flow: {json.dumps(flow)}")
             if network in {"ws", "websocket"}:
                 lines.extend((
                     "    ws-opts:",
@@ -957,6 +961,12 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 "    udp: true",
                 f"    network: {json.dumps(network)}",
             ))
+            security = str(cls._subscription_value(node, "security", "none") or "none").lower()
+            if security in {"tls", "xtls"} or cls._subscription_bool(node, "tls"):
+                lines.extend((
+                    "    tls: true",
+                    f"    servername: {json.dumps(str(node.get('servername') or node.get('sni') or cls._ws_host(node) or address_value))}",
+                ))
             if network in {"ws", "websocket"}:
                 lines.extend((
                     "    ws-opts:",
@@ -1408,7 +1418,12 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 except OSError:
                     pass
         if not uuid_val:
-            for node in self._local_reality_nodes().values():
+            # Prefer the host identity: the gateway routes it to `direct`, so CF
+            # front nodes do not silently depend on whichever exit slot is first.
+            reality_nodes = self._local_reality_nodes()
+            ordered = [reality_nodes["host"]] if "host" in reality_nodes else []
+            ordered.extend(node for slot_id, node in reality_nodes.items() if slot_id != "host")
+            for node in ordered:
                 if node.get("uuid"):
                     uuid_val = str(node["uuid"])
                     break
@@ -1642,7 +1657,7 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 if egress_type in {"residential", "unverified"} and cf_cfg and slot_uuid:
                     # CF VLESS+WS on an assigned preferred domain; the slot UUID picks the exit in the gateway.
                     cf_assigned_domain, cf_assigned_port = self._cf_domain_for_slot(str(slot["id"]), cdn_domains, default_host=cf_hostname)
-                    cf_chain_name = f"{added}·CF"
+                    cf_chain_name = self._unique_clash_node({"name": f"{added}·CF"}, used_names)["name"]
                     cf_chain_yaml = self._cf_slot_vless_node(
                         cf_chain_name,
                         cf_assigned_domain,
@@ -1660,9 +1675,10 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
             elif str(node.get("_slot_id")) == "host":
                 add(node, direct_names)
             else:
-                # tr-* slots are chained exits: first hop via CF entrance or rocket group.
-                dialer = cf_group_name or "🚀 节点选择"
-                add({**node, "dialer-proxy": dialer}, extra_names)
+                # tr-* slots are chained exits: never point dialer-proxy at 🚀 节点选择
+                # because extra_names itself joins 🚀 节点选择, creating a self-loop.
+                dialer = cf_group_name or (direct_names[0] if direct_names else "")
+                add({**node, "dialer-proxy": dialer} if dialer else node, extra_names)
 
         for bridge in self._bridge_nodes():
             if bridge.get("_source_kind", "manual") == "manual":
@@ -1675,8 +1691,8 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
                 if hint in {"TR", "VN", "TH", "PH"} and not raw_name.startswith(hint + "-")
                 else f"自动链式 | {raw_name}"
             )
-            dialer = cf_group_name or "🚀 节点选择"
-            add({**bridge, "name": name, "dialer-proxy": dialer}, extra_names)
+            dialer = cf_group_name or (direct_names[0] if direct_names else "")
+            add({**bridge, "name": name, **({"dialer-proxy": dialer} if dialer else {})}, extra_names)
 
         for node in thirdparty_nodes:
             add(node, extra_names)
@@ -1754,7 +1770,13 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         if pure_names:
             groups.append('  - name: "🏠 住宅自动"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 300\n    tolerance: 150\n    proxies:\n' + lst(pure_names))
         else:
-            groups.append('  - name: "🏠 住宅自动"\n    type: select\n    proxies:\n      - "🚀 节点选择"')
+            # Never point back to 🚀 节点选择 (which contains 🏠 住宅自动): Mihomo rejects group cycles.
+            fallback_proxies = [
+                *([cf_group_name] if cf_group_name else []),
+                *(["直连·本机"] if "直连·本机" in direct_names else []),
+                "DIRECT",
+            ]
+            groups.append('  - name: "🏠 住宅自动"\n    type: select\n    proxies:\n' + lst(fallback_proxies))
         # Scheme A: 🏠 住宅·CF contains CF-routed residential exits, select
         if chain_names:
             groups.append(f'  - name: "{chain_group_name}"\n    type: select\n    proxies:\n' + lst(chain_names))

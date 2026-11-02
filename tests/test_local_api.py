@@ -1511,6 +1511,101 @@ class LocalAPITest(unittest.TestCase):
             self.assertIn('      - "直连·本机"', grp_block)
             self.assertNotIn('exit-01', grp_block)
 
+    def test_cf_front_nodes_fall_back_to_host_uuid_not_first_exit(self):
+        self.manager.set_slot_ready("exit-01")
+        manifest = Path(self.tempdir.name) / "reality-nodes.json"
+        common = {
+            "address": "198.51.100.1", "port": 8443, "sni": "dl.google.com",
+            "public_key": "abcdefghijklmnopqrstuvwxyzABCDEFGH1234567_", "short_id": "1122334455667788",
+        }
+        manifest.write_text(
+            json.dumps({"version": 1, "nodes": [
+                {**common, "slot_id": "exit-01", "uuid": "11111111-1111-1111-1111-111111111111"},
+                {**common, "slot_id": "host", "uuid": "00000000-0000-0000-0000-0000000000aa"},
+            ]}),
+            encoding="utf-8",
+        )
+        self.server.reality_nodes_file = manifest
+        status, data = self.request("/api/data")
+        token = data["mySubToken"]
+
+        with patch.dict(os.environ, {"KUI_CF_HOSTNAME": "cf.example.com", "KUI_CF_UUID": "", "KUI_CF_DOMAINS_SOURCE": "/nonexistent"}), \
+                patch.object(LocalAPIHandler, "_local_front_domains_text", return_value=""):
+            status, body = self.request(
+                f"/api/sub?user={data['mySubUser']}&token={token}&format=clash",
+                expect_json=False,
+            )
+
+        self.assertEqual(200, status)
+        cf_start = body.index('  - name: "CF·本机"')
+        cf_block = body[cf_start:body.index("\n  - name:", cf_start + 1)]
+        self.assertIn('uuid: "00000000-0000-0000-0000-0000000000aa"', cf_block)
+
+    def test_clash_subscription_has_no_cycles_or_duplicate_names_in_edge_topologies(self):
+        import yaml
+        manifest = Path(self.tempdir.name) / "reality-nodes.json"
+        common = {
+            "address": "198.51.100.1", "port": 8443, "sni": "dl.google.com",
+            "public_key": "abcdefghijklmnopqrstuvwxyzABCDEFGH1234567_", "short_id": "1122334455667788",
+        }
+        manifest.write_text(
+            json.dumps({"version": 1, "nodes": [
+                {**common, "slot_id": "host", "uuid": "00000000-0000-0000-0000-0000000000aa"},
+                {**common, "slot_id": "exit-01", "uuid": "11111111-1111-1111-1111-111111111111"},
+                {**common, "slot_id": "tr-01", "uuid": "22222222-2222-2222-2222-222222222222"},
+            ]}),
+            encoding="utf-8",
+        )
+        self.server.reality_nodes_file = manifest
+        status, data = self.request("/api/data")
+        token = data["mySubToken"]
+        bridge = {
+            "name": "B1", "protocol": "socks5", "address": "203.0.113.9", "port": 1080,
+            "_source_kind": "auto", "_country_hint": "TR",
+        }
+
+        def assert_acyclic_and_unique(body: str) -> None:
+            parsed = yaml.safe_load(body)
+            proxy_names = [item["name"] for item in parsed["proxies"]]
+            self.assertEqual(len(proxy_names), len(set(proxy_names)))
+            edges: dict[str, list[str]] = {}
+            for item in parsed["proxies"]:
+                if item.get("dialer-proxy"):
+                    edges[item["name"]] = [item["dialer-proxy"]]
+            for grp in parsed["proxy-groups"]:
+                edges[grp["name"]] = list(grp.get("proxies") or [])
+            visiting: set[str] = set()
+            visited: set[str] = set()
+
+            def walk(node: str) -> None:
+                if node in visited or node not in edges:
+                    return
+                self.assertNotIn(node, visiting, f"cycle through {node}")
+                visiting.add(node)
+                for nxt in edges[node]:
+                    walk(nxt)
+                visiting.remove(node)
+                visited.add(node)
+
+            for start in edges:
+                walk(start)
+
+        # Case 1: no ready residential exits and no CF configured, with tr-01 + auto bridge.
+        with patch("vps.local_api.load_bridge_nodes", return_value=[bridge]), \
+                patch.dict(os.environ, {"KUI_CF_HOSTNAME": "", "KUI_CF_UUID": ""}):
+            status, body = self.request(f"/api/sub?user={data['mySubUser']}&token={token}&format=clash", expect_json=False)
+        self.assertEqual(200, status)
+        assert_acyclic_and_unique(body)
+
+        # Case 2: ready residential exit + front-domain tag colliding with exit-01·CF name.
+        self.manager.set_slot_ready("exit-01")
+        colliding = "front.example.net:443#JP未知·RESI·exit-01·CF\n"
+        with patch.dict(os.environ, {"KUI_CF_HOSTNAME": "cf.example.com", "KUI_CF_UUID": "99999999-9999-9999-9999-999999999999", "KUI_CF_DOMAINS_SOURCE": ""}), \
+                patch.object(LocalAPIHandler, "_local_front_domains_text", return_value=colliding):
+            status, body = self.request(f"/api/sub?user={data['mySubUser']}&token={token}&format=clash", expect_json=False)
+        self.assertEqual(200, status)
+        assert_acyclic_and_unique(body)
+
     def test_clash_subscription_parses_custom_ports_and_tags_from_front_domains_source(self):
         self.manager.set_slot_ready("exit-01")
         custom_file = Path(self.tempdir.name) / "custom-front.txt"
@@ -1816,6 +1911,36 @@ class LocalAPITest(unittest.TestCase):
 
         status, nodes = self.request("/api/nodes")
         self.assertFalse(any(n["ip"] == "10.0.0.9" for n in nodes))
+
+
+class ClashProxyRenderingTest(unittest.TestCase):
+    def test_vmess_ws_tls_keeps_tls_and_servername(self):
+        rendered = LocalAPIHandler._clash_proxy({
+            "name": "VM", "protocol": "vmess", "address": "1.2.3.4", "port": 443,
+            "uuid": "11111111-1111-1111-1111-111111111111", "network": "ws",
+            "security": "tls", "sni": "vm.example.com", "path": "/ws", "host": "vm.example.com",
+        })
+        self.assertIsNotNone(rendered)
+        block = rendered[1]
+        self.assertIn("    type: vmess", block)
+        self.assertIn("    tls: true", block)
+        self.assertIn('    servername: "vm.example.com"', block)
+
+    def test_plain_vmess_has_no_tls(self):
+        block = LocalAPIHandler._clash_proxy({
+            "name": "VM", "protocol": "vmess", "address": "1.2.3.4", "port": 80,
+            "uuid": "11111111-1111-1111-1111-111111111111", "network": "ws",
+        })[1]
+        self.assertNotIn("tls:", block)
+
+    def test_vless_tls_vision_keeps_flow(self):
+        block = LocalAPIHandler._clash_proxy({
+            "name": "VL", "protocol": "vless", "address": "1.2.3.4", "port": 443,
+            "uuid": "11111111-1111-1111-1111-111111111111", "network": "tcp",
+            "security": "tls", "sni": "vl.example.com", "flow": "xtls-rprx-vision",
+        })[1]
+        self.assertIn("    tls: true", block)
+        self.assertIn('    flow: "xtls-rprx-vision"', block)
 
 
 if __name__ == "__main__":

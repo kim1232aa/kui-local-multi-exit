@@ -1,9 +1,17 @@
+# Bounded json-file logs: public scanners hit the gateway constantly.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   kui-local-multi-exit:
     build: .
     image: kui-local-multi-exit:local
     container_name: kui-local-multi-exit
     restart: unless-stopped
+    logging: *default-logging
     cap_add:
       - NET_ADMIN
     devices:
@@ -16,6 +24,7 @@ services:
       KUI_ENABLE_VPNBOOK: ${KUI_ENABLE_VPNBOOK:-1}
       KUI_ALLOW_NON_RESIDENTIAL: ${KUI_ALLOW_NON_RESIDENTIAL:-1}
       KUI_VPN_HISTORY_DAYS: ${KUI_VPN_HISTORY_DAYS:-30}
+      KUI_EVENT_HISTORY_DAYS: ${KUI_EVENT_HISTORY_DAYS:-7}
       KUI_OPENVPN_PROVIDER_DIR: /opt/kui-providers
       KUI_REALITY_NODES_FILE: /run/kui-reality/public-nodes.json
       KUI_BRIDGE_NODES: ${KUI_BRIDGE_NODES:-}
@@ -53,6 +62,7 @@ services:
     image: kui-local-multi-exit:local
     container_name: kui-reality-gateway
     restart: unless-stopped
+    logging: *default-logging
     command: ["python3", "-m", "vps.reality_gateway"]
     depends_on:
       kui-local-multi-exit:
@@ -93,6 +103,7 @@ services:
     image: kui-local-multi-exit:local
     container_name: kui-socks5-bridge
     restart: unless-stopped
+    logging: *default-logging
     command: ["python3", "-m", "vps.socks5_bridge"]
     depends_on:
       kui-local-multi-exit:

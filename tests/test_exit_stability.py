@@ -84,6 +84,14 @@ class ExitStabilityTest(unittest.TestCase):
         self.assertEqual("failed", self.store.get_slot(slot.id).state)
         self.assertTrue(runtime.process is None or runtime.process.terminated)
 
+    def test_confirmed_dead_path_does_not_prefer_the_same_peer_again(self):
+        runtime = self.ready_slot()
+        slot = self.store.get_slot("exit-01")
+        with patch("vps.exit_manager.probe_health_reference", return_value={"ok": True}, create=True):
+            self.assertTrue(self.manager._handle_probe_failure(slot.id, slot.generation, "SOCKS and TUN transport failed"))
+        # The failed peer goes through penalty/cooldown instead of a forced retry.
+        self.assertEqual("", runtime.preferred_node_ip)
+
     def test_degraded_slot_returns_ready_only_after_real_socks_probe(self):
         runtime = self.ready_slot()
         slot = self.store.set_runtime("exit-01", state="degraded", last_error="reference unavailable")

@@ -214,6 +214,10 @@ class LocalStore:
                     result TEXT NOT NULL,
                     created_at INTEGER NOT NULL
                 );
+                CREATE INDEX IF NOT EXISTS idx_events_slot_kind ON events(slot_id, kind, id);
+                CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at);
+                CREATE INDEX IF NOT EXISTS idx_check_results_slot ON check_results(slot_id, id);
+                CREATE INDEX IF NOT EXISTS idx_check_results_created ON check_results(created_at);
                 """
             )
             thirdparty_columns = {
@@ -590,6 +594,14 @@ class LocalStore:
             return ""
         entry_ip, separator, _egress_ip = row["message"].partition(" -> ")
         return entry_ip if separator else ""
+
+    def prune_history(self, *, retention_days: int = 7) -> int:
+        """Drop events/check results older than the retention window; returns rows removed."""
+        cutoff = int(time.time()) - max(1, int(retention_days)) * 86400
+        with self._lock, self._connect() as db:
+            removed = db.execute("DELETE FROM events WHERE created_at < ?", (cutoff,)).rowcount
+            removed += db.execute("DELETE FROM check_results WHERE created_at < ?", (cutoff,)).rowcount
+        return removed
 
     def list_events(self, limit: int = 100) -> list[dict[str, Any]]:
         bounded_limit = max(1, min(int(limit), 500))

@@ -433,6 +433,23 @@ class ExitManagerTest(unittest.TestCase):
         self.assertGreater(self.store.get_slot("exit-01").generation, generation)
         self.assertEqual(["exit-01"], self.routing.cleaned)
 
+    def test_redial_closes_socks_listener_before_removing_fail_closed_route(self):
+        self.manager.start_slot("exit-01")
+        runtime = self.manager.runtime("exit-01")
+        listener = FakeListener("exit-01", "0.0.0.0", 7920, "tun0", 200)
+        listener.start()
+        runtime.listener = listener
+        order = []
+        original_stop = listener.stop
+        listener.stop = lambda: (order.append("listener"), original_stop())
+        original_cleanup = self.routing.cleanup
+        self.routing.cleanup = lambda slot: (order.append("routing"), original_cleanup(slot))
+
+        self.manager.redial_slot("exit-01")
+
+        self.assertEqual(["listener", "routing"], order[:2])
+        self.assertFalse(listener.is_ready())
+
     def test_stop_invalidates_generation_and_restart_clears_the_stop_event(self):
         generation = self.store.get_slot("exit-01").generation
 

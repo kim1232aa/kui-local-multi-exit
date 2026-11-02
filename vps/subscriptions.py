@@ -712,7 +712,9 @@ def generate_singbox_config(outbound_nodes: list[dict[str, Any]]) -> str:
         "outbounds": outbounds,
         "route": {
             "rules": [
-                {"action": "hijack-dns"},
+                # hijack-dns is a final action: unconditioned, it would swallow every connection.
+                {"action": "sniff"},
+                {"protocol": "dns", "action": "hijack-dns"},
                 {"ip_is_private": True, "action": "route", "outbound": "direct"},
             ],
             "final": "select",

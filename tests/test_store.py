@@ -129,6 +129,27 @@ class LocalStoreTest(unittest.TestCase):
         self.assertEqual("", enabled.disabled_reason)
         self.assertGreater(enabled.generation, disabled.generation)
 
+    def test_prune_history_drops_only_rows_older_than_retention(self):
+        self.store.record_event("exit-01", "connected", "198.51.100.1 -> 203.0.113.1")
+        self.store.append_check_result("exit-01", 1, {"ok": True})
+        old = 1_000_000
+        with contextlib.closing(sqlite3.connect(self.db_path)) as db, db:
+            db.execute("INSERT INTO events (slot_id, kind, message, created_at) VALUES ('exit-02','failure','old',?)", (old,))
+            db.execute("INSERT INTO check_results (slot_id, generation, result, created_at) VALUES ('exit-02',1,'{}',?)", (old,))
+
+        self.assertEqual(2, self.store.prune_history(retention_days=7))
+
+        self.assertEqual(["connected"], [event["kind"] for event in self.store.list_events(limit=10)])
+        self.assertEqual(1, len(self.store.list_check_results(limit=10)))
+        self.assertEqual("198.51.100.1", self.store.last_connected_entry_ip("exit-01"))
+        with contextlib.closing(sqlite3.connect(self.db_path)) as db:
+            plan = db.execute(
+                "EXPLAIN QUERY PLAN SELECT message FROM events WHERE slot_id = ? AND kind = 'connected' "
+                "ORDER BY id DESC LIMIT 1",
+                ("exit-01",),
+            ).fetchall()
+        self.assertIn("idx_events_slot_kind", " ".join(str(row) for row in plan))
+
     def test_runtime_state_and_events_are_persisted(self):
         self.store.set_runtime(
             "exit-01",

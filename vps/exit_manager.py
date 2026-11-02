@@ -174,6 +174,10 @@ class ExitManager:
                 )
             except Exception as error:
                 self.store.record_event(None, "openvpn_cache_write_failed", str(error))
+        try:
+            self.store.prune_history(retention_days=int(os.environ.get("KUI_EVENT_HISTORY_DAYS", "7")))
+        except Exception as error:
+            self.store.record_event(None, "history_prune_failed", str(error))
         cached_nodes = self.store.load_vpn_nodes()
         nodes = cached_nodes or fresh_nodes
         if nodes:
@@ -419,7 +423,7 @@ class ExitManager:
         if runtime.process is target:
             runtime.process = None
 
-    def stop_slot(self, slot_id: str, *, stop_listener: bool = True) -> None:
+    def stop_slot(self, slot_id: str) -> None:
         self._require_managed_slot(slot_id)
         runtime = self.runtime(slot_id)
         assert runtime.lock is not None and runtime.stop is not None
@@ -432,12 +436,14 @@ class ExitManager:
             if runtime.retry_timer:
                 runtime.retry_timer.cancel()
                 runtime.retry_timer = None
+            # Close the SOCKS port before routing.cleanup removes the fail-closed
+            # rule; otherwise marked traffic would leave via the VPS main route.
+            if runtime.listener:
+                runtime.listener.stop()
+                runtime.listener = None
             self._terminate_process(runtime)
             self._release_node(slot_id)
             self.routing.cleanup(slot)
-            if stop_listener and runtime.listener:
-                runtime.listener.stop()
-                runtime.listener = None
             if slot.enabled:
                 self.store.set_runtime(slot_id, state="idle", entry_ip="", egress_ip="", current_node={}, check_result={})
             worker = runtime.worker
@@ -459,7 +465,7 @@ class ExitManager:
                 runtime.preferred_node_ip = slot.entry_ip
         if slot.entry_ip:
             self.node_pool.penalize(slot.entry_ip, 3000)
-        self.stop_slot(slot_id, stop_listener=False)
+        self.stop_slot(slot_id)
         updated = self.store.get_slot(slot_id)
         if not updated.enabled:
             if automatic:
@@ -475,7 +481,7 @@ class ExitManager:
         node = self.node_pool.get(node_ip, slot.country)
         if node is None:
             raise ValueError(f"node {node_ip} is not available for {slot.country}")
-        self.stop_slot(slot_id, stop_listener=False)
+        self.stop_slot(slot_id)
         updated = self.store.get_slot(slot_id)
         if not updated.enabled:
             updated = self.store.update_slot(slot_id, enabled=True)
@@ -559,6 +565,8 @@ class ExitManager:
         generation: int,
         error: str,
         endpoint_ip: str = "",
+        *,
+        retry_same_peer: bool = True,
     ) -> ExitSlotSnapshot:
         runtime = self.runtime(slot_id)
         assert runtime.lock is not None
@@ -566,9 +574,11 @@ class ExitManager:
             current = self.store.get_slot(slot_id)
             if not current.enabled or current.generation != generation:
                 return current
-            if current.state in {"ready", "degraded"} and current.entry_ip:
+            if retry_same_peer and current.state in {"ready", "degraded"} and current.entry_ip:
                 # One explicit retry of the just-working peer, then ordinary
                 # same-country selection/cooldown if that handshake also fails.
+                # Skipped when health probes proved the peer's path dead, or a
+                # flapping peer would be re-picked past its cooldown forever.
                 runtime.preferred_node_ip = current.entry_ip
             max_failures = COUNTRY_SLOT_FAILURE_LIMIT if current.country != "ANY" else 3
             failed = self.fail_slot(slot_id, error, max_failures=max_failures)
@@ -1047,7 +1057,7 @@ class ExitManager:
             return False
         if reference.get("ok") or runtime.process is None or runtime.process.poll() is not None:
             self.store.record_event(slot_id, "health_check_failed", f"{error}, triggering retry")
-            self._handle_connection_failure(slot_id, generation, error, current.entry_ip)
+            self._handle_connection_failure(slot_id, generation, error, current.entry_ip, retry_same_peer=False)
             return True
         detail = f"{error}; shared health reference unavailable: {json.dumps(reference, ensure_ascii=False)}; retaining existing tunnel"
         check_result = {**current.check_result, "health": {
