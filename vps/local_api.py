@@ -386,6 +386,7 @@ _LOCAL_DIRECT_RULES: tuple[str, ...] = (
     "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
     "IP-CIDR,100.64.0.0/10,DIRECT,no-resolve",
     "IP-CIDR,198.18.0.0/15,DIRECT,no-resolve",
+    "GEOIP,LAN,DIRECT,no-resolve",
 )
 
 
@@ -1807,8 +1808,10 @@ class LocalAPIHandler(BaseHTTPRequestHandler):
         rules.extend(f"  - {rule},🔵 Google·Gemini" for rule in _GEMINI_RULES)
         rules.extend(f"  - {rule}" for rule in _LOCAL_DIRECT_RULES)
         rules.extend((
+            "  - DOMAIN-SUFFIX,cn,🇨🇳 中国流量",
+            "  - GEOSITE,cn,🇨🇳 中国流量",
             "  - GEOSITE,CN,🇨🇳 中国流量",
-            "  - GEOIP,CN,🇨🇳 中国流量,no-resolve",
+            "  - GEOIP,CN,🇨🇳 中国流量",
             "  - MATCH,🌐 其他流量",
         ))
         return "\n".join(lines + groups + rules) + "\n"
